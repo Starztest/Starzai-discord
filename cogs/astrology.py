@@ -265,6 +265,27 @@ class AstrologyCog(commands.Cog, name="Astrology"):
                 await interaction.followup.send(embed=embed)
             
             # Create and send a downloadable .txt file with the complete report
+            # Strip Markdown formatting for clean plain text
+            import re
+            
+            def strip_markdown(text: str) -> str:
+                """Remove Discord/Markdown formatting from text."""
+                # Remove bold (**text** or __text__)
+                text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+                text = re.sub(r'__(.+?)__', r'\1', text)
+                # Remove italic (*text* or _text_)
+                text = re.sub(r'\*(.+?)\*', r'\1', text)
+                text = re.sub(r'_(.+?)_', r'\1', text)
+                # Remove strikethrough (~~text~~)
+                text = re.sub(r'~~(.+?)~~', r'\1', text)
+                # Remove inline code (`text`)
+                text = re.sub(r'`(.+?)`', r'\1', text)
+                # Remove code blocks (```text```)
+                text = re.sub(r'```(.+?)```', r'\1', text, flags=re.DOTALL)
+                return text
+            
+            clean_content = strip_markdown(full_content)
+            
             report_header = (
                 f"═══════════════════════════════════════════════════════════\n"
                 f"           COMPLETE BIRTH CHART READING REPORT\n"
@@ -285,7 +306,7 @@ class AstrologyCog(commands.Cog, name="Astrology"):
                 f"═══════════════════════════════════════════════════════════\n"
             )
             
-            full_report = report_header + full_content + report_footer
+            full_report = report_header + clean_content + report_footer
             
             # Create a temporary file
             import tempfile
