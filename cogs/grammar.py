@@ -60,6 +60,7 @@ class GrammarCog(commands.Cog, name="Grammar"):
             resp = await self.bot.llm.simple_prompt(
                 prompt,
                 system="You are an expert English editor and proofreader. Be thorough but encouraging.",
+                max_tokens=4096,  # Maximum tokens for detailed grammar analysis
             )
 
             embed = Embedder.standard(
@@ -135,6 +136,7 @@ class GrammarCog(commands.Cog, name="Grammar"):
             resp = await self.bot.llm.simple_prompt(
                 prompt,
                 system=f"You are an expert writing coach specializing in {style} writing.",
+                max_tokens=4096,  # Maximum tokens for detailed text improvement
             )
 
             embed = Embedder.standard(
@@ -159,4 +161,3 @@ class GrammarCog(commands.Cog, name="Grammar"):
 
 async def setup(bot: StarzaiBot) -> None:
     await bot.add_cog(GrammarCog(bot))
-
