@@ -132,20 +132,30 @@ class AstrologyCog(commands.Cog, name="Astrology"):
 
         await interaction.response.defer()
 
-        prompt = (
-            f"Create a detailed and insightful birth chart reading for someone born:\n"
+        # Split into two parts to avoid Discord's 4096 character limit
+        prompt_part1 = (
+            f"Create a detailed birth chart reading for someone born:\n"
             f"📅 Date: {date}\n"
             f"🕐 Time: {time} (24-hour format)\n"
             f"📍 Location: {location}\n\n"
             
-            f"Provide a comprehensive birth chart analysis including:\n\n"
+            f"Provide PART 1 of the birth chart analysis (Core Placements):\n\n"
             
             f"1. **Sun Sign** — their core identity, ego, and life purpose\n"
             f"2. **Moon Sign** — emotional nature and inner world (estimate from date)\n"
             f"3. **Rising Sign** — how they appear to others (estimate from time and location)\n"
             f"4. **Mercury Placement** — communication style and thinking patterns\n"
             f"5. **Venus Placement** — love language and relationships\n"
-            f"6. **Mars Placement** — drive, passion, and action style\n"
+            f"6. **Mars Placement** — drive, passion, and action style\n\n"
+            
+            f"Be detailed and insightful. Use accessible language while maintaining depth."
+        )
+        
+        prompt_part2 = (
+            f"Continue the birth chart reading for someone born on {date} at {time} in {location}.\n\n"
+            
+            f"Provide PART 2 of the birth chart analysis (Synthesis & Insights):\n\n"
+            
             f"7. **Key Planetary Aspects** — important planetary relationships\n"
             f"8. **House Placements** — life areas affected (simplified)\n"
             f"9. **Personality Synthesis** — integrated personality overview from all placements\n"
@@ -154,36 +164,59 @@ class AstrologyCog(commands.Cog, name="Astrology"):
             f"12. **Practical Insights** — actionable advice based on the chart\n\n"
             
             f"Note: This is an AI-generated estimate. For a precise chart, an exact birth time "
-            f"and professional ephemeris data are needed. Use accessible language while maintaining depth."
+            f"and professional ephemeris data are needed."
         )
 
         try:
-            resp = await self.bot.llm.simple_prompt(
-                prompt,
+            # Generate Part 1
+            resp1 = await self.bot.llm.simple_prompt(
+                prompt_part1,
                 system=(
-                    "You are an experienced and knowledgeable astrologer with deep expertise in "
-                    "natal birth chart analysis. Provide detailed, insightful, and personalized readings. "
-                    "Be specific and comprehensive. Structure your response clearly with each section labeled."
+                    "You are an experienced astrologer. Provide detailed, insightful readings. "
+                    "Structure your response clearly with each section labeled."
                 ),
-                max_tokens=4096,  # Increased for more detailed analysis
+                max_tokens=2048,
+            )
+            
+            # Generate Part 2
+            resp2 = await self.bot.llm.simple_prompt(
+                prompt_part2,
+                system=(
+                    "You are an experienced astrologer. Provide detailed, insightful readings. "
+                    "Structure your response clearly with each section labeled."
+                ),
+                max_tokens=2048,
             )
 
-            embed = Embedder.standard(
-                "🌟 Birth Chart Reading",
-                resp.content,
+            # Send Part 1
+            embed1 = Embedder.standard(
+                "🌟 Birth Chart Reading — Part 1: Core Placements",
+                resp1.content[:4000],  # Safety limit
                 fields=[
                     ("Date", date, True),
                     ("Time", time, True),
                     ("Location", location, True),
                 ],
             )
-            await interaction.followup.send(embed=embed)
+            await interaction.followup.send(embed=embed1)
+            
+            # Send Part 2
+            embed2 = Embedder.standard(
+                "🌟 Birth Chart Reading — Part 2: Synthesis & Insights",
+                resp2.content[:4000],  # Safety limit
+            )
+            await interaction.followup.send(embed=embed2)
+            
+            # Log usage for both parts
+            total_tokens = resp1.total_tokens + resp2.total_tokens
+            avg_latency = (resp1.latency_ms + resp2.latency_ms) / 2
+            
             await self.bot.database.log_usage(
                 user_id=interaction.user.id,
                 command="birth-chart",
                 guild_id=interaction.guild_id,
-                tokens_used=resp.total_tokens,
-                latency_ms=resp.latency_ms,
+                tokens_used=total_tokens,
+                latency_ms=avg_latency,
             )
 
         except LLMClientError as exc:
