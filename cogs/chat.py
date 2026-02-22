@@ -554,11 +554,11 @@ class ChatCog(commands.Cog, name="Chat"):
                     collected += chunk
                     now = time.time()
                     
-                    # Edit message every STREAMING_EDIT_INTERVAL seconds
-                    if now - last_edit >= STREAMING_EDIT_INTERVAL:
+                    # Only send/edit if we have content
+                    if collected and now - last_edit >= STREAMING_EDIT_INTERVAL:
                         if not reply_msg:
                             # Send initial message
-                            reply_msg = await message.reply(collected or "⏳ Thinking...")
+                            reply_msg = await message.reply(collected[:2000])
                         else:
                             # Update existing message
                             try:
@@ -567,14 +567,18 @@ class ChatCog(commands.Cog, name="Chat"):
                                 pass
                         last_edit = now
                 
-                # Final update
-                if reply_msg and collected:
-                    try:
-                        await reply_msg.edit(content=collected[:2000])
-                    except discord.HTTPException:
-                        pass
-                elif not reply_msg and collected:
-                    reply_msg = await message.reply(collected[:2000])
+                # Final update - ensure we send the complete response
+                if collected:
+                    if reply_msg:
+                        try:
+                            await reply_msg.edit(content=collected[:2000])
+                        except discord.HTTPException:
+                            pass
+                    else:
+                        reply_msg = await message.reply(collected[:2000])
+                else:
+                    # If no content was generated, send a fallback message
+                    await message.reply("I couldn't generate a response. Please try again.")
                 
                 # Add assistant response to history
                 conv["messages"].append({"role": "assistant", "content": collected})
