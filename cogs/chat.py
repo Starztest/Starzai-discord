@@ -384,12 +384,19 @@ class ChatCog(commands.Cog, name="Chat"):
     async def set_model_cmd(
         self, interaction: discord.Interaction, model: str
     ) -> None:
-        resolved = self.bot.settings.resolve_model(model)
-        if resolved not in self.bot.settings.available_models:
+        # Validate explicitly: check if input is a valid model or alias
+        settings = self.bot.settings
+        model_lower = model.strip().lower()
+        
+        if model in settings.available_models:
+            resolved = model
+        elif model_lower in settings.model_aliases:
+            resolved = settings.model_aliases[model_lower]
+        else:
             await interaction.response.send_message(
                 embed=Embedder.error(
                     "Unknown Model",
-                    f"`{model}` is not available.\nUse `/models` to see available models.",
+                    f"`{model}` is not available.\nUse `/models` to see available models and aliases.",
                 ),
                 ephemeral=True,
             )
@@ -415,4 +422,3 @@ class ChatCog(commands.Cog, name="Chat"):
 
 async def setup(bot: StarzaiBot) -> None:
     await bot.add_cog(ChatCog(bot))
-
