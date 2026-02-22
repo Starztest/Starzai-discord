@@ -132,65 +132,120 @@ class AstrologyCog(commands.Cog, name="Astrology"):
 
         await interaction.response.defer()
 
-        # Split into two parts to avoid Discord's 4096 character limit
+        # Split into three parts + bonus typology for maximum detail
         prompt_part1 = (
             f"Create a detailed birth chart reading for someone born:\n"
             f"📅 Date: {date}\n"
             f"🕐 Time: {time} (24-hour format)\n"
             f"📍 Location: {location}\n\n"
             
-            f"Provide PART 1 of the birth chart analysis (Core Placements):\n\n"
+            f"Provide PART 1 of the birth chart analysis (Core Identity):\n\n"
             
-            f"1. **Sun Sign** — their core identity, ego, and life purpose\n"
-            f"2. **Moon Sign** — emotional nature and inner world (estimate from date)\n"
-            f"3. **Rising Sign** — how they appear to others (estimate from time and location)\n"
-            f"4. **Mercury Placement** — communication style and thinking patterns\n"
-            f"5. **Venus Placement** — love language and relationships\n"
-            f"6. **Mars Placement** — drive, passion, and action style\n\n"
+            f"1. **Sun Sign** — their core identity, ego, and life purpose (be very detailed)\n"
+            f"2. **Moon Sign** — emotional nature, inner world, and subconscious patterns (estimate from date, be thorough)\n"
+            f"3. **Rising Sign (Ascendant)** — how they appear to others, first impressions, and outer personality (estimate from time and location)\n"
+            f"4. **Chart Ruler** — the planet ruling their rising sign and its significance\n\n"
             
-            f"Be detailed and insightful. Use accessible language while maintaining depth."
+            f"Be extremely detailed and insightful. Provide deep analysis for each placement."
         )
         
         prompt_part2 = (
             f"Continue the birth chart reading for someone born on {date} at {time} in {location}.\n\n"
             
-            f"Provide PART 2 of the birth chart analysis (Synthesis & Insights):\n\n"
+            f"Provide PART 2 of the birth chart analysis (Personal Planets & Communication):\n\n"
             
-            f"7. **Key Planetary Aspects** — important planetary relationships\n"
-            f"8. **House Placements** — life areas affected (simplified)\n"
-            f"9. **Personality Synthesis** — integrated personality overview from all placements\n"
-            f"10. **Life Path & Potential** — strengths, challenges, and life purpose\n"
-            f"11. **Compatibility** — which signs harmonize well with this birth chart\n"
-            f"12. **Practical Insights** — actionable advice based on the chart\n\n"
+            f"5. **Mercury Placement** — communication style, thinking patterns, learning style, and mental processes (be very detailed)\n"
+            f"6. **Venus Placement** — love language, relationships, values, aesthetics, and what brings pleasure (be thorough)\n"
+            f"7. **Mars Placement** — drive, passion, action style, anger expression, and sexual energy (be comprehensive)\n"
+            f"8. **Key Planetary Aspects** — important relationships between planets and how they interact\n\n"
             
-            f"Note: This is an AI-generated estimate. For a precise chart, an exact birth time "
-            f"and professional ephemeris data are needed."
+            f"Provide deep, insightful analysis for each placement and aspect."
+        )
+        
+        prompt_part3 = (
+            f"Continue the birth chart reading for someone born on {date} at {time} in {location}.\n\n"
+            
+            f"Provide PART 3 of the birth chart analysis (Life Path & Integration):\n\n"
+            
+            f"9. **House Placements** — which life areas are most emphasized (career, relationships, home, etc.)\n"
+            f"10. **Personality Synthesis** — integrated personality overview combining all placements\n"
+            f"11. **Life Path & Soul Purpose** — strengths, challenges, karmic lessons, and life mission\n"
+            f"12. **Compatibility** — which signs and elements harmonize well with this birth chart\n"
+            f"13. **Practical Insights** — actionable advice and guidance based on the chart\n\n"
+            
+            f"Note: This is an AI-generated estimate. For a precise chart, exact birth time and professional ephemeris data are needed."
+        )
+        
+        prompt_typology = (
+            f"Based on the birth chart for someone born on {date} at {time} in {location}, "
+            f"provide a BONUS personality typology analysis:\n\n"
+            
+            f"**🧠 Personality Typology Predictions (Based on Astrological Chart)**\n\n"
+            
+            f"1. **MBTI Type** — Most likely Myers-Briggs type based on Sun, Moon, Mercury, and Rising signs. "
+            f"Explain the reasoning (e.g., Fire Sun = Extroversion, Water Moon = Feeling, etc.)\n\n"
+            
+            f"2. **Enneagram Type** — Most likely Enneagram type and wing based on core motivations shown in the chart. "
+            f"Explain which planetary placements suggest this type.\n\n"
+            
+            f"3. **Big Five Traits** — Estimate their Big Five personality scores:\n"
+            f"   - Openness (1-10)\n"
+            f"   - Conscientiousness (1-10)\n"
+            f"   - Extraversion (1-10)\n"
+            f"   - Agreeableness (1-10)\n"
+            f"   - Neuroticism (1-10)\n"
+            f"   Explain how the astrological placements suggest these scores.\n\n"
+            
+            f"4. **Integration** — How these typologies align with the astrological profile.\n\n"
+            
+            f"Be specific and explain your reasoning. This is a fun, insightful bonus analysis!"
         )
 
         try:
-            # Generate Part 1
+            # Generate Part 1 - Core Identity
             resp1 = await self.bot.llm.simple_prompt(
                 prompt_part1,
                 system=(
-                    "You are an experienced astrologer. Provide detailed, insightful readings. "
-                    "Structure your response clearly with each section labeled."
+                    "You are an experienced astrologer. Provide extremely detailed, insightful readings. "
+                    "Structure your response clearly with each section labeled. Be thorough and comprehensive."
                 ),
                 max_tokens=2048,
             )
             
-            # Generate Part 2
+            # Generate Part 2 - Personal Planets
             resp2 = await self.bot.llm.simple_prompt(
                 prompt_part2,
                 system=(
-                    "You are an experienced astrologer. Provide detailed, insightful readings. "
-                    "Structure your response clearly with each section labeled."
+                    "You are an experienced astrologer. Provide extremely detailed, insightful readings. "
+                    "Structure your response clearly with each section labeled. Be thorough and comprehensive."
+                ),
+                max_tokens=2048,
+            )
+            
+            # Generate Part 3 - Life Path & Integration
+            resp3 = await self.bot.llm.simple_prompt(
+                prompt_part3,
+                system=(
+                    "You are an experienced astrologer. Provide extremely detailed, insightful readings. "
+                    "Structure your response clearly with each section labeled. Be thorough and comprehensive."
+                ),
+                max_tokens=2048,
+            )
+            
+            # Generate Bonus - Personality Typology
+            resp4 = await self.bot.llm.simple_prompt(
+                prompt_typology,
+                system=(
+                    "You are an expert in both astrology and personality psychology. "
+                    "Provide insightful connections between astrological placements and personality typologies. "
+                    "Be specific and explain your reasoning clearly."
                 ),
                 max_tokens=2048,
             )
 
             # Send Part 1
             embed1 = Embedder.standard(
-                "🌟 Birth Chart Reading — Part 1: Core Placements",
+                "🌟 Birth Chart Reading — Part 1: Core Identity",
                 resp1.content[:4000],  # Safety limit
                 fields=[
                     ("Date", date, True),
@@ -202,14 +257,30 @@ class AstrologyCog(commands.Cog, name="Astrology"):
             
             # Send Part 2
             embed2 = Embedder.standard(
-                "🌟 Birth Chart Reading — Part 2: Synthesis & Insights",
+                "🌟 Birth Chart Reading — Part 2: Personal Planets & Communication",
                 resp2.content[:4000],  # Safety limit
             )
             await interaction.followup.send(embed=embed2)
             
-            # Log usage for both parts
-            total_tokens = resp1.total_tokens + resp2.total_tokens
-            avg_latency = (resp1.latency_ms + resp2.latency_ms) / 2
+            # Send Part 3
+            embed3 = Embedder.standard(
+                "🌟 Birth Chart Reading — Part 3: Life Path & Integration",
+                resp3.content[:4000],  # Safety limit
+            )
+            await interaction.followup.send(embed=embed3)
+            
+            # Send Bonus Typology
+            embed4 = discord.Embed(
+                title="🎁 BONUS: Personality Typology Analysis",
+                description=resp4.content[:4000],  # Safety limit
+                color=discord.Color.purple(),  # Purple for bonus content
+            )
+            embed4.set_footer(text="Based on astrological chart analysis • For entertainment and insight")
+            await interaction.followup.send(embed=embed4)
+            
+            # Log usage for all four parts
+            total_tokens = resp1.total_tokens + resp2.total_tokens + resp3.total_tokens + resp4.total_tokens
+            avg_latency = (resp1.latency_ms + resp2.latency_ms + resp3.latency_ms + resp4.latency_ms) / 4
             
             await self.bot.database.log_usage(
                 user_id=interaction.user.id,
