@@ -132,162 +132,145 @@ class AstrologyCog(commands.Cog, name="Astrology"):
 
         await interaction.response.defer()
 
-        # Split into three parts + bonus typology for maximum detail
-        prompt_part1 = (
-            f"Create a detailed birth chart reading for someone born:\n"
+        # Generate comprehensive birth chart in one go, then split intelligently
+        full_prompt = (
+            f"Create an EXTREMELY DETAILED and comprehensive birth chart reading for someone born:\n"
             f"📅 Date: {date}\n"
             f"🕐 Time: {time} (24-hour format)\n"
             f"📍 Location: {location}\n\n"
             
-            f"Provide PART 1 of the birth chart analysis (Core Identity):\n\n"
+            f"Provide a complete, in-depth birth chart analysis covering ALL of the following sections. "
+            f"Be as detailed and thorough as possible for each section:\n\n"
             
-            f"1. **Sun Sign** — their core identity, ego, and life purpose (be very detailed)\n"
-            f"2. **Moon Sign** — emotional nature, inner world, and subconscious patterns (estimate from date, be thorough)\n"
-            f"3. **Rising Sign (Ascendant)** — how they appear to others, first impressions, and outer personality (estimate from time and location)\n"
-            f"4. **Chart Ruler** — the planet ruling their rising sign and its significance\n\n"
+            f"**PART 1: CORE IDENTITY**\n"
+            f"1. **Sun Sign** — Core identity, ego, life purpose, strengths, shadow side (be extremely detailed)\n"
+            f"2. **Moon Sign** — Emotional nature, inner world, subconscious patterns, needs, childhood (very thorough)\n"
+            f"3. **Rising Sign (Ascendant)** — Outer personality, first impressions, life approach, physical appearance tendencies\n"
+            f"4. **Chart Ruler** — The planet ruling the rising sign and its profound significance\n\n"
             
-            f"Be extremely detailed and insightful. Provide deep analysis for each placement."
-        )
-        
-        prompt_part2 = (
-            f"Continue the birth chart reading for someone born on {date} at {time} in {location}.\n\n"
+            f"**PART 2: PERSONAL PLANETS**\n"
+            f"5. **Mercury Placement** — Communication style, thinking patterns, learning style, mental processes, decision-making\n"
+            f"6. **Venus Placement** — Love language, relationships, values, aesthetics, pleasure, money attitudes\n"
+            f"7. **Mars Placement** — Drive, passion, action style, anger expression, sexual energy, ambition\n"
+            f"8. **Jupiter Placement** — Growth, expansion, luck, philosophy, optimism, where they thrive\n"
+            f"9. **Saturn Placement** — Discipline, responsibility, challenges, life lessons, karmic themes\n\n"
             
-            f"Provide PART 2 of the birth chart analysis (Personal Planets & Communication):\n\n"
+            f"**PART 3: OUTER PLANETS & ASPECTS**\n"
+            f"10. **Uranus, Neptune, Pluto** — Generational influences and personal manifestations\n"
+            f"11. **Major Planetary Aspects** — Conjunctions, oppositions, trines, squares, and their meanings\n"
+            f"12. **Dominant Elements** — Fire, Earth, Air, Water balance and what it means\n"
+            f"13. **Dominant Modalities** — Cardinal, Fixed, Mutable balance and implications\n\n"
             
-            f"5. **Mercury Placement** — communication style, thinking patterns, learning style, and mental processes (be very detailed)\n"
-            f"6. **Venus Placement** — love language, relationships, values, aesthetics, and what brings pleasure (be thorough)\n"
-            f"7. **Mars Placement** — drive, passion, action style, anger expression, and sexual energy (be comprehensive)\n"
-            f"8. **Key Planetary Aspects** — important relationships between planets and how they interact\n\n"
+            f"**PART 4: HOUSES & LIFE AREAS**\n"
+            f"14. **House Placements** — Which life areas are emphasized (career, relationships, home, spirituality, etc.)\n"
+            f"15. **Angular Houses** — 1st, 4th, 7th, 10th house emphasis and significance\n"
+            f"16. **Nodal Axis** — North Node and South Node (karmic path and past life themes)\n\n"
             
-            f"Provide deep, insightful analysis for each placement and aspect."
-        )
-        
-        prompt_part3 = (
-            f"Continue the birth chart reading for someone born on {date} at {time} in {location}.\n\n"
+            f"**PART 5: SYNTHESIS & INTEGRATION**\n"
+            f"17. **Personality Synthesis** — Integrated personality overview combining all placements\n"
+            f"18. **Life Path & Soul Purpose** — Strengths, challenges, karmic lessons, life mission\n"
+            f"19. **Compatibility** — Which signs, elements, and chart types harmonize well\n"
+            f"20. **Practical Insights** — Actionable advice and guidance for personal growth\n\n"
             
-            f"Provide PART 3 of the birth chart analysis (Life Path & Integration):\n\n"
+            f"**BONUS: PERSONALITY TYPOLOGY ANALYSIS**\n"
+            f"21. **MBTI Type** — Most likely Myers-Briggs type with detailed reasoning (I/E, N/S, T/F, J/P)\n"
+            f"22. **Enneagram Complete Analysis**:\n"
+            f"    - Core Type (1-9) with detailed explanation\n"
+            f"    - Wing (e.g., 4w5 or 4w3)\n"
+            f"    - Tritype (e.g., 459, 468, etc.)\n"
+            f"    - Instinctual Variant (Self-Preservation, Social, Sexual/One-to-One)\n"
+            f"    - Integration and Disintegration arrows\n"
+            f"    - How the chart supports this Enneagram profile\n"
+            f"23. **Big Five Personality Traits** with scores (1-10) and explanations:\n"
+            f"    - Openness to Experience\n"
+            f"    - Conscientiousness\n"
+            f"    - Extraversion\n"
+            f"    - Agreeableness\n"
+            f"    - Neuroticism (Emotional Stability)\n"
+            f"24. **Typology Integration** — How MBTI, Enneagram, and Big Five align with the astrological profile\n\n"
             
-            f"9. **House Placements** — which life areas are most emphasized (career, relationships, home, etc.)\n"
-            f"10. **Personality Synthesis** — integrated personality overview combining all placements\n"
-            f"11. **Life Path & Soul Purpose** — strengths, challenges, karmic lessons, and life mission\n"
-            f"12. **Compatibility** — which signs and elements harmonize well with this birth chart\n"
-            f"13. **Practical Insights** — actionable advice and guidance based on the chart\n\n"
+            f"Note: This is an AI-generated estimate based on astrological principles. "
+            f"For a precise chart, exact birth time and professional ephemeris data are needed.\n\n"
             
-            f"Note: This is an AI-generated estimate. For a precise chart, exact birth time and professional ephemeris data are needed."
-        )
-        
-        prompt_typology = (
-            f"Based on the birth chart for someone born on {date} at {time} in {location}, "
-            f"provide a BONUS personality typology analysis:\n\n"
-            
-            f"**🧠 Personality Typology Predictions (Based on Astrological Chart)**\n\n"
-            
-            f"1. **MBTI Type** — Most likely Myers-Briggs type based on Sun, Moon, Mercury, and Rising signs. "
-            f"Explain the reasoning (e.g., Fire Sun = Extroversion, Water Moon = Feeling, etc.)\n\n"
-            
-            f"2. **Enneagram Type** — Most likely Enneagram type and wing based on core motivations shown in the chart. "
-            f"Explain which planetary placements suggest this type.\n\n"
-            
-            f"3. **Big Five Traits** — Estimate their Big Five personality scores:\n"
-            f"   - Openness (1-10)\n"
-            f"   - Conscientiousness (1-10)\n"
-            f"   - Extraversion (1-10)\n"
-            f"   - Agreeableness (1-10)\n"
-            f"   - Neuroticism (1-10)\n"
-            f"   Explain how the astrological placements suggest these scores.\n\n"
-            
-            f"4. **Integration** — How these typologies align with the astrological profile.\n\n"
-            
-            f"Be specific and explain your reasoning. This is a fun, insightful bonus analysis!"
+            f"BE EXTREMELY DETAILED AND COMPREHENSIVE. This should be a complete, professional-level birth chart reading."
         )
 
         try:
-            # Generate Part 1 - Core Identity
-            resp1 = await self.bot.llm.simple_prompt(
-                prompt_part1,
+            # Generate the complete birth chart in one comprehensive call
+            resp = await self.bot.llm.simple_prompt(
+                full_prompt,
                 system=(
-                    "You are an experienced astrologer. Provide extremely detailed, insightful readings. "
-                    "Structure your response clearly with each section labeled. Be thorough and comprehensive."
+                    "You are a master astrologer with deep expertise in natal chart analysis and personality psychology. "
+                    "Provide an extremely detailed, comprehensive, professional-level birth chart reading. "
+                    "Structure your response clearly with each section labeled and numbered. "
+                    "Be thorough, insightful, and specific. This should be the most complete reading possible."
                 ),
-                max_tokens=2048,
+                max_tokens=8192,  # Maximum tokens for full comprehensive analysis
             )
             
-            # Generate Part 2 - Personal Planets
-            resp2 = await self.bot.llm.simple_prompt(
-                prompt_part2,
-                system=(
-                    "You are an experienced astrologer. Provide extremely detailed, insightful readings. "
-                    "Structure your response clearly with each section labeled. Be thorough and comprehensive."
-                ),
-                max_tokens=2048,
-            )
+            # Smart chunking: Split the response into multiple embeds
+            full_content = resp.content
+            chunk_size = 3900  # Safe limit below Discord's 4096
             
-            # Generate Part 3 - Life Path & Integration
-            resp3 = await self.bot.llm.simple_prompt(
-                prompt_part3,
-                system=(
-                    "You are an experienced astrologer. Provide extremely detailed, insightful readings. "
-                    "Structure your response clearly with each section labeled. Be thorough and comprehensive."
-                ),
-                max_tokens=2048,
-            )
+            # Split content intelligently by sections (look for **PART markers)
+            chunks = []
+            current_chunk = ""
             
-            # Generate Bonus - Personality Typology
-            resp4 = await self.bot.llm.simple_prompt(
-                prompt_typology,
-                system=(
-                    "You are an expert in both astrology and personality psychology. "
-                    "Provide insightful connections between astrological placements and personality typologies. "
-                    "Be specific and explain your reasoning clearly."
-                ),
-                max_tokens=2048,
-            )
-
-            # Send Part 1
-            embed1 = Embedder.standard(
-                "🌟 Birth Chart Reading — Part 1: Core Identity",
-                resp1.content[:4000],  # Safety limit
-                fields=[
-                    ("Date", date, True),
-                    ("Time", time, True),
-                    ("Location", location, True),
-                ],
-            )
-            await interaction.followup.send(embed=embed1)
+            lines = full_content.split('\n')
+            for line in lines:
+                # Check if adding this line would exceed the limit
+                if len(current_chunk) + len(line) + 1 > chunk_size:
+                    # Save current chunk and start a new one
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                    current_chunk = line + '\n'
+                else:
+                    current_chunk += line + '\n'
             
-            # Send Part 2
-            embed2 = Embedder.standard(
-                "🌟 Birth Chart Reading — Part 2: Personal Planets & Communication",
-                resp2.content[:4000],  # Safety limit
-            )
-            await interaction.followup.send(embed=embed2)
+            # Add the last chunk
+            if current_chunk:
+                chunks.append(current_chunk.strip())
             
-            # Send Part 3
-            embed3 = Embedder.standard(
-                "🌟 Birth Chart Reading — Part 3: Life Path & Integration",
-                resp3.content[:4000],  # Safety limit
-            )
-            await interaction.followup.send(embed=embed3)
+            # Send all chunks as separate embeds
+            for i, chunk in enumerate(chunks, 1):
+                if i == 1:
+                    # First embed includes birth info
+                    embed = Embedder.standard(
+                        f"🌟 Birth Chart Reading — Part {i}/{len(chunks)}",
+                        chunk,
+                        fields=[
+                            ("Date", date, True),
+                            ("Time", time, True),
+                            ("Location", location, True),
+                        ],
+                    )
+                else:
+                    # Subsequent embeds
+                    # Check if this is the typology section (contains MBTI or Enneagram)
+                    is_typology = "MBTI" in chunk or "Enneagram" in chunk or "Big Five" in chunk
+                    
+                    if is_typology:
+                        embed = discord.Embed(
+                            title=f"🎁 Birth Chart Reading — Part {i}/{len(chunks)} (Personality Typology)",
+                            description=chunk,
+                            color=discord.Color.purple(),
+                        )
+                        embed.set_footer(text="Based on astrological chart • For entertainment and insight")
+                    else:
+                        embed = Embedder.standard(
+                            f"🌟 Birth Chart Reading — Part {i}/{len(chunks)}",
+                            chunk,
+                        )
+                
+                await interaction.followup.send(embed=embed)
             
-            # Send Bonus Typology
-            embed4 = discord.Embed(
-                title="🎁 BONUS: Personality Typology Analysis",
-                description=resp4.content[:4000],  # Safety limit
-                color=discord.Color.purple(),  # Purple for bonus content
-            )
-            embed4.set_footer(text="Based on astrological chart analysis • For entertainment and insight")
-            await interaction.followup.send(embed=embed4)
-            
-            # Log usage for all four parts
-            total_tokens = resp1.total_tokens + resp2.total_tokens + resp3.total_tokens + resp4.total_tokens
-            avg_latency = (resp1.latency_ms + resp2.latency_ms + resp3.latency_ms + resp4.latency_ms) / 4
-            
+            # Log usage
             await self.bot.database.log_usage(
                 user_id=interaction.user.id,
                 command="birth-chart",
                 guild_id=interaction.guild_id,
-                tokens_used=total_tokens,
-                latency_ms=avg_latency,
+                tokens_used=resp.total_tokens,
+                latency_ms=resp.latency_ms,
             )
 
         except LLMClientError as exc:
