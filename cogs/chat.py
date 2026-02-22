@@ -554,8 +554,8 @@ class ChatCog(commands.Cog, name="Chat"):
                     collected += chunk
                     now = time.time()
                     
-                    # Only send/edit if we have content
-                    if collected and now - last_edit >= STREAMING_EDIT_INTERVAL:
+                    # Only send/edit if we have actual content (not just whitespace)
+                    if collected.strip() and now - last_edit >= STREAMING_EDIT_INTERVAL:
                         if not reply_msg:
                             # Send initial message
                             reply_msg = await message.reply(collected[:2000])
@@ -568,7 +568,7 @@ class ChatCog(commands.Cog, name="Chat"):
                         last_edit = now
                 
                 # Final update - ensure we send the complete response
-                if collected:
+                if collected.strip():
                     if reply_msg:
                         try:
                             await reply_msg.edit(content=collected[:2000])
@@ -581,11 +581,12 @@ class ChatCog(commands.Cog, name="Chat"):
                     await message.reply("I couldn't generate a response. Please try again.")
                 
                 # Add assistant response to history
-                conv["messages"].append({"role": "assistant", "content": collected})
+                if collected.strip():
+                    conv["messages"].append({"role": "assistant", "content": collected})
                 
                 # Estimate tokens and log
                 estimated_tokens = _estimate_tokens(content + collected)
-                self.bot.rate_limiter.consume_tokens(user_id, message.guild.id, estimated_tokens)
+                self.bot.rate_limiter.record_tokens(user_id, message.guild.id, estimated_tokens)
                 await self.bot.database.log_usage(
                     user_id=user_id,
                     command="mention",
