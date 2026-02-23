@@ -22,7 +22,8 @@ from config.constants import (
     STREAMING_EDIT_INTERVAL,
 )
 from utils.embedder import Embedder
-from utils.llm_client import LLMClientError
+from utils.llm_client import LLMClient, LLMClientError
+from utils.analysis_view import AnalysisView, create_analysis_embeds, format_full_report
 
 if TYPE_CHECKING:
     from bot import StarzaiBot
@@ -533,7 +534,7 @@ class ChatCog(commands.Cog, name="Chat"):
 
     @app_commands.command(
         name="analyze",
-        description="Create a comprehensive personality analysis of a user"
+        description="🔥 ULTIMATE personality analysis with 5000+ messages & interactive pages"
     )
     @app_commands.describe(
         user="The user to analyze"
@@ -543,7 +544,7 @@ class ChatCog(commands.Cog, name="Chat"):
         interaction: discord.Interaction,
         user: discord.Member
     ) -> None:
-        """Analyze a user's messages and create a personality profile."""
+        """Create comprehensive personality analysis with deep message search and pagination."""
         await interaction.response.defer(ephemeral=True)
         
         if user.bot:
@@ -558,75 +559,70 @@ class ChatCog(commands.Cog, name="Chat"):
         analyzer_id = str(interaction.user.id)
         
         try:
-            # Try to fetch from database first
-            db_messages = await self.bot.database.search_user_messages(
-                target_user_id, guild_id, limit=200
+            # Send initial progress message
+            progress_msg = await interaction.followup.send(
+                f"🔍 **Starting deep analysis of {user.display_name}...**\n"
+                f"⏳ This may take a minute. Searching up to 5000 messages...",
+                ephemeral=True
             )
             
-            # If no database messages, fetch from Discord history across all channels
-            if not db_messages:
-                await interaction.followup.send(
-                    f"🔍 No cached messages found. Searching Discord history for {user.display_name}...",
-                    ephemeral=True
+            # Try database first (fast path)
+            db_messages = await self.bot.database.search_user_messages(
+                target_user_id, guild_id, limit=5000
+            )
+            
+            # If not enough cached messages, search Discord history
+            if len(db_messages) < 100:
+                messages = await self._deep_message_search(
+                    user, interaction.guild, progress_msg, max_messages=5000
                 )
-                
-                # Search across all text channels
-                messages_found = []
-                for channel in interaction.guild.text_channels:
-                    if len(messages_found) >= 200:
-                        break
-                    
-                    try:
-                        permissions = channel.permissions_for(interaction.guild.me)
-                        if not permissions.read_message_history:
-                            continue
-                        
-                        async for msg in channel.history(limit=500):
-                            if msg.author.id == user.id and msg.content.strip():
-                                messages_found.append({
-                                    'content': msg.content,
-                                    'channel_id': str(channel.id),
-                                    'timestamp': msg.created_at.isoformat()
-                                })
-                                if len(messages_found) >= 200:
-                                    break
-                    except (discord.Forbidden, discord.HTTPException):
-                        continue
-                
-                if not messages_found:
-                    await interaction.followup.send(
-                        f"❌ No message history found for {user.display_name}. "
-                        "They might not have sent many messages yet!",
-                        ephemeral=True
-                    )
-                    return
-                
-                messages = messages_found
             else:
                 messages = db_messages
+                await progress_msg.edit(
+                    content=f"✅ **Found {len(messages):,} cached messages!**\n🧠 Analyzing now..."
+                )
             
-            # Prepare analysis prompt
+            if not messages:
+                await progress_msg.edit(
+                    content=f"❌ No message history found for {user.display_name}. "
+                            "They might not have sent many messages yet!"
+                )
+                return
+            
+            # Prepare comprehensive analysis prompt
+            # Sample messages from different time periods
+            sample_size = min(100, len(messages))
+            step = max(1, len(messages) // sample_size)
             message_samples = "\n".join([
-                f"- {msg['content'][:150]}" for msg in messages[:50]
-            ])
+                f"- {messages[i]['content'][:200]}" 
+                for i in range(0, len(messages), step)
+            ][:100])
             
-            analysis_prompt = f"""Analyze this Discord user based on their message history:
+            analysis_prompt = f"""Analyze this Discord user comprehensively based on {len(messages):,} messages.
 
 User: {user.display_name}
-Messages analyzed: {len(messages)}
-Server: {interaction.guild.name if interaction.guild else 'Unknown'}
+Server: {interaction.guild.name}
+Messages: {len(messages):,}
 
-Sample messages:
+Sample messages (chronologically distributed):
 {message_samples}
 
-Provide a comprehensive analysis including:
-1. **Communication Style**: How they express themselves
-2. **Personality Traits**: Key characteristics you observe
-3. **Interests & Topics**: What they talk about most
-4. **Behavioral Patterns**: Notable habits or patterns
-5. **Activity Level**: How active/engaged they are
+Provide a DETAILED analysis in the following JSON-like structure:
 
-Keep it insightful but respectful. Focus on observable patterns, not judgments."""
+{{
+  "overview": "2-3 sentence high-level summary of who they are",
+  "communication_style": "How they express themselves (tone, length, emoji use, formatting). Use bullet points.",
+  "personality_traits": "Key personality characteristics observed. Use bullet points with emojis.",
+  "interests": "Main topics and interests they discuss. Use bullet points with emojis.",
+  "behavioral_patterns": "Notable habits, patterns, or quirks. Use bullet points.",
+  "activity_patterns": "When/how often they post, engagement level. Use bullet points.",
+  "social_dynamics": "How they interact with others, social role in server. Use bullet points.",
+  "vocabulary": "Unique phrases, favorite words, linguistic style. Use bullet points.",
+  "unique_insights": "Interesting observations that stand out. Use bullet points with emojis."
+}}
+
+Make it insightful, respectful, and engaging. Use Discord markdown formatting (**bold**, *italic*, `code`).
+Focus on observable patterns, not judgments. Be specific with examples when possible."""
 
             # Get analysis from LLM
             model = await self._resolve_model(interaction.user.id)
@@ -638,33 +634,170 @@ Keep it insightful but respectful. Focus on observable patterns, not judgments."
             ):
                 analysis_text += chunk
             
+            # Parse the analysis (try to extract JSON-like structure)
+            analysis_data = self._parse_analysis_response(analysis_text)
+            
             # Store the analysis
-            date_range = f"Last {len(messages)} messages"
+            date_range = f"Last {len(messages):,} messages"
             await self.bot.database.store_user_analysis(
                 target_user_id,
                 guild_id,
                 analyzer_id,
-                {"analysis": analysis_text, "user_name": user.display_name},
+                analysis_data,
                 len(messages),
                 date_range
             )
             
-            # Send the analysis
-            embed = discord.Embed(
-                title=f"📊 Analysis: {user.display_name}",
-                description=analysis_text[:4000],  # Discord embed limit
-                color=discord.Color.blue()
-            )
-            embed.set_footer(text=f"Based on {len(messages)} messages | Cached for future reference")
+            # Create paginated embeds
+            pages = create_analysis_embeds(analysis_data, user.display_name, len(messages))
             
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            # Create full text report
+            full_report = format_full_report(analysis_data, user.display_name, len(messages))
+            
+            # Create interactive view
+            view = AnalysisView(pages, full_report)
+            
+            # Send first page with view
+            await progress_msg.edit(
+                content=None,
+                embed=pages[0],
+                view=view
+            )
+            
+            # Store message reference for timeout handling
+            view.message = progress_msg
             
         except Exception as e:
             logger.error(f"Error analyzing user: {e}", exc_info=True)
-            await interaction.followup.send(
-                f"❌ An error occurred while analyzing {user.display_name}: {str(e)}",
-                ephemeral=True
+            try:
+                await progress_msg.edit(
+                    content=f"❌ An error occurred while analyzing {user.display_name}: {str(e)}"
+                )
+            except:
+                await interaction.followup.send(
+                    f"❌ An error occurred while analyzing {user.display_name}: {str(e)}",
+                    ephemeral=True
+                )
+    
+    def _parse_analysis_response(self, response: str) -> Dict[str, str]:
+        """Parse LLM response into structured analysis data."""
+        import json
+        import re
+        
+        # Try to extract JSON if present
+        json_match = re.search(r'\{[\s\S]*\}', response)
+        if json_match:
+            try:
+                return json.loads(json_match.group())
+            except json.JSONDecodeError:
+                pass
+        
+        # Fallback: parse by section headers
+        sections = {
+            "overview": "",
+            "communication_style": "",
+            "personality_traits": "",
+            "interests": "",
+            "behavioral_patterns": "",
+            "activity_patterns": "",
+            "social_dynamics": "",
+            "vocabulary": "",
+            "unique_insights": ""
+        }
+        
+        # Try to extract sections by headers
+        for key in sections.keys():
+            pattern = rf'"{key}":\s*"([^"]*)"'
+            match = re.search(pattern, response, re.IGNORECASE)
+            if match:
+                sections[key] = match.group(1)
+            else:
+                # Try without quotes
+                pattern = rf'{key}:\s*([^\n]+)'
+                match = re.search(pattern, response, re.IGNORECASE)
+                if match:
+                    sections[key] = match.group(1)
+        
+        # If still empty, just use the whole response as overview
+        if not any(sections.values()):
+            sections["overview"] = response[:1000]
+        
+        return sections
+
+    # ── Helper: deep message search with progress ─────────────────────
+
+    async def _deep_message_search(
+        self,
+        user: discord.Member,
+        guild: discord.Guild,
+        progress_message: discord.InteractionMessage,
+        max_messages: int = 5000
+    ) -> List[Dict[str, Any]]:
+        """
+        Deep search for user messages across all channels with progress updates.
+        
+        Args:
+            user: The user to search for
+            guild: The guild to search in
+            progress_message: Message to update with progress
+            max_messages: Maximum messages to collect
+        
+        Returns:
+            List of message dictionaries with content, channel_id, timestamp
+        """
+        messages_found = []
+        channels_searched = 0
+        total_channels = len([c for c in guild.text_channels if c.permissions_for(guild.me).read_message_history])
+        
+        for channel in guild.text_channels:
+            if len(messages_found) >= max_messages:
+                break
+            
+            try:
+                permissions = channel.permissions_for(guild.me)
+                if not permissions.read_message_history:
+                    continue
+                
+                channels_searched += 1
+                
+                # Update progress every 3 channels
+                if channels_searched % 3 == 0:
+                    try:
+                        await progress_message.edit(
+                            content=f"🔍 **Searching Discord history...**\n"
+                                    f"📊 Progress: {channels_searched}/{total_channels} channels\n"
+                                    f"💬 Found: {len(messages_found):,} messages so far..."
+                        )
+                    except:
+                        pass  # Ignore edit failures
+                
+                # Search this channel
+                async for msg in channel.history(limit=1000):
+                    if msg.author.id == user.id and msg.content.strip():
+                        messages_found.append({
+                            'content': msg.content,
+                            'channel_id': str(channel.id),
+                            'timestamp': msg.created_at.isoformat(),
+                            'channel_name': channel.name
+                        })
+                        if len(messages_found) >= max_messages:
+                            break
+            
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+        
+        # Final progress update
+        try:
+            await progress_message.edit(
+                content=f"✅ **Search complete!**\n"
+                        f"📊 Searched: {channels_searched}/{total_channels} channels\n"
+                        f"💬 Found: {len(messages_found):,} messages\n"
+                        f"🧠 Analyzing now..."
             )
+        except:
+            pass
+        
+        return messages_found
 
     # ── Helper: search messages across server ────────────────────────
 
