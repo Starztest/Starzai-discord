@@ -117,12 +117,13 @@ class DatabaseManager:
             );
 
             CREATE TABLE IF NOT EXISTS bot_identities (
-                user_id         TEXT    PRIMARY KEY,
+                user_id         TEXT    NOT NULL,
                 guild_id        TEXT    NOT NULL,
                 bot_name        TEXT    NOT NULL,
                 relationship    TEXT    DEFAULT 'assistant',
                 created_at      TEXT    DEFAULT (datetime('now')),
                 updated_at      TEXT    DEFAULT (datetime('now'))
+                PRIMARY KEY (user_id, guild_id)
             );
 
             CREATE TABLE IF NOT EXISTS user_analyses (
@@ -397,7 +398,7 @@ class DatabaseManager:
         await self.db.execute(
             """INSERT INTO user_context (user_id, guild_id, recent_messages, last_updated)
                VALUES (?, ?, ?, datetime('now'))
-               ON CONFLICT(user_id) DO UPDATE SET
+               ON CONFLICT(user_id, guild_id) DO UPDATE SET
                    recent_messages = excluded.recent_messages,
                    last_updated = excluded.last_updated""",
             (user_id, guild_id, json.dumps(recent_messages)),
@@ -449,7 +450,7 @@ class DatabaseManager:
         await self.db.execute(
             """INSERT INTO bot_identities (user_id, guild_id, bot_name, relationship, updated_at)
                VALUES (?, ?, ?, ?, datetime('now'))
-               ON CONFLICT(user_id) DO UPDATE SET
+               ON CONFLICT(user_id, guild_id) DO UPDATE SET
                    bot_name = excluded.bot_name,
                    relationship = excluded.relationship,
                    updated_at = excluded.updated_at""",

@@ -574,7 +574,8 @@ class ChatCog(commands.Cog, name="Chat"):
             progress_msg = await interaction.followup.send(
                 f"🔍 **Starting deep analysis of {user.display_name}...**\n"
                 f"⏳ This may take a minute. Searching up to 5000 messages...",
-                ephemeral=True
+                ephemeral=True,
+                wait=True
             )
             
             # Try database first (fast path)
@@ -625,7 +626,7 @@ class ChatCog(commands.Cog, name="Chat"):
             
             # BONUS: Analyze top 3 channels for channel-specific insights
             await update_progress("🎯 Analyzing top 3 channels...")
-            top_channels = self._get_top_channels(messages, top_n=3)
+            top_channels = self._get_top_channels(messages, top_n=3, guild=interaction.guild)
             if top_channels:
                 channel_insights = await self._analyze_top_channels(
                     top_channels, user.display_name, model
@@ -730,20 +731,33 @@ class ChatCog(commands.Cog, name="Chat"):
         
         return sections
 
-    def _get_top_channels(self, messages: List[Dict[str, Any]], top_n: int = 3) -> Dict[str, List[Dict[str, Any]]]:
+    def _get_top_channels(self, messages: List[Dict[str, Any]], top_n: int = 3, guild: Optional[discord.Guild] = None) -> Dict[str, List[Dict[str, Any]]]:
         """Identify top N most active channels and group messages by channel."""
         from collections import Counter
         
-        channel_counts = Counter(msg['channel_name'] for msg in messages)
+        # Handle both channel_name (from live search) and channel_id (from database)
+        channel_counts = Counter()
+        for msg in messages:
+            if 'channel_name' in msg:
+                channel_counts[msg['channel_name']] += 1
+            elif 'channel_id' in msg and guild:
+                # Resolve channel_id to channel_name
+                channel = guild.get_channel(int(msg['channel_id']))
+                if channel:
+                    channel_counts[channel.name] += 1
+                    # Add channel_name to message for consistency
+                    msg['channel_name'] = channel.name
+        
         top_channels = channel_counts.most_common(top_n)
         
         channel_messages = {}
         for channel_name, count in top_channels:
             channel_messages[channel_name] = [
-                msg for msg in messages if msg['channel_name'] == channel_name
+                msg for msg in messages if msg.get('channel_name') == channel_name
             ]
         
         return channel_messages
+
 
     async def _analyze_top_channels(
         self,
@@ -833,7 +847,7 @@ Focus on observable patterns, not judgments. Be specific with examples when poss
             
             analysis_data = self._parse_analysis_response(analysis_text)
             
-            top_channels = self._get_top_channels(messages, top_n=3)
+            top_channels = self._get_top_channels(messages, top_n=3, guild=interaction.guild)
             if top_channels:
                 channel_insights = await self._analyze_top_channels(
                     top_channels, user_name, model
@@ -880,6 +894,7 @@ Focus on observable patterns, not judgments. Be specific with examples when poss
                 f"❌ Error re-analyzing with {model}: {str(e)}",
                 ephemeral=True
             )
+    @app_commands.guild_only()
 
     @app_commands.command(
         name="my-stats",
@@ -925,7 +940,8 @@ Focus on observable patterns, not judgments. Be specific with examples when poss
             progress_msg = await interaction.followup.send(
                 f"⚖️ **Comparing {user1.display_name} vs {user2.display_name}...**\n"
                 f"⏳ Gathering data from both users...",
-                ephemeral=True
+                ephemeral=True,
+                wait=True
             )
             
             # Get messages for both users
