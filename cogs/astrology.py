@@ -15,7 +15,15 @@ from discord.ext import commands
 from config.constants import ZODIAC_EMOJIS, ZODIAC_SIGNS
 from utils.embedder import Embedder
 from utils.llm_client import LLMClientError
-from utils.pdf_generator import create_transit_pdf, create_compatibility_pdf
+
+# Optional PDF generation (gracefully handle if reportlab not installed)
+try:
+    from utils.pdf_generator import create_transit_pdf, create_compatibility_pdf
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+    create_transit_pdf = None
+    create_compatibility_pdf = None
 
 if TYPE_CHECKING:
     from bot import StarzaiBot
@@ -548,33 +556,43 @@ class AstrologyCog(commands.Cog, name="Astrology"):
                 f"For entertainment and personal insight purposes\n"
             )
             
-            # Create PDF
-            pdf_bytes = create_transit_pdf(
-                content, date, time, location, current_date, period_labels[period]
-            )
+            # Create PDF (if available)
+            files_to_send = [discord.File(txt_path, filename=f"transit_forecast_{period}_{date}.txt")]
             
-            # Save to temp files
+            if PDF_AVAILABLE:
+                pdf_bytes = create_transit_pdf(
+                    content, date, time, location, current_date, period_labels[period]
+                )
+                with tempfile.NamedTemporaryFile(mode='wb', suffix='.pdf', delete=False) as pdf_file:
+                    pdf_file.write(pdf_bytes)
+                    pdf_path = pdf_file.name
+                files_to_send.append(discord.File(pdf_path, filename=f"transit_forecast_{period}_{date}.pdf"))
+            
+            # Save txt to temp file
             with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as txt_file:
                 txt_file.write(txt_content)
                 txt_path = txt_file.name
             
-            with tempfile.NamedTemporaryFile(mode='wb', suffix='.pdf', delete=False) as pdf_file:
-                pdf_file.write(pdf_bytes)
-                pdf_path = pdf_file.name
+            files_to_send = [discord.File(txt_path, filename=f"transit_forecast_{period}_{date}.txt")]
+            temp_files = [txt_path]
+            
+            if PDF_AVAILABLE:
+                pdf_bytes = create_transit_pdf(
+                    content, date, time, location, current_date, period_labels[period]
+                )
+                with tempfile.NamedTemporaryFile(mode='wb', suffix='.pdf', delete=False) as pdf_file:
+                    pdf_file.write(pdf_bytes)
+                    pdf_path = pdf_file.name
+                files_to_send.append(discord.File(pdf_path, filename=f"transit_forecast_{period}_{date}.pdf"))
+                temp_files.append(pdf_path)
             
             try:
                 # Send embed with files
-                await interaction.followup.send(
-                    embed=embed,
-                    files=[
-                        discord.File(txt_path, filename=f"transit_forecast_{period}_{date}.txt"),
-                        discord.File(pdf_path, filename=f"transit_forecast_{period}_{date}.pdf"),
-                    ]
-                )
+                await interaction.followup.send(embed=embed, files=files_to_send)
             finally:
                 # Clean up temp files
-                os.unlink(txt_path)
-                os.unlink(pdf_path)
+                for temp_file in temp_files:
+                    os.unlink(temp_file)
             
         except LLMClientError as e:
             logger.error("Transit forecast LLM error: %s", e)
@@ -727,39 +745,37 @@ class AstrologyCog(commands.Cog, name="Astrology"):
                 f"For entertainment and relationship insight purposes\n"
             )
             
-            # Create PDF
-            pdf_bytes = create_compatibility_pdf(
-                content,
-                your_date, your_time, your_location,
-                partner_date, partner_time, partner_location
-            )
-            
             # Save to temp files
             with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as txt_file:
                 txt_file.write(txt_content)
                 txt_path = txt_file.name
             
-            with tempfile.NamedTemporaryFile(mode='wb', suffix='.pdf', delete=False) as pdf_file:
-                pdf_file.write(pdf_bytes)
-                pdf_path = pdf_file.name
+            files_to_send = [discord.File(txt_path, filename=f"compatibility_{your_date}_{partner_date}.txt")]
+            temp_files = [txt_path]
+            
+            if PDF_AVAILABLE:
+                pdf_bytes = create_compatibility_pdf(
+                    content,
+                    your_date, your_time, your_location,
+                    partner_date, partner_time, partner_location
+                )
+                with tempfile.NamedTemporaryFile(mode='wb', suffix='.pdf', delete=False) as pdf_file:
+                    pdf_file.write(pdf_bytes)
+                    pdf_path = pdf_file.name
+                files_to_send.append(discord.File(pdf_path, filename=f"compatibility_{your_date}_{partner_date}.pdf"))
+                temp_files.append(pdf_path)
             
             try:
                 # Send first embed with files
-                await interaction.followup.send(
-                    embed=embeds[0],
-                    files=[
-                        discord.File(txt_path, filename=f"compatibility_{your_date}_{partner_date}.txt"),
-                        discord.File(pdf_path, filename=f"compatibility_{your_date}_{partner_date}.pdf"),
-                    ]
-                )
+                await interaction.followup.send(embed=embeds[0], files=files_to_send)
                 
                 # Send remaining embeds if any
                 for i in range(1, len(embeds)):
                     await interaction.followup.send(embed=embeds[i])
             finally:
                 # Clean up temp files
-                os.unlink(txt_path)
-                os.unlink(pdf_path)
+                for temp_file in temp_files:
+                    os.unlink(temp_file)
             
         except LLMClientError as e:
             logger.error("Compatibility LLM error: %s", e)
