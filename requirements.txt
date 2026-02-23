@@ -4,4 +4,4 @@ aiosqlite>=0.19.0
 python-dotenv>=1.0.0
 cachetools>=5.3.0
 aiofiles>=23.2.0
-
+reportlab>=4.0.0
