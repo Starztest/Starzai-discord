@@ -243,10 +243,13 @@ class AstrologyCog(commands.Cog, name="Astrology"):
         await interaction.response.defer()
 
         # Calculate real birth chart if available
+        logger.info(f"🔵 Starting birth chart calculation...")
         chart_data = None
         if self.astro_calc and ASTRO_AVAILABLE:
+            logger.info(f"🔵 AstroCalculator available, calculating...")
             try:
                 chart_data = await self.astro_calc.calculate_birth_chart(date, time, location)
+                logger.info(f"🔵 Calculation complete, chart_data: {chart_data is not None}")
                 if chart_data:
                     logger.info(f"Calculated real birth chart for {date} {time} {location}")
                 else:

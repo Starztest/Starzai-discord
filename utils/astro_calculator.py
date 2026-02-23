@@ -123,22 +123,26 @@ class AstroCalculator:
     
     async def get_coordinates(self, location: str) -> Optional[Tuple[float, float]]:
         """Convert location name to latitude/longitude with caching."""
+        logger.info(f"🟢 get_coordinates called for: '{location}'")
         if not ASTRO_AVAILABLE:
+            logger.warning("🟢 ASTRO_AVAILABLE is False!")
             return None
         
         # Check cache first
         location_key = location.lower().strip()
         if location_key in _geocode_cache:
-            logger.debug(f"Using cached coordinates for '{location}'")
+            logger.info(f"🟢 Using cached coordinates for '{location}'")
             return _geocode_cache[location_key]
         
         try:
             # Run geocoding in thread pool to avoid blocking
+            logger.info(f"🟢 Starting geocoding for '{location}'...")
             loop = asyncio.get_event_loop()
             loc = await loop.run_in_executor(
                 None, 
                 lambda: self.geocoder.geocode(location, timeout=5)
             )
+            logger.info(f"🟢 Geocoding complete for '{location}'")
             
             if loc:
                 coords = (loc.latitude, loc.longitude)
@@ -268,14 +272,17 @@ class AstroCalculator:
     
     async def calculate_birth_chart(self, date: str, time: str, location: str) -> Optional[BirthChart]:
         """Calculate complete birth chart (async for geocoding)."""
+        logger.info(f"🟢 calculate_birth_chart called: {date} {time} {location}")
         if not ASTRO_AVAILABLE:
-            logger.error("Swiss Ephemeris not available")
+            logger.error("🟢 Swiss Ephemeris not available")
             return None
         
         # Get coordinates (async with caching)
+        logger.info(f"🟢 Getting coordinates...")
         coords = await self.get_coordinates(location)
+        logger.info(f"🟢 Coordinates result: {coords}")
         if not coords:
-            logger.error(f"Could not geocode location: {location}")
+            logger.error(f"🟢 Could not geocode location: {location}")
             return None
         
         lat, lon = coords
