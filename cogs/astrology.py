@@ -693,45 +693,85 @@ class AstrologyCog(commands.Cog, name="Astrology"):
         """Analyze synastry and compatibility between two birth charts."""
         await interaction.response.defer()
         
-        prompt = (
-            f"Perform a detailed synastry and compatibility analysis between:\n\n"
-            f"**Person 1:**\n"
-            f"Birth Date: {your_date}\n"
-            f"Birth Time: {your_time}\n"
-            f"Birth Location: {your_location}\n\n"
-            f"**Person 2:**\n"
-            f"Birth Date: {partner_date}\n"
-            f"Birth Time: {partner_time}\n"
-            f"Birth Location: {partner_location}\n\n"
-            f"Provide a comprehensive compatibility analysis covering:\n\n"
-            f"**OVERALL COMPATIBILITY**\n"
-            f"1. Compatibility Score — Overall rating (1-10) with explanation\n"
-            f"2. Relationship Dynamic — Core energy and interaction style\n"
-            f"3. Soul Connection — Karmic ties and spiritual bond\n\n"
-            f"**SYNASTRY ASPECTS**\n"
-            f"4. Sun-Moon Connections — Emotional and ego compatibility\n"
-            f"5. Venus-Mars Aspects — Romantic and sexual chemistry\n"
-            f"6. Mercury Connections — Communication and mental rapport\n"
-            f"7. Major Challenging Aspects — Areas of friction and growth\n"
-            f"8. Harmonious Aspects — Natural strengths and ease\n\n"
-            f"**RELATIONSHIP AREAS**\n"
-            f"9. Communication — How you understand each other\n"
-            f"10. Emotional Connection — Feelings and nurturing\n"
-            f"11. Romance & Passion — Love language and attraction\n"
-            f"12. Shared Values — What you both care about\n"
-            f"13. Long-term Potential — Sustainability and growth\n\n"
-            f"**STRENGTHS & CHALLENGES**\n"
-            f"14. Relationship Strengths — What works naturally\n"
-            f"15. Growth Areas — Where effort is needed\n"
-            f"16. Advice for Harmony — How to nurture the connection\n\n"
-            f"Be honest, balanced, and constructive. Highlight both strengths and challenges."
-        )
+        # Calculate real birth charts and synastry if available
+        chart1 = None
+        chart2 = None
+        synastry_aspects = None
+        
+        if self.astro_calc and ASTRO_AVAILABLE:
+            try:
+                chart1 = self.astro_calc.calculate_birth_chart(your_date, your_time, your_location)
+                chart2 = self.astro_calc.calculate_birth_chart(partner_date, partner_time, partner_location)
+                
+                if chart1 and chart2:
+                    synastry_aspects = self.astro_calc.calculate_synastry(chart1, chart2)
+                    logger.info(f"Calculated real synastry between {your_date} and {partner_date}")
+            except Exception as e:
+                logger.error(f"Synastry calculation error: {e}")
+        
+        # Build prompt with real data if available
+        if chart1 and chart2 and synastry_aspects:
+            # Format both charts
+            chart1_text = self.astro_calc.format_chart_data(chart1)
+            chart2_text = self.astro_calc.format_chart_data(chart2)
+            
+            # Format synastry aspects
+            synastry_text = "\n".join([str(aspect) for aspect in synastry_aspects[:20]])  # Top 20 aspects
+            
+            prompt = (
+                f"Perform a detailed synastry and compatibility analysis between:\n\n"
+                f"**Person 1:**\n"
+                f"Birth Date: {your_date}\n"
+                f"Birth Time: {your_time}\n"
+                f"Birth Location: {your_location}\n\n"
+                f"**PERSON 1 CHART:**\n"
+                f"{chart1_text}\n\n"
+                f"**Person 2:**\n"
+                f"Birth Date: {partner_date}\n"
+                f"Birth Time: {partner_time}\n"
+                f"Birth Location: {partner_location}\n\n"
+                f"**PERSON 2 CHART:**\n"
+                f"{chart2_text}\n\n"
+                f"**ACTUAL SYNASTRY ASPECTS:**\n"
+                f"{synastry_text}\n\n"
+                f"Provide a comprehensive compatibility analysis covering:\n\n"
+                f"**OVERALL COMPATIBILITY**\n"
+                f"1. Compatibility Score — Overall rating (1-10) based on the aspects above\n"
+                f"2. Relationship Dynamic — Core energy and interaction style\n"
+                f"3. Soul Connection — Karmic ties and spiritual bond\n\n"
+                f"**SYNASTRY ASPECTS**\n"
+                f"4. Sun-Moon Connections — Interpret actual Sun-Moon aspects above\n"
+                f"5. Venus-Mars Aspects — Interpret actual Venus-Mars aspects above\n"
+                f"6. Mercury Connections — Interpret actual Mercury aspects above\n"
+                f"7. Major Challenging Aspects — Interpret squares and oppositions above\n"
+                f"8. Harmonious Aspects — Interpret trines and sextiles above\n\n"
+                f"**RELATIONSHIP AREAS**\n"
+                f"9. Communication — How you understand each other\n"
+                f"10. Emotional Connection — Feelings and nurturing\n"
+                f"11. Romance & Passion — Love language and attraction\n"
+                f"12. Shared Values — What you both care about\n"
+                f"13. Long-term Potential — Sustainability and growth\n\n"
+                f"**STRENGTHS & CHALLENGES**\n"
+                f"14. Relationship Strengths — What works naturally\n"
+                f"15. Growth Areas — Where effort is needed\n"
+                f"16. Advice for Harmony — How to nurture the connection\n\n"
+                f"IMPORTANT: Use the EXACT synastry aspects provided above. Base your analysis on these real connections."
+            )
+        else:
+            # Fallback to AI-only mode
+            prompt = (
+                f"Perform a general compatibility analysis between:\n"
+                f"Person 1: {your_date} at {your_time} in {your_location}\n"
+                f"Person 2: {partner_date} at {partner_time} in {partner_location}\n\n"
+                f"Provide a comprehensive analysis. Note: Real calculations unavailable."
+            )
         
         try:
             resp = await self.bot.llm.simple_prompt(
                 prompt,
                 system=(
                     "You are an expert relationship astrologer specializing in synastry analysis. "
+                    "When provided with REAL synastry aspects, interpret those EXACT aspects accurately. "
                     "Provide balanced, honest assessments that highlight both strengths and challenges. "
                     "Be constructive and focus on how the relationship can thrive."
                 ),
