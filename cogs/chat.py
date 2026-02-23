@@ -70,7 +70,7 @@ class AnalysisOptInView(discord.ui.View):
     
     def __init__(self, db_manager, user_id: str, guild_id: str):
         super().__init__(timeout=300)  # 5 minute timeout
-        self.bot.database = db_manager
+        self.database = db_manager
         self.user_id = user_id
         self.guild_id = guild_id
     
@@ -84,7 +84,7 @@ class AnalysisOptInView(discord.ui.View):
             )
             return
         
-        await self.bot.database.set_analysis_opt_in(self.user_id, self.guild_id, True)
+        await self.database.set_analysis_opt_in(self.user_id, self.guild_id, True)
         await interaction.response.edit_message(
             content="✅ **Analysis Enabled!**\n\n"
                     "You can now be analyzed with `/analyze` and `/compare` commands.\n"
@@ -102,7 +102,7 @@ class AnalysisOptInView(discord.ui.View):
             )
             return
         
-        await self.bot.database.set_analysis_opt_in(self.user_id, self.guild_id, False)
+        await self.database.set_analysis_opt_in(self.user_id, self.guild_id, False)
         await interaction.response.edit_message(
             content="❌ **Analysis Disabled**\n\n"
                     "You won't be analyzed by `/analyze` or `/compare` commands.\n"
