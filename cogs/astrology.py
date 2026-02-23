@@ -25,6 +25,13 @@ except ImportError:
     create_transit_pdf = None
     create_compatibility_pdf = None
 
+# Real astronomical calculations
+try:
+    from utils.astro_calculator import AstroCalculator, ASTRO_AVAILABLE
+except ImportError:
+    ASTRO_AVAILABLE = False
+    AstroCalculator = None
+
 if TYPE_CHECKING:
     from bot import StarzaiBot
 
@@ -234,57 +241,77 @@ class AstrologyCog(commands.Cog, name="Astrology"):
 
         await interaction.response.defer()
 
-        # Generate comprehensive birth chart - detailed analysis
-        full_prompt = (
-            f"Create a detailed and comprehensive birth chart reading for someone born:\n"
-            f"Date: {date}\n"
-            f"Time: {time}\n"
-            f"Location: {location}\n\n"
-            
-            f"Provide an in-depth analysis covering:\n\n"
-            
-            f"**CORE IDENTITY**\n"
-            f"1. Sun Sign — Core identity, ego, life purpose, strengths, shadow side\n"
-            f"2. Moon Sign — Emotional nature, inner world, subconscious patterns, needs\n"
-            f"3. Rising Sign — Outer personality, first impressions, life approach\n"
-            f"4. Chart Ruler — Ruling planet and its profound significance\n\n"
-            
-            f"**PERSONAL PLANETS**\n"
-            f"5. Mercury — Communication style, thinking patterns, learning style\n"
-            f"6. Venus — Love language, relationships, values, aesthetics\n"
-            f"7. Mars — Drive, passion, action style, ambition\n"
-            f"8. Jupiter — Growth, expansion, luck, philosophy\n"
-            f"9. Saturn — Discipline, responsibility, challenges, life lessons\n\n"
-            
-            f"**ASPECTS & ELEMENTS**\n"
-            f"10. Major Planetary Aspects — Conjunctions, oppositions, trines, squares\n"
-            f"11. Dominant Elements — Fire/Earth/Air/Water balance and meaning\n"
-            f"12. House Placements — Life areas emphasized (career, relationships, home, etc.)\n\n"
-            
-            f"**LIFE PATH**\n"
-            f"13. Personality Synthesis — Integrated overview combining all placements\n"
-            f"14. Life Purpose and Strengths — Karmic lessons, life mission\n"
-            f"15. Compatibility — Which signs and elements harmonize well\n\n"
-            
-            f"**PERSONALITY TYPOLOGY**\n"
-            f"16. MBTI Type — Most likely type with detailed reasoning (I/E, N/S, T/F, J/P)\n"
-            f"17. Enneagram — Core Type (1-9), Wing, Tritype, Instinctual Variant (SP/SO/SX)\n"
-            f"18. Big Five Traits — Openness, Conscientiousness, Extraversion, Agreeableness, Neuroticism (scores 1-10)\n\n"
-            
-            f"Be thorough, detailed, and insightful for each section. Provide specific examples and practical insights."
-        )
+        # Calculate real birth chart if available
+        chart_data = None
+        if self.astro_calc and ASTRO_AVAILABLE:
+            try:
+                chart_data = self.astro_calc.calculate_birth_chart(date, time, location)
+                if chart_data:
+                    logger.info(f"Calculated real birth chart for {date} {time} {location}")
+            except Exception as e:
+                logger.error(f"Birth chart calculation error: {e}")
+        
+        # Build prompt with real data if available
+        if chart_data:
+            # Use REAL astronomical data
+            chart_text = self.astro_calc.format_chart_data(chart_data)
+            full_prompt = (
+                f"Interpret this REAL birth chart for someone born:\n"
+                f"Date: {date}\n"
+                f"Time: {time}\n"
+                f"Location: {location}\n\n"
+                f"**ACTUAL ASTRONOMICAL DATA:**\n"
+                f"{chart_text}\n\n"
+                f"Provide an in-depth interpretation covering:\n\n"
+                f"**CORE IDENTITY**\n"
+                f"1. Sun Sign — Core identity, ego, life purpose, strengths, shadow side\n"
+                f"2. Moon Sign — Emotional nature, inner world, subconscious patterns, needs\n"
+                f"3. Rising Sign — Outer personality, first impressions, life approach\n"
+                f"4. Chart Ruler — Ruling planet and its profound significance\n\n"
+                f"**PERSONAL PLANETS**\n"
+                f"5. Mercury — Communication style, thinking patterns, learning style\n"
+                f"6. Venus — Love language, relationships, values, aesthetics\n"
+                f"7. Mars — Drive, passion, action style, ambition\n"
+                f"8. Jupiter — Growth, expansion, luck, philosophy\n"
+                f"9. Saturn — Discipline, responsibility, challenges, life lessons\n\n"
+                f"**ASPECTS & ELEMENTS**\n"
+                f"10. Major Planetary Aspects — Interpret the aspects listed above\n"
+                f"11. Dominant Elements — Fire/Earth/Air/Water balance and meaning\n"
+                f"12. House Placements — Life areas emphasized based on house positions\n\n"
+                f"**LIFE PATH**\n"
+                f"13. Personality Synthesis — Integrated overview combining all placements\n"
+                f"14. Life Purpose and Strengths — Karmic lessons, life mission\n"
+                f"15. Compatibility — Which signs and elements harmonize well\n\n"
+                f"**PERSONALITY TYPOLOGY**\n"
+                f"16. MBTI Type — Most likely type with detailed reasoning (I/E, N/S, T/F, J/P)\n"
+                f"17. Enneagram — Core Type (1-9), Wing, Tritype, Instinctual Variant (SP/SO/SX)\n"
+                f"18. Big Five Traits — Openness, Conscientiousness, Extraversion, Agreeableness, Neuroticism (scores 1-10)\n\n"
+                f"IMPORTANT: Use the EXACT planetary positions and aspects provided above. Do not make up different positions."
+            )
+        else:
+            # Fallback to AI-only mode
+            full_prompt = (
+                f"Create a detailed birth chart reading for someone born:\n"
+                f"Date: {date}\n"
+                f"Time: {time}\n"
+                f"Location: {location}\n\n"
+                f"Provide an in-depth analysis covering all sections as usual.\n"
+                f"Note: Real astronomical calculations unavailable, provide general interpretation."
+            )
 
         try:
-            # Generate the complete birth chart in one comprehensive call
+            # Generate the complete birth chart interpretation
             resp = await self.bot.llm.simple_prompt(
                 full_prompt,
                 system=(
                     "You are a master astrologer with deep expertise in natal chart analysis and personality psychology. "
+                    "When provided with REAL astronomical data, interpret those EXACT positions accurately. "
+                    "Do not make up different planetary positions - use only what is provided. "
                     "Provide a detailed, comprehensive birth chart reading. "
                     "Structure your response clearly with each section labeled and numbered. "
                     "Be thorough, insightful, and specific."
                 ),
-                max_tokens=5000,  # Testing detailed analysis limits
+                max_tokens=5000,
             )
             
             # Smart chunking: Split the response into max 5 pages
@@ -483,39 +510,70 @@ class AstrologyCog(commands.Cog, name="Astrology"):
             "monthly": "This Month"
         }
         
-        prompt = (
-            f"Analyze the current planetary transits for someone born:\n"
-            f"Birth Date: {date}\n"
-            f"Birth Time: {time}\n"
-            f"Birth Location: {location}\n\n"
-            f"Current Date: {current_date}\n"
-            f"Forecast Period: {period_labels[period]}\n\n"
-            f"Provide a detailed transit forecast covering:\n\n"
-            f"**CURRENT TRANSITS**\n"
-            f"1. Major Planetary Transits — Which planets are transiting which houses/natal planets\n"
-            f"2. Most Significant Aspects — Key transit aspects (conjunctions, oppositions, squares, trines)\n"
-            f"3. Transit Themes — Overall energy and themes for this period\n\n"
-            f"**LIFE AREAS ACTIVATED**\n"
-            f"4. Career & Ambition — Professional opportunities and challenges\n"
-            f"5. Relationships & Love — Romantic and social dynamics\n"
-            f"6. Personal Growth — Inner development and spiritual themes\n"
-            f"7. Health & Vitality — Physical and emotional well-being\n\n"
-            f"**TIMING & GUIDANCE**\n"
-            f"8. Best Days — Most favorable days for important activities\n"
-            f"9. Challenging Days — Days requiring extra caution or patience\n"
-            f"10. Opportunities — What to focus on and take advantage of\n"
-            f"11. Warnings — What to avoid or be mindful of\n\n"
-            f"**PRACTICAL ADVICE**\n"
-            f"12. Action Steps — Specific recommendations for this period\n"
-            f"13. Affirmations — Supportive mantras aligned with current energy\n\n"
-            f"Be specific, practical, and insightful. Focus on actionable guidance."
-        )
+        # Calculate real natal chart and transits if available
+        natal_chart = None
+        transit_data = None
+        if self.astro_calc and ASTRO_AVAILABLE:
+            try:
+                natal_chart = self.astro_calc.calculate_birth_chart(date, time, location)
+                if natal_chart:
+                    transit_data = self.astro_calc.calculate_transits(natal_chart, current_date)
+                    logger.info(f"Calculated real transits for {date}")
+            except Exception as e:
+                logger.error(f"Transit calculation error: {e}")
+        
+        # Build prompt with real data if available
+        if natal_chart and transit_data:
+            # Format transit positions
+            transit_text = "\n".join([f"{p.name}: {p.degree:.1f}° {p.sign}" + (" ℞" if p.retrograde else "") 
+                                      for p in transit_data.values()])
+            
+            prompt = (
+                f"Analyze the current planetary transits for someone born:\n"
+                f"Birth Date: {date}\n"
+                f"Birth Time: {time}\n"
+                f"Birth Location: {location}\n\n"
+                f"Current Date: {current_date}\n"
+                f"Forecast Period: {period_labels[period]}\n\n"
+                f"**ACTUAL TRANSITING POSITIONS:**\n"
+                f"{transit_text}\n\n"
+                f"**NATAL CHART (for reference):**\n"
+                f"{self.astro_calc.format_chart_data(natal_chart)}\n\n"
+                f"Provide a detailed transit forecast covering:\n\n"
+                f"**CURRENT TRANSITS**\n"
+                f"1. Major Planetary Transits — Interpret the transiting positions above\n"
+                f"2. Most Significant Aspects — Key transit-to-natal aspects\n"
+                f"3. Transit Themes — Overall energy and themes for this period\n\n"
+                f"**LIFE AREAS ACTIVATED**\n"
+                f"4. Career & Ambition — Professional opportunities and challenges\n"
+                f"5. Relationships & Love — Romantic and social dynamics\n"
+                f"6. Personal Growth — Inner development and spiritual themes\n"
+                f"7. Health & Vitality — Physical and emotional well-being\n\n"
+                f"**TIMING & GUIDANCE**\n"
+                f"8. Best Days — Most favorable days for important activities\n"
+                f"9. Challenging Days — Days requiring extra caution or patience\n"
+                f"10. Opportunities — What to focus on and take advantage of\n"
+                f"11. Warnings — What to avoid or be mindful of\n\n"
+                f"**PRACTICAL ADVICE**\n"
+                f"12. Action Steps — Specific recommendations for this period\n"
+                f"13. Affirmations — Supportive mantras aligned with current energy\n\n"
+                f"IMPORTANT: Use the EXACT transiting positions provided above."
+            )
+        else:
+            # Fallback to AI-only mode
+            prompt = (
+                f"Analyze transits for someone born {date} at {time} in {location}.\n"
+                f"Current Date: {current_date}\n"
+                f"Period: {period_labels[period]}\n\n"
+                f"Provide a general transit forecast. Note: Real calculations unavailable."
+            )
         
         try:
             resp = await self.bot.llm.simple_prompt(
                 prompt,
                 system=(
                     "You are an expert astrologer specializing in transit analysis. "
+                    "When provided with REAL transit positions, interpret those EXACT positions accurately. "
                     "Provide practical, insightful forecasts that help people navigate current energies. "
                     "Be specific about timing and actionable in your guidance."
                 ),
