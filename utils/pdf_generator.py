@@ -1,0 +1,312 @@
+"""
+Beautiful PDF generator for astrology reports.
+"""
+
+from __future__ import annotations
+
+import io
+import re
+from typing import TYPE_CHECKING
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import (
+    PageBreak,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
+
+if TYPE_CHECKING:
+    from typing import List
+
+
+def strip_markdown(text: str) -> str:
+    """Remove Discord/Markdown formatting from text."""
+    # Remove bold (**text** or __text__)
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    # Remove italic (*text* or _text_)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    text = re.sub(r'_(.+?)_', r'\1', text)
+    # Remove strikethrough (~~text~~)
+    text = re.sub(r'~~(.+?)~~', r'\1', text)
+    # Remove inline code (`text`)
+    text = re.sub(r'`(.+?)`', r'\1', text)
+    # Remove code blocks (```text```)
+    text = re.sub(r'```(.+?)```', r'\1', text, flags=re.DOTALL)
+    return text
+
+
+def create_transit_pdf(
+    content: str,
+    birth_date: str,
+    birth_time: str,
+    birth_location: str,
+    current_date: str,
+    period: str,
+) -> bytes:
+    """
+    Create a beautifully formatted PDF for transit predictions.
+    
+    Args:
+        content: The transit forecast content
+        birth_date: Birth date
+        birth_time: Birth time
+        birth_location: Birth location
+        current_date: Current date for forecast
+        period: Forecast period (daily/weekly/monthly)
+    
+    Returns:
+        PDF file as bytes
+    """
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
+    
+    # Styles
+    styles = getSampleStyleSheet()
+    
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=24,
+        textColor=colors.HexColor('#9B59B6'),  # Purple
+        spaceAfter=20,
+        alignment=1,  # Center
+        fontName='Helvetica-Bold',
+    )
+    
+    header_style = ParagraphStyle(
+        'CustomHeader',
+        parent=styles['Heading2'],
+        fontSize=16,
+        textColor=colors.HexColor('#8E44AD'),  # Darker purple
+        spaceAfter=12,
+        spaceBefore=12,
+        fontName='Helvetica-Bold',
+    )
+    
+    body_style = ParagraphStyle(
+        'CustomBody',
+        parent=styles['BodyText'],
+        fontSize=11,
+        leading=16,
+        spaceAfter=10,
+        fontName='Helvetica',
+    )
+    
+    # Build content
+    story = []
+    
+    # Title with decorative border
+    story.append(Paragraph("═" * 60, body_style))
+    story.append(Paragraph(f"🔮 TRANSIT FORECAST — {period.upper()}", title_style))
+    story.append(Paragraph("═" * 60, body_style))
+    story.append(Spacer(1, 0.3*inch))
+    
+    # Birth info table
+    birth_data = [
+        ['Birth Information', ''],
+        ['Date:', birth_date],
+        ['Time:', birth_time],
+        ['Location:', birth_location],
+        ['Forecast Date:', current_date],
+    ]
+    
+    birth_table = Table(birth_data, colWidths=[2*inch, 4*inch])
+    birth_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#9B59B6')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#F4ECF7')),
+        ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#9B59B6')),
+        ('FONTNAME', (0, 1), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 1), (-1, -1), 10),
+        ('TOPPADDING', (0, 1), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 8),
+    ]))
+    
+    story.append(birth_table)
+    story.append(Spacer(1, 0.4*inch))
+    
+    # Clean content
+    clean_content = strip_markdown(content)
+    
+    # Parse and format content sections
+    lines = clean_content.split('\n')
+    for line in lines:
+        line = line.strip()
+        if not line:
+            story.append(Spacer(1, 0.1*inch))
+            continue
+        
+        # Check if it's a section header (all caps or starts with **)
+        if line.isupper() or line.startswith('**'):
+            line = line.replace('**', '').strip()
+            story.append(Paragraph(f"✨ {line}", header_style))
+        else:
+            story.append(Paragraph(line, body_style))
+    
+    # Footer
+    story.append(Spacer(1, 0.3*inch))
+    story.append(Paragraph("─" * 80, body_style))
+    footer_style = ParagraphStyle(
+        'Footer',
+        parent=styles['Normal'],
+        fontSize=9,
+        textColor=colors.grey,
+        alignment=1,
+    )
+    story.append(Paragraph(
+        "Generated by Starzai • AI-Powered Astrological Analysis<br/>"
+        "For entertainment and personal insight purposes",
+        footer_style
+    ))
+    
+    # Build PDF
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def create_compatibility_pdf(
+    content: str,
+    person1_date: str,
+    person1_time: str,
+    person1_location: str,
+    person2_date: str,
+    person2_time: str,
+    person2_location: str,
+) -> bytes:
+    """
+    Create a beautifully formatted PDF for compatibility analysis.
+    
+    Args:
+        content: The compatibility analysis content
+        person1_date: Person 1 birth date
+        person1_time: Person 1 birth time
+        person1_location: Person 1 birth location
+        person2_date: Person 2 birth date
+        person2_time: Person 2 birth time
+        person2_location: Person 2 birth location
+    
+    Returns:
+        PDF file as bytes
+    """
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
+    
+    # Styles
+    styles = getSampleStyleSheet()
+    
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=24,
+        textColor=colors.HexColor('#FF1493'),  # Deep pink
+        spaceAfter=20,
+        alignment=1,  # Center
+        fontName='Helvetica-Bold',
+    )
+    
+    header_style = ParagraphStyle(
+        'CustomHeader',
+        parent=styles['Heading2'],
+        fontSize=16,
+        textColor=colors.HexColor('#C71585'),  # Medium violet red
+        spaceAfter=12,
+        spaceBefore=12,
+        fontName='Helvetica-Bold',
+    )
+    
+    body_style = ParagraphStyle(
+        'CustomBody',
+        parent=styles['BodyText'],
+        fontSize=11,
+        leading=16,
+        spaceAfter=10,
+        fontName='Helvetica',
+    )
+    
+    # Build content
+    story = []
+    
+    # Title with hearts
+    story.append(Paragraph("♥" * 40, body_style))
+    story.append(Paragraph("💕 COMPATIBILITY ANALYSIS 💕", title_style))
+    story.append(Paragraph("♥" * 40, body_style))
+    story.append(Spacer(1, 0.3*inch))
+    
+    # Birth info table for both people
+    birth_data = [
+        ['', 'Person 1', 'Person 2'],
+        ['Birth Date:', person1_date, person2_date],
+        ['Birth Time:', person1_time, person2_time],
+        ['Birth Location:', person1_location, person2_location],
+    ]
+    
+    birth_table = Table(birth_data, colWidths=[1.5*inch, 2.5*inch, 2.5*inch])
+    birth_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#FF69B4')),  # Hot pink
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#FFF0F5')),  # Lavender blush
+        ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#FF69B4')),
+        ('FONTNAME', (0, 1), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 1), (-1, -1), 10),
+        ('TOPPADDING', (0, 1), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 8),
+    ]))
+    
+    story.append(birth_table)
+    story.append(Spacer(1, 0.4*inch))
+    
+    # Clean content
+    clean_content = strip_markdown(content)
+    
+    # Parse and format content sections
+    lines = clean_content.split('\n')
+    for line in lines:
+        line = line.strip()
+        if not line:
+            story.append(Spacer(1, 0.1*inch))
+            continue
+        
+        # Check if it's a section header
+        if line.isupper() or line.startswith('**'):
+            line = line.replace('**', '').strip()
+            story.append(Paragraph(f"💖 {line}", header_style))
+        else:
+            story.append(Paragraph(line, body_style))
+    
+    # Footer
+    story.append(Spacer(1, 0.3*inch))
+    story.append(Paragraph("─" * 80, body_style))
+    footer_style = ParagraphStyle(
+        'Footer',
+        parent=styles['Normal'],
+        fontSize=9,
+        textColor=colors.grey,
+        alignment=1,
+    )
+    story.append(Paragraph(
+        "Generated by Starzai • AI-Powered Synastry Analysis<br/>"
+        "For entertainment and relationship insight purposes",
+        footer_style
+    ))
+    
+    # Build PDF
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
