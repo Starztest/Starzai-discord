@@ -65,6 +65,52 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+class AnalysisOptInView(discord.ui.View):
+    """Interactive view for analysis opt-in/opt-out."""
+    
+    def __init__(self, db_manager, user_id: str, guild_id: str):
+        super().__init__(timeout=300)  # 5 minute timeout
+        self.db_manager = db_manager
+        self.user_id = user_id
+        self.guild_id = guild_id
+    
+    @discord.ui.button(label="✅ Allow Analysis", style=discord.ButtonStyle.success)
+    async def allow_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Handle opt-in button click."""
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message(
+                "❌ This button is not for you! Use `/allow-analysis` to manage your own settings.",
+                ephemeral=True
+            )
+            return
+        
+        await self.db_manager.set_analysis_opt_in(self.user_id, self.guild_id, True)
+        await interaction.response.edit_message(
+            content="✅ **Analysis Enabled!**\n\n"
+                    "You can now be analyzed with `/analyze` and `/compare` commands.\n"
+                    "Use `/allow-analysis` again anytime to disable.",
+            view=None
+        )
+    
+    @discord.ui.button(label="❌ Disable Analysis", style=discord.ButtonStyle.danger)
+    async def disable_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Handle opt-out button click."""
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message(
+                "❌ This button is not for you! Use `/allow-analysis` to manage your own settings.",
+                ephemeral=True
+            )
+            return
+        
+        await self.db_manager.set_analysis_opt_in(self.user_id, self.guild_id, False)
+        await interaction.response.edit_message(
+            content="❌ **Analysis Disabled**\n\n"
+                    "You won't be analyzed by `/analyze` or `/compare` commands.\n"
+                    "Use `/allow-analysis` again anytime to re-enable.",
+            view=None
+        )
+
+
 class ChatCog(commands.Cog, name="Chat"):
     """Core AI chat features powered by MegaLLM."""
 
@@ -569,6 +615,18 @@ class ChatCog(commands.Cog, name="Chat"):
         guild_id = str(interaction.guild_id) if interaction.guild_id else "0"
         analyzer_id = str(interaction.user.id)
         
+        # Check if analyzing self (always allowed) or if target user has opted in
+        is_self_analysis = target_user_id == analyzer_id
+        if not is_self_analysis:
+            has_opted_in = await self.db_manager.get_analysis_opt_in(target_user_id, guild_id)
+            if not has_opted_in:
+                await interaction.followup.send(
+                    f"❌ {user.mention} hasn't enabled analysis yet. "
+                    f"They can use `/allow-analysis` to opt in!",
+                    ephemeral=True
+                )
+                return
+        
         try:
             # Send initial progress message
             progress_msg = await interaction.followup.send(
@@ -905,6 +963,54 @@ Focus on observable patterns, not judgments. Be specific with examples when poss
         # Just call analyze_user with the interaction user
         await self.analyze_user(interaction, interaction.user)
 
+
+    @app_commands.command(
+        name="allow-analysis",
+        description="🔐 Manage your analysis privacy settings"
+    )
+    @app_commands.guild_only()
+    async def allow_analysis(self, interaction: discord.Interaction) -> None:
+        """Allow or disable personality analysis features."""
+        # Check current opt-in status
+        current_status = await self.db_manager.get_analysis_opt_in(
+            str(interaction.user.id),
+            str(interaction.guild.id)
+        )
+        
+        status_text = "✅ **Currently Enabled**" if current_status else "❌ **Currently Disabled**"
+        
+        disclaimer = f"""🔍 **User Analysis Feature**
+
+{status_text}
+
+This bot can create personality insights based on your Discord messages!
+
+**What we analyze:**
+• Communication style & tone
+• Personality traits & interests  
+• Activity patterns
+• Word frequency & vocabulary
+
+**Your privacy:**
+• Only opted-in users can be analyzed
+• You can toggle this on/off anytime
+• Your data stays in this server
+• Analysis is respectful & insightful
+
+Ready to see what makes you unique? 🌟"""
+        
+        view = AnalysisOptInView(
+            self.db_manager,
+            str(interaction.user.id),
+            str(interaction.guild.id)
+        )
+        
+        await interaction.response.send_message(
+            disclaimer,
+            view=view,
+            ephemeral=True
+        )
+
     @app_commands.command(
         name="compare",
         description="⚖️ Compare two users side-by-side"
@@ -935,6 +1041,32 @@ Focus on observable patterns, not judgments. Be specific with examples when poss
                 ephemeral=True
             )
             return
+        
+        # Check if both users have opted in (unless comparing with self)
+        guild_id = str(interaction.guild_id) if interaction.guild_id else "0"
+        analyzer_id = str(interaction.user.id)
+        
+        # Check user1 opt-in (unless it's the analyzer themselves)
+        if str(user1.id) != analyzer_id:
+            has_opted_in = await self.db_manager.get_analysis_opt_in(str(user1.id), guild_id)
+            if not has_opted_in:
+                await interaction.followup.send(
+                    f"❌ {user1.mention} hasn't enabled analysis yet. "
+                    f"They can use `/allow-analysis` to opt in!",
+                    ephemeral=True
+                )
+                return
+        
+        # Check user2 opt-in (unless it's the analyzer themselves)
+        if str(user2.id) != analyzer_id:
+            has_opted_in = await self.db_manager.get_analysis_opt_in(str(user2.id), guild_id)
+            if not has_opted_in:
+                await interaction.followup.send(
+                    f"❌ {user2.mention} hasn't enabled analysis yet. "
+                    f"They can use `/allow-analysis` to opt in!",
+                    ephemeral=True
+                )
+                return
         
         try:
             progress_msg = await interaction.followup.send(

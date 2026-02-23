@@ -138,6 +138,16 @@ class DatabaseManager:
                 UNIQUE(target_user_id, guild_id, analyzer_user_id)
             );
 
+
+            CREATE TABLE IF NOT EXISTS analysis_opt_in (
+                user_id         TEXT    NOT NULL,
+                guild_id        TEXT    NOT NULL,
+                opted_in        INTEGER DEFAULT 0,
+                created_at      TEXT    DEFAULT (datetime('now')),
+                updated_at      TEXT    DEFAULT (datetime('now')),
+                PRIMARY KEY (user_id, guild_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_conversations_user
                 ON conversations(user_id, active);
             CREATE INDEX IF NOT EXISTS idx_usage_logs_user
@@ -575,3 +585,28 @@ class DatabaseManager:
                     "created_at": row["created_at"],
                 }
         return None
+
+    async def set_analysis_opt_in(self, user_id: str, guild_id: str, opted_in: bool) -> None:
+        """Set user's analysis opt-in preference."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO analysis_opt_in (user_id, guild_id, opted_in, updated_at)
+                VALUES (?, ?, ?, datetime('now'))
+                ON CONFLICT(user_id, guild_id) DO UPDATE SET
+                    opted_in = excluded.opted_in,
+                    updated_at = datetime('now')
+                """,
+                (user_id, guild_id, 1 if opted_in else 0)
+            )
+            await db.commit()
+    
+    async def get_analysis_opt_in(self, user_id: str, guild_id: str) -> bool:
+        """Check if user has opted in to analysis features."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT opted_in FROM analysis_opt_in WHERE user_id = ? AND guild_id = ?",
+                (user_id, guild_id)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return bool(row[0]) if row else False
