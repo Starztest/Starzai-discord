@@ -225,67 +225,44 @@ class AstrologyCog(commands.Cog, name="Astrology"):
 
         await interaction.response.defer()
 
-        # Generate comprehensive birth chart in one go, then split intelligently
+        # Generate comprehensive birth chart - optimized for 5 pages
         full_prompt = (
-            f"Create an EXTREMELY DETAILED and comprehensive birth chart reading for someone born:\n"
-            f"📅 Date: {date}\n"
-            f"🕐 Time: {time} (24-hour format)\n"
-            f"📍 Location: {location}\n\n"
+            f"Create a detailed birth chart reading for someone born:\n"
+            f"Date: {date}\n"
+            f"Time: {time}\n"
+            f"Location: {location}\n\n"
             
-            f"Provide a complete, in-depth birth chart analysis covering ALL of the following sections. "
-            f"Be as detailed and thorough as possible for each section:\n\n"
+            f"Provide a comprehensive analysis covering:\n\n"
             
-            f"**PART 1: CORE IDENTITY**\n"
-            f"1. **Sun Sign** — Core identity, ego, life purpose, strengths, shadow side (be extremely detailed)\n"
-            f"2. **Moon Sign** — Emotional nature, inner world, subconscious patterns, needs, childhood (very thorough)\n"
-            f"3. **Rising Sign (Ascendant)** — Outer personality, first impressions, life approach, physical appearance tendencies\n"
-            f"4. **Chart Ruler** — The planet ruling the rising sign and its profound significance\n\n"
+            f"**CORE IDENTITY**\n"
+            f"1. Sun Sign — Core identity, ego, life purpose\n"
+            f"2. Moon Sign — Emotional nature, inner world\n"
+            f"3. Rising Sign — Outer personality, first impressions\n"
+            f"4. Chart Ruler — Ruling planet significance\n\n"
             
-            f"**PART 2: PERSONAL PLANETS**\n"
-            f"5. **Mercury Placement** — Communication style, thinking patterns, learning style, mental processes, decision-making\n"
-            f"6. **Venus Placement** — Love language, relationships, values, aesthetics, pleasure, money attitudes\n"
-            f"7. **Mars Placement** — Drive, passion, action style, anger expression, sexual energy, ambition\n"
-            f"8. **Jupiter Placement** — Growth, expansion, luck, philosophy, optimism, where they thrive\n"
-            f"9. **Saturn Placement** — Discipline, responsibility, challenges, life lessons, karmic themes\n\n"
+            f"**PERSONAL PLANETS**\n"
+            f"5. Mercury — Communication and thinking style\n"
+            f"6. Venus — Love, relationships, values\n"
+            f"7. Mars — Drive, passion, action\n"
+            f"8. Jupiter — Growth and expansion\n"
+            f"9. Saturn — Discipline and challenges\n\n"
             
-            f"**PART 3: OUTER PLANETS & ASPECTS**\n"
-            f"10. **Uranus, Neptune, Pluto** — Generational influences and personal manifestations\n"
-            f"11. **Major Planetary Aspects** — Conjunctions, oppositions, trines, squares, and their meanings\n"
-            f"12. **Dominant Elements** — Fire, Earth, Air, Water balance and what it means\n"
-            f"13. **Dominant Modalities** — Cardinal, Fixed, Mutable balance and implications\n\n"
+            f"**ASPECTS & ELEMENTS**\n"
+            f"10. Major Planetary Aspects\n"
+            f"11. Dominant Elements (Fire/Earth/Air/Water)\n"
+            f"12. House Placements\n\n"
             
-            f"**PART 4: HOUSES & LIFE AREAS**\n"
-            f"14. **House Placements** — Which life areas are emphasized (career, relationships, home, spirituality, etc.)\n"
-            f"15. **Angular Houses** — 1st, 4th, 7th, 10th house emphasis and significance\n"
-            f"16. **Nodal Axis** — North Node and South Node (karmic path and past life themes)\n\n"
+            f"**LIFE PATH**\n"
+            f"13. Personality Synthesis\n"
+            f"14. Life Purpose and Strengths\n"
+            f"15. Compatibility\n\n"
             
-            f"**PART 5: SYNTHESIS & INTEGRATION**\n"
-            f"17. **Personality Synthesis** — Integrated personality overview combining all placements\n"
-            f"18. **Life Path & Soul Purpose** — Strengths, challenges, karmic lessons, life mission\n"
-            f"19. **Compatibility** — Which signs, elements, and chart types harmonize well\n"
-            f"20. **Practical Insights** — Actionable advice and guidance for personal growth\n\n"
+            f"**PERSONALITY TYPOLOGY**\n"
+            f"16. MBTI Type (with reasoning)\n"
+            f"17. Enneagram (Core Type, Wing, Tritype, Instinctual Variant)\n"
+            f"18. Big Five Traits (scores 1-10)\n\n"
             
-            f"**BONUS: PERSONALITY TYPOLOGY ANALYSIS**\n"
-            f"21. **MBTI Type** — Most likely Myers-Briggs type with detailed reasoning (I/E, N/S, T/F, J/P)\n"
-            f"22. **Enneagram Complete Analysis**:\n"
-            f"    - Core Type (1-9) with detailed explanation\n"
-            f"    - Wing (e.g., 4w5 or 4w3)\n"
-            f"    - Tritype (e.g., 459, 468, etc.)\n"
-            f"    - Instinctual Variant (Self-Preservation, Social, Sexual/One-to-One)\n"
-            f"    - Integration and Disintegration arrows\n"
-            f"    - How the chart supports this Enneagram profile\n"
-            f"23. **Big Five Personality Traits** with scores (1-10) and explanations:\n"
-            f"    - Openness to Experience\n"
-            f"    - Conscientiousness\n"
-            f"    - Extraversion\n"
-            f"    - Agreeableness\n"
-            f"    - Neuroticism (Emotional Stability)\n"
-            f"24. **Typology Integration** — How MBTI, Enneagram, and Big Five align with the astrological profile\n\n"
-            
-            f"Note: This is an AI-generated estimate based on astrological principles. "
-            f"For a precise chart, exact birth time and professional ephemeris data are needed.\n\n"
-            
-            f"BE EXTREMELY DETAILED AND COMPREHENSIVE. This should be a complete, professional-level birth chart reading."
+            f"Be detailed and insightful for each section."
         )
 
         try:
@@ -301,10 +278,10 @@ class AstrologyCog(commands.Cog, name="Astrology"):
                 max_tokens=6000,  # Balanced token limit for comprehensive analysis
             )
             
-            # Smart chunking: Split the response into max 7 pages
+            # Smart chunking: Split the response into max 5 pages
             full_content = resp.content
             chunk_size = 3900  # Safe limit below Discord's 4096
-            max_pages = 7  # Maximum number of pages
+            max_pages = 5  # Maximum number of pages
             
             # Split content intelligently by sections
             chunks = []
