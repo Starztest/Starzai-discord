@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import re
 import time
 from typing import TYPE_CHECKING, Dict, Optional
 
@@ -33,6 +34,18 @@ SYSTEM_PROMPT = (
     "Be helpful, concise, and engaging. Use Discord markdown formatting: "
     "**bold**, *italic*, __underline__, ~~strikethrough~~, `code`, ```code blocks```. "
     "Keep responses natural and conversational. If you don't know something, say so honestly."
+)
+
+# Extended system prompt template for @mention conversations with server context
+MENTION_SYSTEM_PROMPT = (
+    "You are Starzai, a friendly and knowledgeable AI assistant on Discord. "
+    "Be helpful, concise, and engaging. Use Discord markdown formatting: "
+    "**bold**, *italic*, __underline__, ~~strikethrough~~, `code`, ```code blocks```. "
+    "Keep responses natural and conversational. If you don't know something, say so honestly.\n\n"
+    "Context: You are chatting in the Discord server \"{server_name}\" in the #{channel_name} channel. "
+    "The user talking to you is \"{user_display_name}\". "
+    "When the user mentions other people by name in their messages, those are real users in the server — "
+    "acknowledge them naturally."
 )
 
 # Auto-expiry for @mention conversations (10 minutes of inactivity)
@@ -473,6 +486,46 @@ class ChatCog(commands.Cog, name="Chat"):
             ephemeral=True,
         )
 
+    # ── Helper: resolve mentions to display names ─────────────────────
+
+    def _resolve_message_mentions(self, message: discord.Message) -> str:
+        """
+        Process message content to properly handle mentions:
+        - Remove the bot's own mention (it's just the trigger)
+        - Replace other user mentions with their display names
+        - Replace role mentions with role names
+        - Replace channel mentions with channel names
+        """
+        content = message.content
+        bot_id = self.bot.user.id
+
+        # Step 1: Replace OTHER users' mentions with their display names
+        for mention in message.mentions:
+            if mention.id == bot_id:
+                continue  # Skip the bot mention — we'll remove it separately
+            display_name = mention.display_name
+            content = content.replace(f"<@{mention.id}>", f"@{display_name}")
+            content = content.replace(f"<@!{mention.id}>", f"@{display_name}")
+
+        # Step 2: Remove the bot's own mention (the conversation trigger)
+        content = content.replace(f"<@{bot_id}>", "")
+        content = content.replace(f"<@!{bot_id}>", "")
+
+        # Step 3: Resolve role mentions to role names
+        for role in message.role_mentions:
+            content = content.replace(f"<@&{role.id}>", f"@{role.name}")
+
+        # Step 4: Resolve channel mentions to channel names
+        if message.guild:
+            channel_pattern = re.compile(r"<#(\d+)>")
+            for match in channel_pattern.finditer(content):
+                channel_id = int(match.group(1))
+                channel = message.guild.get_channel(channel_id)
+                if channel:
+                    content = content.replace(match.group(0), f"#{channel.name}")
+
+        return content.strip()
+
     # ── @mention handler ─────────────────────────────────────────────
 
     @commands.Cog.listener()
@@ -486,11 +539,8 @@ class ChatCog(commands.Cog, name="Chat"):
         if self.bot.user not in message.mentions:
             return
         
-        # Remove the mention from the message
-        content = message.content
-        for mention in message.mentions:
-            content = content.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
-        content = content.strip()
+        # Resolve mentions: strip bot mention, convert user/role/channel mentions to names
+        content = self._resolve_message_mentions(message)
         
         if not content:
             await message.reply("Hey! You mentioned me but didn't say anything. How can I help? 😊")
@@ -538,8 +588,13 @@ class ChatCog(commands.Cog, name="Chat"):
         # Get user's preferred model
         model = await self._resolve_model(user_id)
         
-        # Build messages for API
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # Build messages for API with server context
+        system_prompt = MENTION_SYSTEM_PROMPT.format(
+            server_name=message.guild.name,
+            channel_name=message.channel.name if hasattr(message.channel, 'name') else "DM",
+            user_display_name=message.author.display_name,
+        )
+        messages = [{"role": "system", "content": system_prompt}]
         messages.extend(conv["messages"])
         
         # Show typing indicator
