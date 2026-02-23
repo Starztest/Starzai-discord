@@ -724,6 +724,154 @@ Focus on observable patterns, not judgments. Be specific with examples when poss
         
         return sections
 
+    @app_commands.command(
+        name="my-stats",
+        description="📊 View your own personality analysis and statistics"
+    )
+    async def my_stats(self, interaction: discord.Interaction) -> None:
+        """Quick access to analyze yourself."""
+        # Just call analyze_user with the interaction user
+        await self.analyze_user(interaction, interaction.user)
+
+    @app_commands.command(
+        name="compare",
+        description="⚖️ Compare two users side-by-side"
+    )
+    @app_commands.describe(
+        user1="First user to compare",
+        user2="Second user to compare"
+    )
+    async def compare_users(
+        self,
+        interaction: discord.Interaction,
+        user1: discord.Member,
+        user2: discord.Member
+    ) -> None:
+        """Compare two users' communication styles and personalities."""
+        await interaction.response.defer(ephemeral=True)
+        
+        if user1.bot or user2.bot:
+            await interaction.followup.send(
+                "❌ I can't compare bots!",
+                ephemeral=True
+            )
+            return
+        
+        if user1.id == user2.id:
+            await interaction.followup.send(
+                "❌ Please select two different users to compare!",
+                ephemeral=True
+            )
+            return
+        
+        try:
+            progress_msg = await interaction.followup.send(
+                f"⚖️ **Comparing {user1.display_name} vs {user2.display_name}...**\n"
+                f"⏳ Gathering data from both users...",
+                ephemeral=True
+            )
+            
+            # Get messages for both users
+            guild_id = str(interaction.guild_id)
+            
+            messages1 = await self.bot.database.search_user_messages(
+                str(user1.id), guild_id, limit=1000
+            )
+            messages2 = await self.bot.database.search_user_messages(
+                str(user2.id), guild_id, limit=1000
+            )
+            
+            # If not enough cached, search Discord
+            if len(messages1) < 50:
+                messages1 = await self._deep_message_search(
+                    user1, interaction.guild, progress_msg, max_messages=1000
+                )
+            if len(messages2) < 50:
+                await progress_msg.edit(
+                    content=f"⚖️ **Comparing {user1.display_name} vs {user2.display_name}...**\n"
+                            f"⏳ Gathering data from {user2.display_name}..."
+                )
+                messages2 = await self._deep_message_search(
+                    user2, interaction.guild, progress_msg, max_messages=1000
+                )
+            
+            if not messages1 or not messages2:
+                await progress_msg.edit(
+                    content=f"❌ Not enough message history for comparison. "
+                            f"Need at least 50 messages from each user."
+                )
+                return
+            
+            # Prepare comparison prompt
+            sample1 = "\n".join([f"- {m['content'][:150]}" for m in messages1[:30]])
+            sample2 = "\n".join([f"- {m['content'][:150]}" for m in messages2[:30]])
+            
+            comparison_prompt = f"""Compare these two Discord users side-by-side:
+
+**User 1: {user1.display_name}** ({len(messages1)} messages)
+Sample messages:
+{sample1}
+
+**User 2: {user2.display_name}** ({len(messages2)} messages)
+Sample messages:
+{sample2}
+
+Provide a comparative analysis covering:
+1. **Communication Styles**: How do they differ in expression?
+2. **Personality Differences**: Key contrasts in personality
+3. **Similarities**: What do they have in common?
+4. **Activity Levels**: Who's more active/engaged?
+5. **Unique Traits**: What makes each one stand out?
+
+Format with bullet points and emojis. Be insightful and respectful."""
+
+            await progress_msg.edit(
+                content=f"⚖️ **Comparing {user1.display_name} vs {user2.display_name}...**\n"
+                        f"🧠 Analyzing differences and similarities..."
+            )
+            
+            # Get comparison from LLM
+            model = await self._resolve_model(interaction.user.id)
+            comparison_text = ""
+            
+            async for chunk in self.bot.llm.chat_stream(
+                [{"role": "user", "content": comparison_prompt}],
+                model=model
+            ):
+                comparison_text += chunk
+            
+            # Create comparison embed
+            embed = discord.Embed(
+                title=f"⚖️ Comparison: {user1.display_name} vs {user2.display_name}",
+                description=comparison_text[:4000],
+                color=discord.Color.gold()
+            )
+            embed.add_field(
+                name=f"📊 {user1.display_name}",
+                value=f"{len(messages1):,} messages analyzed",
+                inline=True
+            )
+            embed.add_field(
+                name=f"📊 {user2.display_name}",
+                value=f"{len(messages2):,} messages analyzed",
+                inline=True
+            )
+            embed.set_footer(text="Comparative analysis • Based on message history")
+            
+            await progress_msg.edit(content=None, embed=embed)
+            
+        except Exception as e:
+            logger.error(f"Error comparing users: {e}", exc_info=True)
+            try:
+                await progress_msg.edit(
+                    content=f"❌ An error occurred during comparison: {str(e)}"
+                )
+            except:
+                await interaction.followup.send(
+                    f"❌ An error occurred during comparison: {str(e)}",
+                    ephemeral=True
+                )
+
     # ── Helper: deep message search with progress ─────────────────────
 
     async def _deep_message_search(
