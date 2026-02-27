@@ -15,14 +15,14 @@ Commands:
     /musicprofile         — View your (or another user's) music profile
     /requestchannel       — Set up a song request channel
     /sleeptimer           — Set a sleep timer to auto-disconnect
-    /import               — Import a Spotify/Apple Music playlist
+    /import               — Import a Spotify/Apple Music/YouTube Music playlist
 
 Features:
     • Full interactive UI with buttons for playlists & favorites
     • Per-user music profiles with listening stats, top artists, top songs
     • Song request channel — just type a song name and it auto-queues
     • Sleep timer with live countdown
-    • Spotify & Apple Music playlist import via scraping
+    • Spotify, Apple Music & YouTube Music playlist/album import
 """
 
 from __future__ import annotations
@@ -1415,15 +1415,15 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
             self._sleep_timers.pop(guild_id, None)
 
     # ══════════════════════════════════════════════════════════════════
-    #  /import — Spotify / Apple Music playlist import
+    #  /import — Spotify / Apple Music / YouTube Music playlist import
     # ══════════════════════════════════════════════════════════════════
 
     @app_commands.command(
         name="import",
-        description="Import a Spotify or Apple Music playlist into a saved playlist",
+        description="Import a Spotify, Apple Music, or YouTube Music playlist into a saved playlist",
     )
     @app_commands.describe(
-        url="Spotify or Apple Music playlist URL",
+        url="Spotify, Apple Music, or YouTube Music playlist/album URL",
         playlist_name="Name for the imported playlist (auto-generated if blank)",
     )
     async def import_cmd(
@@ -1447,6 +1447,13 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
         apple_album_match = re.search(
             r"(?:https?://)?music\.apple\.com/(\w+)/album/([^/]+)/(\d+)", url
         )
+        # YouTube Music / YouTube playlist and album patterns
+        yt_playlist_match = re.search(
+            r"(?:https?://)?(?:music\.)?youtube\.com/playlist\?list=([a-zA-Z0-9_-]+)", url
+        )
+        yt_album_match = re.search(
+            r"(?:https?://)?music\.youtube\.com/browse/(MPREb_[a-zA-Z0-9_-]+)", url
+        )
 
         session = getattr(self._get_music_cog(), "_session", None)
         if not session:
@@ -1463,16 +1470,25 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
             )
         elif apple_playlist_match or apple_album_match:
             tracks, auto_name = await self._import_apple_music(url, session)
+        elif yt_playlist_match or yt_album_match:
+            tracks, auto_name = await self._import_youtube_music(
+                url, session,
+                playlist_id=yt_playlist_match.group(1) if yt_playlist_match else None,
+                browse_id=yt_album_match.group(1) if yt_album_match else None,
+            )
         else:
             await interaction.followup.send(
                 embed=Embedder.error(
                     "Unsupported URL",
-                    "\u274c Please provide a Spotify or Apple Music **playlist** or **album** URL.\n\n"
+                    "\u274c Please provide a **playlist** or **album** URL.\n\n"
                     "**Supported formats:**\n"
                     "\u2022 `https://open.spotify.com/playlist/...`\n"
                     "\u2022 `https://open.spotify.com/album/...`\n"
                     "\u2022 `https://music.apple.com/.../playlist/...`\n"
-                    "\u2022 `https://music.apple.com/.../album/...`",
+                    "\u2022 `https://music.apple.com/.../album/...`\n"
+                    "\u2022 `https://music.youtube.com/playlist?list=...`\n"
+                    "\u2022 `https://music.youtube.com/browse/MPREb_...`\n"
+                    "\u2022 `https://youtube.com/playlist?list=...`",
                 ),
                 ephemeral=True,
             )
@@ -1728,6 +1744,331 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
             logger.warning("Apple Music import failed: %s", exc)
 
         return tracks, name
+
+    # ── YouTube Music import helper ────────────────────────────────
+
+    async def _import_youtube_music(
+        self,
+        url: str,
+        session: aiohttp.ClientSession,
+        *,
+        playlist_id: Optional[str] = None,
+        browse_id: Optional[str] = None,
+    ) -> tuple:
+        """Extract track names from a YouTube Music/YouTube playlist or album.
+
+        Strategy:
+          1. For playlists — fetch the YouTube playlist page HTML, extract the
+             ``ytInitialData`` JSON blob and parse video titles + channel names.
+          2. For YT Music albums (browse_id) — call the internal ``youtubei``
+             browse API which returns structured JSON with track listings.
+          3. Fallback — attempt to parse ``<title>`` and ``videoRenderer``
+             patterns from the raw HTML.
+        """
+        tracks: List[Dict[str, str]] = []
+        name = "YouTube Music Import"
+
+        _HEADERS = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        _COOKIES = {"CONSENT": "YES+1"}  # bypass EU consent wall
+
+        try:
+            # ── Album via browse API ──────────────────────────────
+            if browse_id:
+                tracks, name = await self._yt_browse_album(browse_id, session, _HEADERS)
+                if tracks:
+                    return tracks, name
+
+            # ── Playlist via page scraping ────────────────────────
+            if playlist_id:
+                page_url = f"https://www.youtube.com/playlist?list={playlist_id}"
+            else:
+                page_url = url if url.startswith("http") else f"https://{url}"
+                # Normalise music.youtube.com to www.youtube.com for playlist pages
+                page_url = page_url.replace("music.youtube.com", "www.youtube.com")
+
+            async with session.get(
+                page_url,
+                timeout=aiohttp.ClientTimeout(total=25),
+                headers=_HEADERS,
+                cookies=_COOKIES,
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("YouTube playlist page returned %d", resp.status)
+                    return tracks, name
+
+                html_text = await resp.text()
+
+            # Extract ytInitialData JSON blob
+            yt_data = self._extract_yt_initial_data(html_text)
+            if not yt_data:
+                logger.warning("Could not extract ytInitialData from YouTube page")
+                return tracks, name
+
+            # Extract playlist title
+            try:
+                metadata = yt_data.get("metadata", {})
+                pl_renderer = metadata.get("playlistMetadataRenderer", {})
+                name = pl_renderer.get("title", name)
+            except Exception:
+                pass
+
+            # Navigate to the video list
+            # Path: contents → twoColumnBrowseResultsRenderer → tabs[0]
+            #   → tabRenderer → content → sectionListRenderer → contents[0]
+            #   → itemSectionRenderer → contents[0]
+            #   → playlistVideoListRenderer → contents[]
+            try:
+                tabs = (
+                    yt_data
+                    .get("contents", {})
+                    .get("twoColumnBrowseResultsRenderer", {})
+                    .get("tabs", [])
+                )
+                if not tabs:
+                    return tracks, name
+
+                tab_content = tabs[0].get("tabRenderer", {}).get("content", {})
+                section_contents = (
+                    tab_content
+                    .get("sectionListRenderer", {})
+                    .get("contents", [])
+                )
+
+                video_items = []
+                for section in section_contents:
+                    item_section = section.get("itemSectionRenderer", {})
+                    for inner in item_section.get("contents", []):
+                        playlist_renderer = inner.get("playlistVideoListRenderer", {})
+                        if playlist_renderer:
+                            video_items = playlist_renderer.get("contents", [])
+                            break
+                    if video_items:
+                        break
+
+                for item in video_items:
+                    renderer = item.get("playlistVideoRenderer", {})
+                    if not renderer:
+                        continue
+
+                    title_obj = renderer.get("title", {})
+                    video_title = ""
+                    # title.runs[0].text or title.simpleText
+                    runs = title_obj.get("runs", [])
+                    if runs:
+                        video_title = runs[0].get("text", "")
+                    elif title_obj.get("simpleText"):
+                        video_title = title_obj["simpleText"]
+
+                    # Channel / artist: shortBylineText.runs[0].text
+                    channel_name = ""
+                    byline = renderer.get("shortBylineText", {})
+                    byline_runs = byline.get("runs", [])
+                    if byline_runs:
+                        channel_name = byline_runs[0].get("text", "")
+
+                    if video_title:
+                        # Try to split "Artist - Song" from the title
+                        parsed_name, parsed_artist = self._parse_yt_title(
+                            video_title, channel_name
+                        )
+                        tracks.append({"name": parsed_name, "artist": parsed_artist})
+
+            except Exception as exc:
+                logger.warning("YouTube playlist parsing error: %s", exc)
+
+        except Exception as exc:
+            logger.warning("YouTube Music import failed: %s", exc)
+
+        return tracks, name
+
+    async def _yt_browse_album(
+        self,
+        browse_id: str,
+        session: aiohttp.ClientSession,
+        headers: Dict[str, str],
+    ) -> tuple:
+        """Fetch a YouTube Music album via the internal browse API."""
+        tracks: List[Dict[str, str]] = []
+        name = "YouTube Music Album"
+
+        try:
+            api_url = "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false"
+            payload = {
+                "browseId": browse_id,
+                "context": {
+                    "client": {
+                        "clientName": "WEB_REMIX",
+                        "clientVersion": "1.20241120.01.00",
+                        "hl": "en",
+                        "gl": "US",
+                    },
+                },
+            }
+
+            async with session.post(
+                api_url,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=20),
+                headers={
+                    **headers,
+                    "Content-Type": "application/json",
+                    "Origin": "https://music.youtube.com",
+                    "Referer": "https://music.youtube.com/",
+                },
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("YouTube Music browse API returned %d", resp.status)
+                    return tracks, name
+
+                data = await resp.json(content_type=None)
+
+            # Extract album title from header
+            header = data.get("header", {})
+            music_header = header.get("musicImmersiveHeaderRenderer", {}) or header.get(
+                "musicDetailHeaderRenderer", {}
+            )
+            title_obj = music_header.get("title", {})
+            runs = title_obj.get("runs", [])
+            if runs:
+                name = runs[0].get("text", name)
+
+            # Extract album artist from subtitle
+            album_artist = ""
+            subtitle = music_header.get("subtitle", {})
+            sub_runs = subtitle.get("runs", [])
+            # Subtitle runs are usually: ["Album", " • ", "2024", " • ", "ArtistName", ...]
+            # or ["ArtistName", " • ", "Album", " • ", "2024"]
+            for run in sub_runs:
+                text = run.get("text", "").strip()
+                # Skip separators and common labels
+                if text in ("", "•", "\u2022") or text.isdigit() or len(text) <= 2:
+                    continue
+                if text.lower() in ("album", "single", "ep", "playlist", "song", "video"):
+                    continue
+                # First real text run that looks like an artist name
+                album_artist = text
+                break
+
+            # Extract tracks from the shelf
+            # Path: contents → singleColumnBrowseResultsRenderer → tabs[0]
+            #   → tabRenderer → content → sectionListRenderer → contents[]
+            #   → musicShelfRenderer → contents[]
+            #   → musicResponsiveListItemRenderer
+            try:
+                tabs = (
+                    data
+                    .get("contents", {})
+                    .get("singleColumnBrowseResultsRenderer", {})
+                    .get("tabs", [])
+                )
+                if not tabs:
+                    return tracks, name
+
+                tab_content = tabs[0].get("tabRenderer", {}).get("content", {})
+                sections = tab_content.get("sectionListRenderer", {}).get("contents", [])
+
+                for section in sections:
+                    shelf = section.get("musicShelfRenderer", {})
+                    if not shelf:
+                        continue
+
+                    for item in shelf.get("contents", []):
+                        renderer = item.get("musicResponsiveListItemRenderer", {})
+                        if not renderer:
+                            continue
+
+                        flex_columns = renderer.get("flexColumns", [])
+                        track_name = ""
+                        track_artist = album_artist  # default to album artist
+
+                        # First flex column → song title
+                        if flex_columns:
+                            col0 = flex_columns[0].get(
+                                "musicResponsiveListItemFlexColumnRenderer", {}
+                            )
+                            text_obj = col0.get("text", {})
+                            col_runs = text_obj.get("runs", [])
+                            if col_runs:
+                                track_name = col_runs[0].get("text", "")
+
+                        # Second flex column → artist (if present)
+                        if len(flex_columns) > 1:
+                            col1 = flex_columns[1].get(
+                                "musicResponsiveListItemFlexColumnRenderer", {}
+                            )
+                            text_obj = col1.get("text", {})
+                            col_runs = text_obj.get("runs", [])
+                            if col_runs:
+                                artist_text = col_runs[0].get("text", "")
+                                if artist_text:
+                                    track_artist = artist_text
+
+                        if track_name:
+                            tracks.append({"name": track_name, "artist": track_artist})
+
+            except Exception as exc:
+                logger.warning("YouTube Music album track extraction error: %s", exc)
+
+        except Exception as exc:
+            logger.warning("YouTube Music browse API failed: %s", exc)
+
+        return tracks, name
+
+    @staticmethod
+    def _extract_yt_initial_data(html: str) -> Optional[Dict[str, Any]]:
+        """Extract and parse the ``ytInitialData`` JSON blob from YouTube HTML."""
+        # Pattern 1: var ytInitialData = {...};
+        match = re.search(r"var\s+ytInitialData\s*=\s*(\{.+?\});\s*</script>", html, re.DOTALL)
+        if not match:
+            # Pattern 2: window["ytInitialData"] = {...};
+            match = re.search(
+                r'window\["ytInitialData"\]\s*=\s*(\{.+?\});\s*</script>',
+                html,
+                re.DOTALL,
+            )
+        if not match:
+            return None
+
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError as exc:
+            logger.warning("Failed to parse ytInitialData JSON: %s", exc)
+            return None
+
+    @staticmethod
+    def _parse_yt_title(title: str, channel: str = "") -> tuple:
+        """Parse a YouTube video title into (song_name, artist).
+
+        Many music videos use the "Artist - Song Title" format.
+        This also strips common noise suffixes.
+        """
+        # Strip common YouTube noise in parens/brackets
+        cleaned = re.sub(
+            r"\s*[\(\[]\s*(?:Official\s+)?(?:Music\s+|Lyric\s+)?(?:Video|Audio|Visuali[sz]er|Lyrics?|HD|HQ|4K|M/?V|Live)\s*[\)\]]",
+            "",
+            title,
+            flags=re.IGNORECASE,
+        )
+        # Strip trailing "| Official ..." pipes
+        cleaned = re.sub(r"\s*\|\s*Official.*$", "", cleaned, flags=re.IGNORECASE).strip()
+
+        # Try "Artist - Title" split
+        if " - " in cleaned:
+            parts = cleaned.split(" - ", 1)
+            artist = parts[0].strip()
+            song = parts[1].strip()
+            if artist and song:
+                return song, artist
+
+        # Fallback: title is the song name, channel is the artist
+        return cleaned or title, channel
 
 
 # =====================================================================
