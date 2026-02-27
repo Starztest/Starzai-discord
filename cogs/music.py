@@ -112,6 +112,25 @@ FFMPEG_OPTIONS = {
 # discord.py's Opus wrapper — anything higher is ignored by the codec.
 MAX_ENCODER_BITRATE = 512_000  # 512 kbps
 
+# ── Audio Filters (FFmpeg -af chains) ────────────────────────────────
+AUDIO_FILTERS: Dict[str, str] = {
+    "off":        "",
+    "bassboost":  "bass=g=10,dynaudnorm=f=150",
+    "nightcore":  "aresample=48000,asetrate=48000*1.25",
+    "vaporwave":  "aresample=48000,asetrate=48000*0.8",
+    "karaoke":    "stereotools=mlev=0.03",
+    "8d":         "apulsator=hz=0.09",
+    "treble":     "treble=g=5,dynaudnorm=f=150",
+    "vibrato":    "vibrato=f=6.5:d=0.5",
+    "tremolo":    "tremolo=f=6.5:d=0.6",
+    "pop":        "bass=g=3,treble=g=2,dynaudnorm=f=200",
+    "soft":       "lowpass=f=3000,volume=1.2",
+    "loud":       "volume=2.0,dynaudnorm=f=150",
+}
+AUDIO_FILTER_NAMES = list(AUDIO_FILTERS.keys())
+
+MAX_HISTORY = 50  # cap on how many recently-played songs we remember
+
 # ── Branding (user-facing) ───────────────────────────────────────────
 BRAND = "Powered by StarzAI \u26a1"
 
@@ -144,6 +163,17 @@ class GuildMusicState:
         "_resume_info",
         # Concurrency lock — serialises connect / play / queue mutations
         "_lock",
+        # History & previous
+        "history",
+        "previous_song",
+        # 24/7 mode (never auto-disconnect)
+        "always_connected",
+        # Audio filter
+        "audio_filter",
+        # Autoplay (find similar songs when queue ends)
+        "autoplay",
+        # Vote-skip tracking
+        "skip_votes",
     )
 
     def __init__(self) -> None:
@@ -170,6 +200,18 @@ class GuildMusicState:
         # Per-guild lock — serialises VC connect / play / queue mutations
         # so concurrent /play commands don't race and kill each other.
         self._lock: asyncio.Lock = asyncio.Lock()
+        # History of recently played songs (capped at 50)
+        self.history: List[Dict[str, Any]] = []
+        # The song that played immediately before the current one
+        self.previous_song: Optional[Dict[str, Any]] = None
+        # 24/7 mode — bot stays in VC even when idle / alone
+        self.always_connected: bool = False
+        # Active audio filter ("off", "bassboost", "nightcore", "vaporwave", "karaoke", "8d")
+        self.audio_filter: str = "off"
+        # Autoplay — auto-queue similar songs when the queue runs out
+        self.autoplay: bool = False
+        # Set of user IDs who voted to skip the current song
+        self.skip_votes: set = set()
 
     @property
     def current_position(self) -> float:
@@ -195,6 +237,11 @@ class GuildMusicState:
         self._seeking = False
         self._current_stream_url = ""
         self._resume_info = None
+        self.history.clear()
+        self.previous_song = None
+        self.audio_filter = "off"
+        self.autoplay = False
+        self.skip_votes.clear()
         if self.idle_task and not self.idle_task.done():
             self.idle_task.cancel()
             self.idle_task = None
@@ -657,11 +704,21 @@ def _now_playing_embed(
     bar = _progress_bar(position, duration)
     loop = _loop_badge(state.loop_mode) if state else ""
 
+    # Extra status badges
+    badges: List[str] = []
+    if state and state.audio_filter != "off":
+        badges.append(f"\U0001f3db {state.audio_filter.title()}")
+    if state and state.autoplay:
+        badges.append("\U0001f525 Autoplay")
+    if state and state.always_connected:
+        badges.append("\U0001f504 24/7")
+    badge_str = ("  " + " \u2022 ".join(badges)) if badges else ""
+
     desc = (
         f"**{song['name']}**\n"
         f"\U0001f3a4 {song['artist']}\n"
         f"\U0001f4bf {song['album']} \u2022 {song['year']}\n\n"
-        f"{bar}{loop}"
+        f"{bar}{loop}{badge_str}"
     )
     footer_parts = ["320kbps"]
     if requester:
@@ -1493,6 +1550,535 @@ class MusicCog(commands.Cog, name="Music"):
         # its own locking.
         await self._play_song_in_vc(interaction, song, followup=True)
 
+    # ── /skipto ──────────────────────────────────────────────────────
+
+    @app_commands.command(name="skipto", description="Skip to a specific position in the queue")
+    @app_commands.describe(position="Queue position to skip to (1-based)")
+    async def skipto_cmd(self, interaction: discord.Interaction, position: int) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        state = self._get_state(interaction.guild_id)
+        if not await self._check_dj(interaction, state):
+            return
+
+        idx = position - 1
+        if idx < 0 or idx >= len(state.queue):
+            await interaction.response.send_message(
+                embed=Embedder.error(
+                    "Invalid Position",
+                    f"Queue has **{len(state.queue)}** songs. Use a number between 1 and {len(state.queue)}.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if not state.voice_client or not (state.voice_client.is_playing() or state.voice_client.is_paused()):
+            await interaction.response.send_message(
+                embed=Embedder.warning("Nothing Playing", "Nothing is currently playing."),
+                ephemeral=True,
+            )
+            return
+
+        # Remove all songs before the target position
+        skipped = state.queue[:idx]
+        target = state.queue[idx]
+        state.queue = state.queue[idx:]  # target is now at front
+
+        await interaction.response.send_message(
+            embed=Embedder.success(
+                "Skipped To",
+                f"\u23ed Skipping to **{target['name']}** \u2014 {target['artist']}\n"
+                f"Removed **{len(skipped)}** song{'s' if len(skipped) != 1 else ''} from queue.",
+            )
+        )
+        state.voice_client.stop()  # triggers _play_next -> plays the target
+
+    # ── /move ────────────────────────────────────────────────────────
+
+    @app_commands.command(name="move", description="Move a song to a different position in the queue")
+    @app_commands.describe(
+        from_pos="Current position of the song (1-based)",
+        to_pos="New position for the song (1-based)",
+    )
+    async def move_cmd(self, interaction: discord.Interaction, from_pos: int, to_pos: int) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        state = self._get_state(interaction.guild_id)
+        if not await self._check_dj(interaction, state):
+            return
+
+        from_idx = from_pos - 1
+        to_idx = to_pos - 1
+        q_len = len(state.queue)
+
+        if from_idx < 0 or from_idx >= q_len or to_idx < 0 or to_idx >= q_len:
+            await interaction.response.send_message(
+                embed=Embedder.error(
+                    "Invalid Position",
+                    f"Queue has **{q_len}** songs. Both positions must be between 1 and {q_len}.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        song = state.queue.pop(from_idx)
+        state.queue.insert(to_idx, song)
+        await interaction.response.send_message(
+            embed=Embedder.success(
+                "Moved",
+                f"\u21c5 Moved **{song['name']}** from position #{from_pos} to #{to_pos}.",
+            )
+        )
+
+    # ── /swap ────────────────────────────────────────────────────────
+
+    @app_commands.command(name="swap", description="Swap two songs in the queue")
+    @app_commands.describe(pos1="First position (1-based)", pos2="Second position (1-based)")
+    async def swap_cmd(self, interaction: discord.Interaction, pos1: int, pos2: int) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        state = self._get_state(interaction.guild_id)
+        if not await self._check_dj(interaction, state):
+            return
+
+        idx1, idx2 = pos1 - 1, pos2 - 1
+        q_len = len(state.queue)
+
+        if idx1 < 0 or idx1 >= q_len or idx2 < 0 or idx2 >= q_len:
+            await interaction.response.send_message(
+                embed=Embedder.error(
+                    "Invalid Position",
+                    f"Queue has **{q_len}** songs. Both positions must be between 1 and {q_len}.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        state.queue[idx1], state.queue[idx2] = state.queue[idx2], state.queue[idx1]
+        await interaction.response.send_message(
+            embed=Embedder.success(
+                "Swapped",
+                f"\U0001f500 Swapped **#{pos1}** ({state.queue[idx2]['name']}) "
+                f"with **#{pos2}** ({state.queue[idx1]['name']}).",
+            )
+        )
+
+    # ── /replay ──────────────────────────────────────────────────────
+
+    @app_commands.command(name="replay", description="Restart the current song from the beginning")
+    async def replay_cmd(self, interaction: discord.Interaction) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        state = self._get_state(interaction.guild_id)
+        if not state.current:
+            await interaction.response.send_message(
+                embed=Embedder.warning("Nothing Playing", "No song is currently playing."),
+                ephemeral=True,
+            )
+            return
+        if not state.voice_client or not state.voice_client.is_connected():
+            await interaction.response.send_message(
+                embed=Embedder.warning("Not Connected", "Not connected to a voice channel."),
+                ephemeral=True,
+            )
+            return
+
+        stream_url = state._current_stream_url
+        if not stream_url:
+            stream_url = _pick_best_url(state.current.get("download_urls", []), "320kbps")
+        if not stream_url:
+            await interaction.response.send_message(
+                embed=Embedder.error("Replay Failed", "No stream URL available."),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+        async with state._lock:
+            state._seeking = True
+            if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
+                state.voice_client.stop()
+            await asyncio.sleep(0.3)
+            await self._start_playback(interaction.guild_id, stream_url, seek_to=0.0)
+
+        await interaction.followup.send(
+            embed=Embedder.success("Replaying", f"\U0001f501 Restarted **{state.current['name']}**")
+        )
+
+    # ── /previous ────────────────────────────────────────────────────
+
+    @app_commands.command(name="previous", description="Go back to the previously played song")
+    async def previous_cmd(self, interaction: discord.Interaction) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        state = self._get_state(interaction.guild_id)
+
+        if not state.previous_song:
+            await interaction.response.send_message(
+                embed=Embedder.warning("No Previous Song", "There is no previous song to go back to."),
+                ephemeral=True,
+            )
+            return
+
+        if not state.voice_client or not state.voice_client.is_connected():
+            await interaction.response.send_message(
+                embed=Embedder.warning("Not Connected", "Not connected to a voice channel."),
+                ephemeral=True,
+            )
+            return
+
+        prev = state.previous_song
+        prev = await self.music_api.ensure_download_urls(prev)
+        stream_url = _pick_best_url(prev.get("download_urls", []), "320kbps")
+        if not stream_url:
+            await interaction.response.send_message(
+                embed=Embedder.error("Unavailable", "Could not get a stream URL for the previous song."),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+        async with state._lock:
+            # Push current song to front of queue so it plays next
+            if state.current:
+                state.queue.insert(0, state.current)
+
+            state._seeking = True
+            if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
+                state.voice_client.stop()
+            await asyncio.sleep(0.3)
+
+            state.current = prev
+            state.previous_song = None  # prevent infinite back-and-forth
+            await self._start_playback(interaction.guild_id, stream_url)
+
+        requester = self.bot.get_user(interaction.user.id)
+        embed = _now_playing_embed(state, prev, requester)
+        embed.title = "\u23ee Now Playing (Previous)"
+        await interaction.followup.send(embed=embed, view=NowPlayingView(prev, self, interaction.guild_id))
+
+    # ── /grab ────────────────────────────────────────────────────────
+
+    @app_commands.command(name="grab", description="Save the current song info to your DMs")
+    async def grab_cmd(self, interaction: discord.Interaction) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        state = self._get_state(interaction.guild_id)
+        if not state.current:
+            await interaction.response.send_message(
+                embed=Embedder.warning("Nothing Playing", "No song is currently playing."),
+                ephemeral=True,
+            )
+            return
+
+        song = state.current
+        desc = (
+            f"**{song['name']}**\n"
+            f"\U0001f3a4 {song['artist']}\n"
+            f"\U0001f4bf {song['album']} \u2022 {song['year']}\n"
+            f"\u23f1 {song['duration_formatted']}"
+        )
+        embed = Embedder.standard(
+            "\U0001f4be Saved Song",
+            desc,
+            footer=f"Saved from #{interaction.channel.name if interaction.channel else 'vc'} \u2022 {BRAND}",
+            thumbnail=song.get("image"),
+        )
+
+        try:
+            await interaction.user.send(embed=embed)
+            await interaction.response.send_message(
+                embed=Embedder.success("Saved", "\U0001f4be Sent the song info to your DMs!"),
+                ephemeral=True,
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                embed=Embedder.error("DMs Closed", "I can't send you a DM. Please enable DMs from server members."),
+                ephemeral=True,
+            )
+
+    # ── /history ─────────────────────────────────────────────────────
+
+    @app_commands.command(name="history", description="Show recently played songs")
+    async def history_cmd(self, interaction: discord.Interaction) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        state = self._get_state(interaction.guild_id)
+
+        if not state.history:
+            await interaction.response.send_message(
+                embed=Embedder.warning("No History", "No songs have been played yet in this session."),
+                ephemeral=True,
+            )
+            return
+
+        lines: List[str] = []
+        # Show most recent first
+        for i, s in enumerate(reversed(state.history[-20:]), 1):
+            dur = s.get("duration_formatted", "?:??")
+            lines.append(f"**{i}.** {s['name']} \u2014 {s['artist']}  `{dur}`")
+
+        await interaction.response.send_message(
+            embed=Embedder.standard(
+                "\U0001f553 Recently Played",
+                "\n".join(lines)[:MAX_EMBED_DESC],
+                footer=f"{len(state.history)} total songs played \u2022 {BRAND}",
+            )
+        )
+
+    # ── /duplicates ──────────────────────────────────────────────────
+
+    @app_commands.command(name="duplicates", description="Remove duplicate songs from the queue")
+    async def duplicates_cmd(self, interaction: discord.Interaction) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        state = self._get_state(interaction.guild_id)
+        if not await self._check_dj(interaction, state):
+            return
+
+        if not state.queue:
+            await interaction.response.send_message(
+                embed=Embedder.warning("Empty Queue", "The queue is empty."),
+                ephemeral=True,
+            )
+            return
+
+        seen: set = set()
+        unique: List[Dict[str, Any]] = []
+        removed = 0
+        for s in state.queue:
+            song_id = s.get("id", "")
+            if song_id and song_id in seen:
+                removed += 1
+            else:
+                seen.add(song_id)
+                unique.append(s)
+
+        state.queue = unique
+        if removed == 0:
+            await interaction.response.send_message(
+                embed=Embedder.info("No Duplicates", "There are no duplicate songs in the queue."),
+            )
+        else:
+            await interaction.response.send_message(
+                embed=Embedder.success(
+                    "Duplicates Removed",
+                    f"\U0001f9f9 Removed **{removed}** duplicate{'s' if removed != 1 else ''} from the queue.",
+                )
+            )
+
+    # ── /247 ─────────────────────────────────────────────────────────
+
+    @app_commands.command(name="247", description="Toggle 24/7 mode (stay in VC even when idle)")
+    async def always_on_cmd(self, interaction: discord.Interaction) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        state = self._get_state(interaction.guild_id)
+        if not await self._check_dj(interaction, state):
+            return
+
+        state.always_connected = not state.always_connected
+
+        if state.always_connected:
+            # Cancel any pending idle disconnect
+            if state.idle_task and not state.idle_task.done():
+                state.idle_task.cancel()
+                state.idle_task = None
+            await interaction.response.send_message(
+                embed=Embedder.success(
+                    "24/7 Mode Enabled",
+                    "\U0001f504 I'll stay in the voice channel even when idle or alone.\n"
+                    "Use `/247` again to disable.",
+                )
+            )
+        else:
+            await interaction.response.send_message(
+                embed=Embedder.info(
+                    "24/7 Mode Disabled",
+                    "\u23f0 I'll auto-disconnect after being idle for "
+                    f"{VC_IDLE_TIMEOUT // 60} minutes.",
+                )
+            )
+
+    # ── /voteskip ────────────────────────────────────────────────────
+
+    @app_commands.command(name="voteskip", description="Vote to skip the current song")
+    async def voteskip_cmd(self, interaction: discord.Interaction) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        state = self._get_state(interaction.guild_id)
+
+        if not state.voice_client or not state.voice_client.is_connected():
+            await interaction.response.send_message(
+                embed=Embedder.warning("Not Connected", "Not connected to a voice channel."),
+                ephemeral=True,
+            )
+            return
+
+        if not state.voice_client.is_playing():
+            await interaction.response.send_message(
+                embed=Embedder.warning("Nothing Playing", "There's nothing to skip."),
+                ephemeral=True,
+            )
+            return
+
+        # Only count users actually in the VC
+        member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+        if not member or not member.voice or member.voice.channel != state.voice_client.channel:
+            await interaction.response.send_message(
+                embed=Embedder.error("Not in VC", "You must be in the voice channel to vote."),
+                ephemeral=True,
+            )
+            return
+
+        state.skip_votes.add(interaction.user.id)
+        humans = sum(1 for m in state.voice_client.channel.members if not m.bot)
+        needed = max(1, (humans + 1) // 2)  # majority (at least 1)
+        current_votes = len(state.skip_votes)
+
+        if current_votes >= needed:
+            skipped_name = state.current["name"] if state.current else "current song"
+            state.skip_votes.clear()
+            state.voice_client.stop()
+            await interaction.response.send_message(
+                embed=Embedder.success("Vote Skip", f"\u23ed Vote passed! Skipped **{skipped_name}** ({current_votes}/{needed})")
+            )
+        else:
+            await interaction.response.send_message(
+                embed=Embedder.info(
+                    "Vote Skip",
+                    f"\U0001f5f3 **{interaction.user.display_name}** voted to skip "
+                    f"({current_votes}/{needed} needed).",
+                )
+            )
+
+    # ── /autoplay ────────────────────────────────────────────────────
+
+    @app_commands.command(name="autoplay", description="Toggle autoplay — auto-queue similar songs when queue ends")
+    async def autoplay_cmd(self, interaction: discord.Interaction) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        state = self._get_state(interaction.guild_id)
+
+        state.autoplay = not state.autoplay
+        if state.autoplay:
+            await interaction.response.send_message(
+                embed=Embedder.success(
+                    "Autoplay Enabled",
+                    "\U0001f525 When the queue ends, I'll automatically find and queue similar songs.\n"
+                    "Use `/autoplay` again to disable.",
+                )
+            )
+        else:
+            await interaction.response.send_message(
+                embed=Embedder.info(
+                    "Autoplay Disabled",
+                    "\u23f9 Autoplay turned off. Playback will stop when the queue ends.",
+                )
+            )
+
+    # ── /filter ──────────────────────────────────────────────────────
+
+    @app_commands.command(name="filter", description="Apply an audio filter to playback")
+    @app_commands.describe(name="Filter to apply")
+    @app_commands.choices(name=[
+        app_commands.Choice(name="Off (no filter)", value="off"),
+        app_commands.Choice(name="Bass Boost", value="bassboost"),
+        app_commands.Choice(name="Nightcore", value="nightcore"),
+        app_commands.Choice(name="Vaporwave", value="vaporwave"),
+        app_commands.Choice(name="Karaoke", value="karaoke"),
+        app_commands.Choice(name="8D Audio", value="8d"),
+        app_commands.Choice(name="Treble Boost", value="treble"),
+        app_commands.Choice(name="Vibrato", value="vibrato"),
+        app_commands.Choice(name="Tremolo", value="tremolo"),
+        app_commands.Choice(name="Pop", value="pop"),
+        app_commands.Choice(name="Soft", value="soft"),
+        app_commands.Choice(name="Loud", value="loud"),
+    ])
+    async def filter_cmd(self, interaction: discord.Interaction, name: str) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        state = self._get_state(interaction.guild_id)
+
+        if name not in AUDIO_FILTERS:
+            await interaction.response.send_message(
+                embed=Embedder.error("Invalid Filter", f"Unknown filter: `{name}`."),
+                ephemeral=True,
+            )
+            return
+
+        old_filter = state.audio_filter
+        state.audio_filter = name
+
+        # If something is playing, restart playback with the new filter
+        if state.voice_client and state.voice_client.is_connected() and state.current:
+            stream_url = state._current_stream_url
+            if not stream_url:
+                stream_url = _pick_best_url(state.current.get("download_urls", []), "320kbps")
+            if stream_url:
+                current_pos = state.current_position
+                await interaction.response.defer()
+                async with state._lock:
+                    state._seeking = True
+                    if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
+                        state.voice_client.stop()
+                    await asyncio.sleep(0.3)
+                    await self._start_playback(interaction.guild_id, stream_url, seek_to=current_pos)
+
+                label = name.title() if name != "off" else "Off"
+                await interaction.followup.send(
+                    embed=Embedder.success(
+                        "Filter Applied",
+                        f"\U0001f3db Filter set to **{label}**. Playback restarted at current position.",
+                    )
+                )
+                return
+
+        # Not currently playing — just store the setting
+        label = name.title() if name != "off" else "Off"
+        await interaction.response.send_message(
+            embed=Embedder.success(
+                "Filter Set",
+                f"\U0001f3db Audio filter set to **{label}**. It will apply to the next song.",
+            )
+        )
+
     # ── /djrole ──────────────────────────────────────────────────────
 
     @app_commands.command(name="djrole", description="Set or clear the DJ role for music commands")
@@ -2052,13 +2638,19 @@ class MusicCog(commands.Cog, name="Music"):
             return
 
         try:
-            # Build FFmpeg options, injecting -ss for seeking
+            # Build FFmpeg options, injecting -ss for seeking and -af for filters
             before_opts = FFMPEG_OPTIONS["before_options"]
             if seek_to > 0:
                 before_opts = f"-ss {seek_to:.2f} {before_opts}"
+
+            output_opts = FFMPEG_OPTIONS["options"]
+            af_chain = AUDIO_FILTERS.get(state.audio_filter, "")
+            if af_chain:
+                output_opts = f"{output_opts} -af {af_chain}"
+
             ffmpeg_opts = {
                 "before_options": before_opts,
-                "options": FFMPEG_OPTIONS["options"],
+                "options": output_opts,
             }
 
             source = discord.FFmpegPCMAudio(url, **ffmpeg_opts)
@@ -2100,8 +2692,19 @@ class MusicCog(commands.Cog, name="Music"):
 
         text_ch = None
         np_song: Optional[Dict[str, Any]] = None
+        autoplay_triggered = False
 
         async with state._lock:
+            # ── Track history & previous ─────────────────────────────
+            if state.current:
+                state.previous_song = state.current
+                state.history.append(state.current)
+                if len(state.history) > MAX_HISTORY:
+                    state.history = state.history[-MAX_HISTORY:]
+
+            # Reset vote-skip votes for the new track
+            state.skip_votes.clear()
+
             # ── Loop mode: TRACK — replay the same song ──────────────
             if state.loop_mode == "track" and state.current:
                 stream_url = state._current_stream_url or _pick_best_url(
@@ -2115,6 +2718,29 @@ class MusicCog(commands.Cog, name="Music"):
             if state.loop_mode == "queue" and state.current:
                 state.queue.append(state.current)
 
+            # ── Autoplay: if queue is empty and autoplay is on, find similar ─
+            if not state.queue and state.autoplay and state.current:
+                autoplay_triggered = True
+                # Search for more by the same artist
+                try:
+                    artist = state.current.get("artist", "")
+                    if artist and self.music_api:
+                        suggestions = await self.music_api.search(artist, limit=5)
+                        if suggestions:
+                            # Filter out the song that just played
+                            current_id = state.current.get("id", "")
+                            for s in suggestions:
+                                if s.get("id") != current_id:
+                                    s = await self.music_api.ensure_download_urls(s)
+                                    if _pick_best_url(s.get("download_urls", []), "320kbps"):
+                                        state.queue.append(s)
+                            logger.info(
+                                "Autoplay: queued %d songs by '%s' in guild %d",
+                                len(state.queue), artist, guild_id,
+                            )
+                except Exception as exc:
+                    logger.warning("Autoplay search failed: %s", exc)
+
             # Iterate through the queue until we find a playable track or the queue is empty.
             while state.queue:
                 next_song = state.queue.pop(0)
@@ -2122,13 +2748,8 @@ class MusicCog(commands.Cog, name="Music"):
                 stream_url = _pick_best_url(next_song.get("download_urls", []), "320kbps")
                 if stream_url:
                     await self._start_playback(guild_id, stream_url)
-                    # Send the "Now Playing" embed outside the lock to avoid
-                    # holding it during slow Discord API calls.  Copy the
-                    # needed values first.
                     text_ch = state.text_channel
                     np_song = next_song
-
-                    # Release lock, then send message
                     break
                 else:
                     logger.warning("Skipping song '%s' — no stream URL", next_song.get("name", ""))
@@ -2137,16 +2758,19 @@ class MusicCog(commands.Cog, name="Music"):
                 # Queue exhausted — nothing more to play.
                 state.current = None
                 state.playback_start_time = 0.0
-                if state.voice_client and state.voice_client.is_connected():
-                    state.idle_task = asyncio.ensure_future(self._idle_disconnect(guild_id))
+                if not state.always_connected:
+                    if state.voice_client and state.voice_client.is_connected():
+                        state.idle_task = asyncio.ensure_future(self._idle_disconnect(guild_id))
                 return
 
         # ── Lock released — send the Now Playing embed ────────────
-        if text_ch:
+        if text_ch and np_song:
             try:
                 requester_id = state.requester_map.get(np_song.get("id", ""))
                 requester = self.bot.get_user(requester_id) if requester_id else None
                 embed = _now_playing_embed(state, np_song, requester)
+                if autoplay_triggered:
+                    embed.set_footer(text=f"Autoplay \u2022 {BRAND}")
                 view = NowPlayingView(np_song, self, guild_id)
                 await text_ch.send(embed=embed, view=view)
             except Exception:
@@ -2155,10 +2779,15 @@ class MusicCog(commands.Cog, name="Music"):
     # ── Internal: idle disconnect ─────────────────────────────────────
 
     async def _idle_disconnect(self, guild_id: int) -> None:
-        """Disconnect from VC after idle timeout."""
+        """Disconnect from VC after idle timeout.  Respects 24/7 mode."""
         try:
             await asyncio.sleep(VC_IDLE_TIMEOUT)
             state = self._get_state(guild_id)
+
+            # 24/7 mode — never auto-disconnect
+            if state.always_connected:
+                return
+
             if state.voice_client and state.voice_client.is_connected():
                 if not state.voice_client.is_playing() and not state.voice_client.is_paused():
                     if state.text_channel:
@@ -2285,6 +2914,9 @@ class MusicCog(commands.Cog, name="Music"):
         humans = sum(1 for m in vc_channel.members if not m.bot)
 
         if humans == 0:
+            # 24/7 mode — stay connected even when alone
+            if state.always_connected:
+                return
             # All humans left — start idle disconnect timer
             if state.idle_task and not state.idle_task.done():
                 state.idle_task.cancel()
