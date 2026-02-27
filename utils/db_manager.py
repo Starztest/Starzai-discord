@@ -202,6 +202,69 @@ class DatabaseManager:
                 PRIMARY KEY (user_id, guild_id)
             );
 
+            -- ── Music Premium: Favorites ────────────────────────────
+            CREATE TABLE IF NOT EXISTS user_favorites (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     TEXT    NOT NULL,
+                song_data   TEXT    NOT NULL,
+                added_at    TEXT    DEFAULT (datetime('now')),
+                UNIQUE(user_id, song_data)
+            );
+
+            -- ── Music Premium: Playlists ────────────────────────────
+            CREATE TABLE IF NOT EXISTS user_playlists (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     TEXT    NOT NULL,
+                name        TEXT    NOT NULL,
+                description TEXT    DEFAULT '',
+                created_at  TEXT    DEFAULT (datetime('now')),
+                updated_at  TEXT    DEFAULT (datetime('now')),
+                UNIQUE(user_id, name)
+            );
+
+            CREATE TABLE IF NOT EXISTS playlist_songs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                playlist_id INTEGER NOT NULL,
+                song_data   TEXT    NOT NULL,
+                position    INTEGER NOT NULL DEFAULT 0,
+                added_at    TEXT    DEFAULT (datetime('now')),
+                FOREIGN KEY (playlist_id) REFERENCES user_playlists(id) ON DELETE CASCADE
+            );
+
+            -- ── Music Premium: Listening Profiles ───────────────────
+            CREATE TABLE IF NOT EXISTS music_profiles (
+                user_id                 TEXT    PRIMARY KEY,
+                total_listening_seconds REAL    DEFAULT 0,
+                total_songs_played      INTEGER DEFAULT 0,
+                created_at              TEXT    DEFAULT (datetime('now')),
+                updated_at              TEXT    DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS listening_history (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         TEXT    NOT NULL,
+                guild_id        TEXT    NOT NULL,
+                song_data       TEXT    NOT NULL,
+                listened_seconds REAL   DEFAULT 0,
+                played_at       TEXT    DEFAULT (datetime('now'))
+            );
+
+            -- ── Music Premium: Song Request Channels ────────────────
+            CREATE TABLE IF NOT EXISTS song_request_channels (
+                guild_id        TEXT    PRIMARY KEY,
+                channel_id      TEXT    NOT NULL,
+                configured_by   TEXT    NOT NULL,
+                configured_at   TEXT    DEFAULT (datetime('now'))
+            );
+
+            -- ── Music Premium: Sleep Timers (persisted per-guild) ───
+            CREATE TABLE IF NOT EXISTS sleep_timers (
+                guild_id        TEXT    PRIMARY KEY,
+                expires_at      TEXT    NOT NULL,
+                set_by          TEXT    NOT NULL,
+                created_at      TEXT    DEFAULT (datetime('now'))
+            );
+
             CREATE INDEX IF NOT EXISTS idx_conversations_user
                 ON conversations(user_id, active);
             CREATE INDEX IF NOT EXISTS idx_usage_logs_user
@@ -212,6 +275,14 @@ class DatabaseManager:
                 ON user_messages(user_id, guild_id, timestamp);
             CREATE INDEX IF NOT EXISTS idx_user_context
                 ON user_context(user_id, guild_id);
+            CREATE INDEX IF NOT EXISTS idx_user_favorites_user
+                ON user_favorites(user_id, added_at);
+            CREATE INDEX IF NOT EXISTS idx_playlist_songs_playlist
+                ON playlist_songs(playlist_id, position);
+            CREATE INDEX IF NOT EXISTS idx_listening_history_user
+                ON listening_history(user_id, played_at);
+            CREATE INDEX IF NOT EXISTS idx_listening_history_guild
+                ON listening_history(user_id, guild_id, played_at);
             """
         )
         await self.db.commit()
@@ -662,3 +733,337 @@ class DatabaseManager:
         ) as cursor:
             row = await cursor.fetchone()
             return bool(row["opted_in"]) if row else False
+
+    # ══════════════════════════════════════════════════════════════════
+    #  Music Premium — Favorites
+    # ══════════════════════════════════════════════════════════════════
+
+    async def add_favorite(self, user_id: str, song_data: str) -> bool:
+        """Add a song to user's favorites. Returns True if added, False if duplicate."""
+        try:
+            await self.db.execute(
+                "INSERT OR IGNORE INTO user_favorites (user_id, song_data) VALUES (?, ?)",
+                (user_id, song_data),
+            )
+            await self.db.commit()
+            return True
+        except Exception:
+            return False
+
+    async def remove_favorite(self, user_id: str, song_data: str) -> bool:
+        """Remove a song from favorites. Returns True if removed."""
+        cur = await self.db.execute(
+            "DELETE FROM user_favorites WHERE user_id = ? AND song_data = ?",
+            (user_id, song_data),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def remove_favorite_by_id(self, user_id: str, fav_id: int) -> bool:
+        """Remove a favorite by its row ID."""
+        cur = await self.db.execute(
+            "DELETE FROM user_favorites WHERE id = ? AND user_id = ?",
+            (fav_id, user_id),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def is_favorite(self, user_id: str, song_data: str) -> bool:
+        """Check if a song is in the user's favorites."""
+        async with self.db.execute(
+            "SELECT 1 FROM user_favorites WHERE user_id = ? AND song_data = ?",
+            (user_id, song_data),
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    async def get_favorites(
+        self, user_id: str, limit: int = 50, offset: int = 0
+    ) -> List[Dict[str, Any]]:
+        """Get user's favorite songs (newest first)."""
+        async with self.db.execute(
+            "SELECT id, song_data, added_at FROM user_favorites WHERE user_id = ? ORDER BY added_at DESC LIMIT ? OFFSET ?",
+            (user_id, limit, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+            results = []
+            for row in rows:
+                try:
+                    song = json.loads(row["song_data"])
+                    song["_fav_id"] = row["id"]
+                    song["_added_at"] = row["added_at"]
+                    results.append(song)
+                except json.JSONDecodeError:
+                    continue
+            return results
+
+    async def get_favorites_count(self, user_id: str) -> int:
+        """Get total number of favorites for a user."""
+        async with self.db.execute(
+            "SELECT COUNT(*) as cnt FROM user_favorites WHERE user_id = ?",
+            (user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return row["cnt"] if row else 0
+
+    # ══════════════════════════════════════════════════════════════════
+    #  Music Premium — Playlists
+    # ══════════════════════════════════════════════════════════════════
+
+    async def create_playlist(self, user_id: str, name: str, description: str = "") -> Optional[int]:
+        """Create a new playlist. Returns playlist ID or None if name already exists."""
+        try:
+            cur = await self.db.execute(
+                "INSERT INTO user_playlists (user_id, name, description) VALUES (?, ?, ?)",
+                (user_id, name, description),
+            )
+            await self.db.commit()
+            return cur.lastrowid
+        except Exception:
+            return None
+
+    async def delete_playlist(self, user_id: str, playlist_id: int) -> bool:
+        """Delete a playlist and all its songs."""
+        cur = await self.db.execute(
+            "DELETE FROM user_playlists WHERE id = ? AND user_id = ?",
+            (playlist_id, user_id),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def rename_playlist(self, user_id: str, playlist_id: int, new_name: str) -> bool:
+        """Rename a playlist."""
+        try:
+            cur = await self.db.execute(
+                "UPDATE user_playlists SET name = ?, updated_at = datetime('now') WHERE id = ? AND user_id = ?",
+                (new_name, playlist_id, user_id),
+            )
+            await self.db.commit()
+            return (cur.rowcount or 0) > 0
+        except Exception:
+            return False
+
+    async def get_playlists(self, user_id: str) -> List[Dict[str, Any]]:
+        """Get all playlists for a user."""
+        async with self.db.execute(
+            """SELECT p.id, p.name, p.description, p.created_at, p.updated_at,
+                      (SELECT COUNT(*) FROM playlist_songs WHERE playlist_id = p.id) as song_count
+               FROM user_playlists p WHERE p.user_id = ? ORDER BY p.updated_at DESC""",
+            (user_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_playlist(self, user_id: str, playlist_id: int) -> Optional[Dict[str, Any]]:
+        """Get a single playlist with metadata."""
+        async with self.db.execute(
+            """SELECT p.id, p.name, p.description, p.created_at, p.updated_at,
+                      (SELECT COUNT(*) FROM playlist_songs WHERE playlist_id = p.id) as song_count
+               FROM user_playlists p WHERE p.id = ? AND p.user_id = ?""",
+            (playlist_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def get_playlist_by_name(self, user_id: str, name: str) -> Optional[Dict[str, Any]]:
+        """Get a playlist by name."""
+        async with self.db.execute(
+            """SELECT p.id, p.name, p.description, p.created_at, p.updated_at,
+                      (SELECT COUNT(*) FROM playlist_songs WHERE playlist_id = p.id) as song_count
+               FROM user_playlists p WHERE p.user_id = ? AND LOWER(p.name) = LOWER(?)""",
+            (user_id, name),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def add_song_to_playlist(self, playlist_id: int, song_data: str) -> bool:
+        """Add a song to a playlist at the end."""
+        try:
+            # Get next position
+            async with self.db.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 as next_pos FROM playlist_songs WHERE playlist_id = ?",
+                (playlist_id,),
+            ) as cur:
+                row = await cur.fetchone()
+                pos = row["next_pos"] if row else 0
+
+            await self.db.execute(
+                "INSERT INTO playlist_songs (playlist_id, song_data, position) VALUES (?, ?, ?)",
+                (playlist_id, song_data, pos),
+            )
+            await self.db.execute(
+                "UPDATE user_playlists SET updated_at = datetime('now') WHERE id = ?",
+                (playlist_id,),
+            )
+            await self.db.commit()
+            return True
+        except Exception:
+            return False
+
+    async def remove_song_from_playlist(self, playlist_id: int, position: int) -> bool:
+        """Remove a song from a playlist by position (0-based)."""
+        cur = await self.db.execute(
+            "DELETE FROM playlist_songs WHERE playlist_id = ? AND position = ?",
+            (playlist_id, position),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def get_playlist_songs(self, playlist_id: int) -> List[Dict[str, Any]]:
+        """Get all songs in a playlist, ordered by position."""
+        async with self.db.execute(
+            "SELECT id, song_data, position, added_at FROM playlist_songs WHERE playlist_id = ? ORDER BY position",
+            (playlist_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+            results = []
+            for row in rows:
+                try:
+                    song = json.loads(row["song_data"])
+                    song["_position"] = row["position"]
+                    results.append(song)
+                except json.JSONDecodeError:
+                    continue
+            return results
+
+    async def clear_playlist(self, playlist_id: int) -> int:
+        """Remove all songs from a playlist. Returns count removed."""
+        cur = await self.db.execute(
+            "DELETE FROM playlist_songs WHERE playlist_id = ?",
+            (playlist_id,),
+        )
+        await self.db.commit()
+        return cur.rowcount or 0
+
+    # ══════════════════════════════════════════════════════════════════
+    #  Music Premium — Listening Profiles & History
+    # ══════════════════════════════════════════════════════════════════
+
+    async def log_listening_session(
+        self, user_id: str, guild_id: str, song_data: str, listened_seconds: float
+    ) -> None:
+        """Log a listening session for a user."""
+        await self.db.execute(
+            "INSERT INTO listening_history (user_id, guild_id, song_data, listened_seconds) VALUES (?, ?, ?, ?)",
+            (user_id, guild_id, song_data, listened_seconds),
+        )
+        # Upsert the profile aggregate
+        await self.db.execute(
+            """INSERT INTO music_profiles (user_id, total_listening_seconds, total_songs_played)
+               VALUES (?, ?, 1)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   total_listening_seconds = total_listening_seconds + excluded.total_listening_seconds,
+                   total_songs_played = total_songs_played + 1,
+                   updated_at = datetime('now')""",
+            (user_id, listened_seconds),
+        )
+        await self.db.commit()
+
+    async def get_music_profile(self, user_id: str) -> Dict[str, Any]:
+        """Get a user's music profile stats."""
+        profile: Dict[str, Any] = {
+            "total_listening_seconds": 0,
+            "total_songs_played": 0,
+            "top_artists": [],
+            "top_songs": [],
+            "recent_songs": [],
+        }
+
+        # Basic stats
+        async with self.db.execute(
+            "SELECT total_listening_seconds, total_songs_played, created_at FROM music_profiles WHERE user_id = ?",
+            (user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            if row:
+                profile["total_listening_seconds"] = row["total_listening_seconds"]
+                profile["total_songs_played"] = row["total_songs_played"]
+                profile["member_since"] = row["created_at"]
+
+        # Recent songs (last 10)
+        async with self.db.execute(
+            "SELECT song_data, listened_seconds, played_at FROM listening_history WHERE user_id = ? ORDER BY played_at DESC LIMIT 10",
+            (user_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+            for row in rows:
+                try:
+                    song = json.loads(row["song_data"])
+                    song["_listened"] = row["listened_seconds"]
+                    song["_played_at"] = row["played_at"]
+                    profile["recent_songs"].append(song)
+                except json.JSONDecodeError:
+                    continue
+
+        # Top songs (by play count)
+        async with self.db.execute(
+            """SELECT song_data, COUNT(*) as plays, SUM(listened_seconds) as total_time
+               FROM listening_history WHERE user_id = ?
+               GROUP BY song_data ORDER BY plays DESC LIMIT 10""",
+            (user_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+            for row in rows:
+                try:
+                    song = json.loads(row["song_data"])
+                    song["_plays"] = row["plays"]
+                    song["_total_time"] = row["total_time"]
+                    profile["top_songs"].append(song)
+                except json.JSONDecodeError:
+                    continue
+
+        # Top artists (by play count)
+        async with self.db.execute(
+            """SELECT song_data, COUNT(*) as plays
+               FROM listening_history WHERE user_id = ?
+               GROUP BY song_data ORDER BY plays DESC LIMIT 50""",
+            (user_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+            artist_counts: Dict[str, int] = {}
+            for row in rows:
+                try:
+                    song = json.loads(row["song_data"])
+                    artist = song.get("artist", "Unknown")
+                    artist_counts[artist] = artist_counts.get(artist, 0) + row["plays"]
+                except json.JSONDecodeError:
+                    continue
+            # Sort by count, take top 5
+            sorted_artists = sorted(artist_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+            profile["top_artists"] = [{"name": a, "plays": c} for a, c in sorted_artists]
+
+        return profile
+
+    # ══════════════════════════════════════════════════════════════════
+    #  Music Premium — Song Request Channels
+    # ══════════════════════════════════════════════════════════════════
+
+    async def set_request_channel(self, guild_id: str, channel_id: str, configured_by: str) -> None:
+        """Set the song request channel for a guild."""
+        await self.db.execute(
+            """INSERT INTO song_request_channels (guild_id, channel_id, configured_by)
+               VALUES (?, ?, ?)
+               ON CONFLICT(guild_id) DO UPDATE SET
+                   channel_id = excluded.channel_id,
+                   configured_by = excluded.configured_by,
+                   configured_at = datetime('now')""",
+            (guild_id, channel_id, configured_by),
+        )
+        await self.db.commit()
+
+    async def get_request_channel(self, guild_id: str) -> Optional[str]:
+        """Get the song request channel ID for a guild."""
+        async with self.db.execute(
+            "SELECT channel_id FROM song_request_channels WHERE guild_id = ?",
+            (guild_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return row["channel_id"] if row else None
+
+    async def remove_request_channel(self, guild_id: str) -> bool:
+        """Remove the song request channel for a guild."""
+        cur = await self.db.execute(
+            "DELETE FROM song_request_channels WHERE guild_id = ?",
+            (guild_id,),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0

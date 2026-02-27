@@ -62,6 +62,28 @@ from utils.music_api import (
 from utils.lyrics import LyricsFetcher
 from utils.platform_resolver import is_music_url, resolve_url
 
+
+def _song_key(song: Dict[str, Any]) -> str:
+    """Create a stable JSON key for storing a song in the database.
+
+    Stores only the fields needed for retrieval/display so that
+    different API responses for the same song produce the same key.
+    """
+    return json.dumps(
+        {
+            "id": song.get("id", ""),
+            "name": song.get("name", ""),
+            "artist": song.get("artist", ""),
+            "album": song.get("album", ""),
+            "year": song.get("year", ""),
+            "duration": song.get("duration", 0),
+            "duration_formatted": song.get("duration_formatted", "0:00"),
+            "image": song.get("image", ""),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
 if TYPE_CHECKING:
     from bot import StarzaiBot
 
@@ -533,6 +555,36 @@ class NowPlayingView(discord.ui.View):
     async def lyrics_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         query = f"{self.song['artist']} {self.song['name']}"
         await self.cog._send_lyrics(interaction, query, self.song["artist"], self.song["name"])
+
+    @discord.ui.button(label="\u2764", style=discord.ButtonStyle.secondary)
+    async def favorite_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        """Toggle favorite for the currently-playing song."""
+        try:
+            db = getattr(self.cog.bot, "database", None)
+            if not db:
+                await interaction.response.send_message(
+                    "\u274c Database unavailable.", ephemeral=True
+                )
+                return
+            uid = str(interaction.user.id)
+            key = _song_key(self.song)
+            is_fav = await db.is_favorite(uid, key)
+            if is_fav:
+                await db.remove_favorite(uid, key)
+                await interaction.response.send_message(
+                    f"\U0001f494 Removed **{self.song['name']}** from your favorites.",
+                    ephemeral=True,
+                )
+            else:
+                await db.add_favorite(uid, key)
+                await interaction.response.send_message(
+                    f"\u2764\ufe0f Added **{self.song['name']}** to your favorites!",
+                    ephemeral=True,
+                )
+        except Exception:
+            await interaction.response.send_message(
+                "\u274c Could not update favorites.", ephemeral=True
+            )
 
     async def on_timeout(self) -> None:
         for item in self.children:
@@ -2705,12 +2757,27 @@ class MusicCog(commands.Cog, name="Music"):
         state._np_message = None
 
         async with state._lock:
-            # ── Track history & previous ─────────────────────────────
+            # ── Track history, previous & listening profile ──────────
             if state.current:
                 state.previous_song = state.current
                 state.history.append(state.current)
                 if len(state.history) > MAX_HISTORY:
                     state.history = state.history[-MAX_HISTORY:]
+
+                # ── Log listening session for music profile ──────────
+                try:
+                    listened = state.current_position
+                    requester_id = state.requester_map.get(state.current.get("id", ""))
+                    db = getattr(self.bot, "database", None)
+                    if db and requester_id and listened > 5:
+                        await db.log_listening_session(
+                            user_id=str(requester_id),
+                            guild_id=str(guild_id),
+                            song_data=_song_key(state.current),
+                            listened_seconds=listened,
+                        )
+                except Exception as exc:
+                    logger.debug("Failed to log listening session: %s", exc)
 
             # Reset vote-skip votes for the new track
             state.skip_votes.clear()
