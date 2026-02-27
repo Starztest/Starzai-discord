@@ -3061,6 +3061,1480 @@ class MusicCog(commands.Cog, name="Music"):
                 state.idle_task.cancel()
                 state.idle_task = None
 
+    # ── /dashboard — The All-in-One Music Controller ──────────────────
+
+    @app_commands.command(
+        name="dashboard",
+        description="Open the all-in-one music dashboard with button controls",
+    )
+    async def dashboard_cmd(self, interaction: discord.Interaction) -> None:
+        """Launch the interactive music dashboard.
+
+        The dashboard provides full button-based access to every music
+        feature — play, pause, skip, queue, volume, filters, playlists,
+        favorites, lyrics, download, and more — all without typing
+        additional commands.
+        """
+        if not interaction.guild:
+            embed = Embedder.error("Server Only", "The music dashboard can only be used in a server.")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+
+        if not await self._ensure_services(interaction):
+            return
+
+        guild_id = interaction.guild.id
+        state = self._get_state(guild_id)
+
+        # Build the dashboard embed and view
+        embed = _dashboard_embed(state, self, interaction.guild)
+        view = MusicDashboardView(self, guild_id, interaction.user.id)
+
+        await interaction.response.send_message(embed=embed, view=view)
+
+        # Store the message reference so the view can edit it later
+        try:
+            view._message = await interaction.original_response()
+        except Exception:
+            pass
+
+
+# =====================================================================
+#  Music Dashboard — "App within Discord" with full button navigation
+# =====================================================================
+
+# ── Dashboard constants ──────────────────────────────────────────────
+DASH_TIMEOUT = 600  # 10 minutes before the dashboard expires
+DASH_QUEUE_PAGE_SIZE = 8
+DASH_HISTORY_PAGE_SIZE = 10
+
+# Volume presets for the select menu
+VOLUME_PRESETS = [
+    ("Mute", 0),
+    ("10%", 10),
+    ("25%", 25),
+    ("50%", 50),
+    ("75%", 75),
+    ("100%", 100),
+]
+
+# ── Dashboard embed builders ─────────────────────────────────────────
+
+def _dashboard_embed(
+    state: GuildMusicState,
+    cog: "MusicCog",
+    guild: Optional[discord.Guild] = None,
+) -> discord.Embed:
+    """Build the main dashboard embed showing full player state."""
+    if state.current:
+        song = state.current
+        position = state.current_position
+        duration = song.get("duration", 0) or 0
+        bar = _progress_bar(position, duration, width=14)
+        loop = _loop_badge(state.loop_mode)
+
+        # Status indicator
+        if state.voice_client and state.voice_client.is_paused():
+            status_icon = "\u23f8\ufe0f Paused"
+        elif state.voice_client and state.voice_client.is_playing():
+            status_icon = "\u25b6\ufe0f Now Playing"
+        else:
+            status_icon = "\U0001f3b5 Ready"
+
+        # Badges
+        badges: List[str] = []
+        if state.audio_filter != "off":
+            badges.append(f"\U0001f3db {state.audio_filter.title()}")
+        if state.autoplay:
+            badges.append("\U0001f525 Autoplay")
+        if state.always_connected:
+            badges.append("\U0001f504 24/7")
+        badge_str = (" \u2022 ".join(badges)) if badges else ""
+
+        vol_pct = int(state.volume * 100)
+        vol_icon = "\U0001f507" if vol_pct == 0 else "\U0001f509" if vol_pct <= 50 else "\U0001f50a"
+
+        desc = (
+            f"## {song['name']}\n"
+            f"\U0001f3a4 **{song['artist']}**\n"
+            f"\U0001f4bf {song['album']} \u2022 {song['year']}\n\n"
+            f"{bar}{loop}\n\n"
+            f"{vol_icon} **{vol_pct}%** \u2022 "
+            f"\U0001f501 **{state.loop_mode.title()}** \u2022 "
+            f"\U0001f4cb **{len(state.queue)}** in queue"
+        )
+        if badge_str:
+            desc += f"\n{badge_str}"
+
+        # Queue preview (next 3)
+        if state.queue:
+            upcoming = []
+            for i, s in enumerate(state.queue[:3], 1):
+                upcoming.append(f"`{i}.` {s['name']} \u2014 {s['artist']}")
+            desc += "\n\n**Up Next:**\n" + "\n".join(upcoming)
+            if len(state.queue) > 3:
+                desc += f"\n*\u2026and {len(state.queue) - 3} more*"
+
+        embed = Embedder.standard(
+            f"{status_icon}",
+            desc[:MAX_EMBED_DESC],
+            footer=f"Use buttons below to control \u2022 {BRAND}",
+            thumbnail=song.get("image"),
+        )
+    else:
+        # No song playing
+        desc = (
+            "## \U0001f3b5 Music Dashboard\n\n"
+            "Nothing is currently playing.\n\n"
+            "Use **\U0001f50d Search** to find and play a song,\n"
+            "or **\U0001f4c1 Playlists** to load a saved playlist."
+        )
+        if state.queue:
+            desc += f"\n\n\U0001f4cb **{len(state.queue)}** songs in queue"
+
+        embed = Embedder.standard(
+            "\U0001f3b5 Music Dashboard",
+            desc[:MAX_EMBED_DESC],
+            footer=f"Your all-in-one music controller \u2022 {BRAND}",
+        )
+
+    return embed
+
+
+def _dashboard_queue_embed(
+    state: GuildMusicState, page: int = 0
+) -> discord.Embed:
+    """Build the queue sub-view embed."""
+    lines: List[str] = []
+
+    if state.current:
+        loop = _loop_badge(state.loop_mode)
+        lines.append(f"\U0001f3b5 **Now:** {state.current['name']} \u2014 {state.current['artist']}{loop}\n")
+
+    if state.queue:
+        total_pages = max(1, (len(state.queue) + DASH_QUEUE_PAGE_SIZE - 1) // DASH_QUEUE_PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
+        start = page * DASH_QUEUE_PAGE_SIZE
+        end = start + DASH_QUEUE_PAGE_SIZE
+        page_songs = state.queue[start:end]
+
+        for i, s in enumerate(page_songs, start + 1):
+            dur = s.get("duration_formatted", "?:??")
+            lines.append(f"**{i}.** {s['name']} \u2014 {s['artist']}  `{dur}`")
+
+        total_dur = sum(s.get("duration", 0) for s in state.queue)
+        dur_m, dur_s = divmod(int(total_dur), 60)
+        dur_h, dur_m = divmod(dur_m, 60)
+        dur_str = f"{dur_h}h {dur_m}m" if dur_h else f"{dur_m}m {dur_s}s"
+
+        footer = f"{len(state.queue)} songs \u2022 {dur_str} \u2022 Page {page + 1}/{total_pages}"
+    else:
+        lines.append("The queue is empty.")
+        footer = "No songs in queue"
+
+    return Embedder.standard(
+        "\U0001f4cb Queue",
+        "\n".join(lines)[:MAX_EMBED_DESC],
+        footer=f"{footer} \u2022 {BRAND}",
+    )
+
+
+def _dashboard_history_embed(
+    state: GuildMusicState, page: int = 0
+) -> discord.Embed:
+    """Build the history sub-view embed."""
+    if not state.history:
+        return Embedder.standard(
+            "\U0001f553 History",
+            "No songs have been played yet in this session.",
+            footer=BRAND,
+        )
+
+    rev = list(reversed(state.history))
+    total_pages = max(1, (len(rev) + DASH_HISTORY_PAGE_SIZE - 1) // DASH_HISTORY_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * DASH_HISTORY_PAGE_SIZE
+    end = start + DASH_HISTORY_PAGE_SIZE
+    page_songs = rev[start:end]
+
+    lines: List[str] = []
+    for i, s in enumerate(page_songs, start + 1):
+        dur = s.get("duration_formatted", "?:??")
+        lines.append(f"**{i}.** {s['name']} \u2014 {s['artist']}  `{dur}`")
+
+    return Embedder.standard(
+        "\U0001f553 Recently Played",
+        "\n".join(lines)[:MAX_EMBED_DESC],
+        footer=f"{len(state.history)} total \u2022 Page {page + 1}/{total_pages} \u2022 {BRAND}",
+    )
+
+
+# ── Search Modal ─────────────────────────────────────────────────────
+
+class DashboardSearchModal(discord.ui.Modal, title="\U0001f50d Search & Play"):
+    """Modal that collects a search query, finds the best match, and plays it."""
+
+    query_input = discord.ui.TextInput(
+        label="Song name, artist, or music link",
+        placeholder="e.g. Blinding Lights, Drake, spotify.com/track/...",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=200,
+    )
+
+    def __init__(self, cog: "MusicCog", guild_id: int, dashboard_view: "MusicDashboardView") -> None:
+        super().__init__()
+        self.cog = cog
+        self.guild_id = guild_id
+        self.dashboard_view = dashboard_view
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        query = self.query_input.value.strip()
+        if not query:
+            await interaction.response.send_message("\u274c Please enter a search query.", ephemeral=True)
+            return
+
+        if not interaction.guild:
+            await interaction.response.send_message("\u274c Server only.", ephemeral=True)
+            return
+
+        member = interaction.guild.get_member(interaction.user.id)
+        if not member or not member.voice or not member.voice.channel:
+            await interaction.response.send_message(
+                embed=Embedder.error("Not in VC", "\U0001f50a Join a voice channel first!"),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        search_query = await self.cog._resolve_query(query)
+        songs = await self.cog.music_api.search(search_query, limit=1)
+
+        if not songs:
+            await interaction.followup.send(
+                embed=Embedder.error("No Results", f"\u274c No songs found for **{query}**."),
+                ephemeral=True,
+            )
+            return
+
+        song = await self.cog.music_api.ensure_download_urls(songs[0])
+        await self.cog._play_song_in_vc(interaction, song, followup=True)
+
+        # Refresh the dashboard after a small delay for state to settle
+        await asyncio.sleep(1.0)
+        try:
+            await self.dashboard_view.refresh_dashboard(interaction)
+        except Exception:
+            pass
+
+
+# ── Seek Modal ───────────────────────────────────────────────────────
+
+class DashboardSeekModal(discord.ui.Modal, title="\u23e9 Seek to Position"):
+    """Modal that collects a time position and seeks to it."""
+
+    position_input = discord.ui.TextInput(
+        label="Position (e.g. 1:30, 90, 0:45)",
+        placeholder="M:SS or seconds",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=10,
+    )
+
+    def __init__(self, cog: "MusicCog", guild_id: int, dashboard_view: "MusicDashboardView") -> None:
+        super().__init__()
+        self.cog = cog
+        self.guild_id = guild_id
+        self.dashboard_view = dashboard_view
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        raw = self.position_input.value.strip()
+        seek_seconds = _parse_seek_position(raw)
+        if seek_seconds is None:
+            await interaction.response.send_message(
+                embed=Embedder.error("Invalid", "Use format like `1:30` or `90`."),
+                ephemeral=True,
+            )
+            return
+
+        state = self.cog._get_state(self.guild_id)
+        if not state.current:
+            await interaction.response.send_message("Nothing playing.", ephemeral=True)
+            return
+
+        duration = state.current.get("duration", 0) or 0
+        if duration > 0 and seek_seconds >= duration:
+            await interaction.response.send_message(
+                embed=Embedder.error("Out of Range", f"Song is only {_fmt_seconds(duration)} long."),
+                ephemeral=True,
+            )
+            return
+
+        stream_url = state._current_stream_url
+        if not stream_url:
+            stream_url = _pick_best_url(state.current.get("download_urls", []), "320kbps")
+        if not stream_url:
+            await interaction.response.send_message("No stream URL.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        async with state._lock:
+            state._seeking = True
+            if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
+                state.voice_client.stop()
+            await asyncio.sleep(0.3)
+            await self.cog._start_playback(self.guild_id, stream_url, seek_to=seek_seconds)
+
+        await interaction.followup.send(
+            embed=Embedder.success("Seeked", f"\u23e9 Jumped to **{_fmt_seconds(seek_seconds)}**"),
+            ephemeral=True,
+        )
+        # Refresh dashboard
+        await asyncio.sleep(0.5)
+        try:
+            await self.dashboard_view.refresh_dashboard(interaction)
+        except Exception:
+            pass
+
+
+# ── Sleep Timer Modal ────────────────────────────────────────────────
+
+class DashboardSleepModal(discord.ui.Modal, title="\U0001f634 Sleep Timer"):
+    """Modal to set a sleep timer."""
+
+    minutes_input = discord.ui.TextInput(
+        label="Minutes until disconnect (0 to cancel)",
+        placeholder="e.g. 30, 60, 0",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=4,
+    )
+
+    def __init__(self, cog: "MusicCog", guild_id: int) -> None:
+        super().__init__()
+        self.cog = cog
+        self.guild_id = guild_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            minutes = int(self.minutes_input.value.strip())
+        except ValueError:
+            await interaction.response.send_message("Please enter a number.", ephemeral=True)
+            return
+
+        # Delegate to the premium cog's sleep timer
+        premium_cog = self.cog.bot.get_cog("MusicPremium")
+        if not premium_cog:
+            await interaction.response.send_message(
+                embed=Embedder.error("Unavailable", "Sleep timer is not available."),
+                ephemeral=True,
+            )
+            return
+
+        guild_id = self.guild_id
+
+        # Cancel existing
+        existing = premium_cog._sleep_timers.get(guild_id)
+        if existing and not existing.done():
+            existing.cancel()
+            del premium_cog._sleep_timers[guild_id]
+
+        if minutes <= 0:
+            await interaction.response.send_message(
+                embed=Embedder.info("Cancelled", "\u23f0 Sleep timer cancelled."),
+                ephemeral=True,
+            )
+            return
+
+        if minutes > 480:
+            await interaction.response.send_message(
+                embed=Embedder.error("Too Long", "Max is 480 minutes (8 hours)."),
+                ephemeral=True,
+            )
+            return
+
+        premium_cog._sleep_timers[guild_id] = asyncio.ensure_future(
+            premium_cog._sleep_timer_task(guild_id, minutes, interaction.channel)
+        )
+        await interaction.response.send_message(
+            embed=Embedder.success("Sleep Timer", f"\U0001f634 Music stops in **{minutes} min**."),
+            ephemeral=True,
+        )
+
+
+# ── Volume Sub-View ──────────────────────────────────────────────────
+
+class DashboardVolumeView(discord.ui.View):
+    """Sub-view with volume preset buttons + back."""
+
+    def __init__(self, cog: "MusicCog", guild_id: int, parent: "MusicDashboardView") -> None:
+        super().__init__(timeout=DASH_TIMEOUT)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.parent = parent
+        self._build()
+
+    def _build(self) -> None:
+        state = self.cog._get_state(self.guild_id)
+        current_vol = int(state.volume * 100)
+
+        # Row 1: Volume presets
+        presets = [0, 10, 25, 50, 75, 100]
+        for vol in presets[:5]:
+            label = "Mute" if vol == 0 else f"{vol}%"
+            style = discord.ButtonStyle.success if vol == current_vol else discord.ButtonStyle.secondary
+            btn = discord.ui.Button(label=label, style=style, custom_id=f"dvol_{vol}", row=0)
+            btn.callback = self._make_vol_callback(vol)
+            self.add_item(btn)
+
+        # Row 2: 100% + fine controls + back
+        btn100 = discord.ui.Button(label="100%", style=discord.ButtonStyle.success if current_vol == 100 else discord.ButtonStyle.secondary, custom_id="dvol_100", row=1)
+        btn100.callback = self._make_vol_callback(100)
+        self.add_item(btn100)
+
+        btn_down = discord.ui.Button(label="\U0001f509 -10", style=discord.ButtonStyle.primary, custom_id="dvol_down", row=1)
+        btn_down.callback = self._vol_down
+        self.add_item(btn_down)
+
+        btn_up = discord.ui.Button(label="\U0001f50a +10", style=discord.ButtonStyle.primary, custom_id="dvol_up", row=1)
+        btn_up.callback = self._vol_up
+        self.add_item(btn_up)
+
+        back_btn = discord.ui.Button(label="\u2190 Back", style=discord.ButtonStyle.danger, custom_id="dvol_back", row=1)
+        back_btn.callback = self._go_back
+        self.add_item(back_btn)
+
+    def _make_vol_callback(self, vol: int):
+        async def callback(interaction: discord.Interaction) -> None:
+            state = self.cog._get_state(self.guild_id)
+            state.volume = vol / 100.0
+            if state.voice_client and state.voice_client.source and hasattr(state.voice_client.source, "volume"):
+                state.voice_client.source.volume = state.volume
+            # Rebuild volume view with updated highlight
+            new_view = DashboardVolumeView(self.cog, self.guild_id, self.parent)
+            embed = Embedder.standard(
+                "\U0001f50a Volume Control",
+                f"Volume set to **{vol}%**\n\nSelect a preset or use \u00b110 buttons.",
+                footer=BRAND,
+            )
+            await interaction.response.edit_message(embed=embed, view=new_view)
+        return callback
+
+    async def _vol_down(self, interaction: discord.Interaction) -> None:
+        state = self.cog._get_state(self.guild_id)
+        new_vol = max(0, int(state.volume * 100) - 10)
+        state.volume = new_vol / 100.0
+        if state.voice_client and state.voice_client.source and hasattr(state.voice_client.source, "volume"):
+            state.voice_client.source.volume = state.volume
+        new_view = DashboardVolumeView(self.cog, self.guild_id, self.parent)
+        embed = Embedder.standard(
+            "\U0001f50a Volume Control",
+            f"Volume set to **{new_vol}%**\n\nSelect a preset or use \u00b110 buttons.",
+            footer=BRAND,
+        )
+        await interaction.response.edit_message(embed=embed, view=new_view)
+
+    async def _vol_up(self, interaction: discord.Interaction) -> None:
+        state = self.cog._get_state(self.guild_id)
+        new_vol = min(100, int(state.volume * 100) + 10)
+        state.volume = new_vol / 100.0
+        if state.voice_client and state.voice_client.source and hasattr(state.voice_client.source, "volume"):
+            state.voice_client.source.volume = state.volume
+        new_view = DashboardVolumeView(self.cog, self.guild_id, self.parent)
+        embed = Embedder.standard(
+            "\U0001f50a Volume Control",
+            f"Volume set to **{new_vol}%**\n\nSelect a preset or use \u00b110 buttons.",
+            footer=BRAND,
+        )
+        await interaction.response.edit_message(embed=embed, view=new_view)
+
+    async def _go_back(self, interaction: discord.Interaction) -> None:
+        await self.parent.return_to_main(interaction)
+
+
+# ── Filters Sub-View ─────────────────────────────────────────────────
+
+class DashboardFiltersView(discord.ui.View):
+    """Sub-view with audio filter selection."""
+
+    def __init__(self, cog: "MusicCog", guild_id: int, parent: "MusicDashboardView") -> None:
+        super().__init__(timeout=DASH_TIMEOUT)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.parent = parent
+        self._build()
+
+    def _build(self) -> None:
+        state = self.cog._get_state(self.guild_id)
+        current_filter = state.audio_filter
+
+        # Build a select menu with all filters
+        options: List[discord.SelectOption] = []
+        filter_labels = {
+            "off": "\u274c Off",
+            "bassboost": "\U0001f50a Bass Boost",
+            "nightcore": "\U0001f319 Nightcore",
+            "vaporwave": "\U0001f30a Vaporwave",
+            "karaoke": "\U0001f3a4 Karaoke",
+            "8d": "\U0001f3a7 8D Audio",
+            "treble": "\U0001f3b5 Treble Boost",
+            "vibrato": "\U0001f300 Vibrato",
+            "tremolo": "\U0001f4a5 Tremolo",
+            "pop": "\U0001f3b6 Pop",
+            "soft": "\U0001f54a Soft",
+            "loud": "\U0001f4e2 Loud",
+        }
+        for key, label in filter_labels.items():
+            default = (key == current_filter)
+            options.append(discord.SelectOption(label=label, value=key, default=default))
+
+        select = discord.ui.Select(
+            placeholder="Choose an audio filter\u2026",
+            options=options,
+            custom_id="dfilter_select",
+            row=0,
+        )
+        select.callback = self._on_select
+        self.add_item(select)
+
+        back_btn = discord.ui.Button(label="\u2190 Back", style=discord.ButtonStyle.danger, custom_id="dfilter_back", row=1)
+        back_btn.callback = self._go_back
+        self.add_item(back_btn)
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        filter_name = interaction.data["values"][0]
+        state = self.cog._get_state(self.guild_id)
+        state.audio_filter = filter_name
+
+        # If something is playing, restart with the new filter
+        if state.voice_client and state.voice_client.is_connected() and state.current:
+            stream_url = state._current_stream_url
+            if not stream_url:
+                stream_url = _pick_best_url(state.current.get("download_urls", []), "320kbps")
+            if stream_url:
+                current_pos = state.current_position
+                await interaction.response.defer()
+                async with state._lock:
+                    state._seeking = True
+                    if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
+                        state.voice_client.stop()
+                    await asyncio.sleep(0.3)
+                    await self.cog._start_playback(self.guild_id, stream_url, seek_to=current_pos)
+
+                # Return to main dashboard
+                await self.parent.return_to_main(interaction, followup=True)
+                return
+
+        # Not playing — just store and go back
+        await self.parent.return_to_main(interaction)
+
+    async def _go_back(self, interaction: discord.Interaction) -> None:
+        await self.parent.return_to_main(interaction)
+
+
+# ── Queue Sub-View ───────────────────────────────────────────────────
+
+class DashboardQueueView(discord.ui.View):
+    """Paginated queue sub-view with shuffle/clear and back."""
+
+    def __init__(self, cog: "MusicCog", guild_id: int, parent: "MusicDashboardView", page: int = 0) -> None:
+        super().__init__(timeout=DASH_TIMEOUT)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.parent = parent
+        self.page = page
+
+    @property
+    def total_pages(self) -> int:
+        state = self.cog._get_state(self.guild_id)
+        total = len(state.queue)
+        if total == 0:
+            return 1
+        return (total + DASH_QUEUE_PAGE_SIZE - 1) // DASH_QUEUE_PAGE_SIZE
+
+    @discord.ui.button(label="\u25c0 Prev", style=discord.ButtonStyle.secondary, row=0)
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.page > 0:
+            self.page -= 1
+        state = self.cog._get_state(self.guild_id)
+        await interaction.response.edit_message(
+            embed=_dashboard_queue_embed(state, self.page), view=self
+        )
+
+    @discord.ui.button(label="\u25b6 Next", style=discord.ButtonStyle.secondary, row=0)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.page < self.total_pages - 1:
+            self.page += 1
+        state = self.cog._get_state(self.guild_id)
+        await interaction.response.edit_message(
+            embed=_dashboard_queue_embed(state, self.page), view=self
+        )
+
+    @discord.ui.button(label="\U0001f500 Shuffle", style=discord.ButtonStyle.primary, row=0)
+    async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        if len(state.queue) >= 2:
+            random.shuffle(state.queue)
+        self.page = 0
+        await interaction.response.edit_message(
+            embed=_dashboard_queue_embed(state, self.page), view=self
+        )
+
+    @discord.ui.button(label="\U0001f9f9 Clear", style=discord.ButtonStyle.danger, row=0)
+    async def clear_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        state.queue.clear()
+        state.loop_mode = "off"
+        self.page = 0
+        await interaction.response.edit_message(
+            embed=_dashboard_queue_embed(state, self.page), view=self
+        )
+
+    @discord.ui.button(label="\u2190 Back", style=discord.ButtonStyle.danger, row=1)
+    async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.parent.return_to_main(interaction)
+
+
+# ── History Sub-View ─────────────────────────────────────────────────
+
+class DashboardHistoryView(discord.ui.View):
+    """Paginated history sub-view."""
+
+    def __init__(self, cog: "MusicCog", guild_id: int, parent: "MusicDashboardView", page: int = 0) -> None:
+        super().__init__(timeout=DASH_TIMEOUT)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.parent = parent
+        self.page = page
+
+    @property
+    def total_pages(self) -> int:
+        state = self.cog._get_state(self.guild_id)
+        total = len(state.history)
+        if total == 0:
+            return 1
+        return (total + DASH_HISTORY_PAGE_SIZE - 1) // DASH_HISTORY_PAGE_SIZE
+
+    @discord.ui.button(label="\u25c0 Prev", style=discord.ButtonStyle.secondary, row=0)
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.page > 0:
+            self.page -= 1
+        state = self.cog._get_state(self.guild_id)
+        await interaction.response.edit_message(
+            embed=_dashboard_history_embed(state, self.page), view=self
+        )
+
+    @discord.ui.button(label="\u25b6 Next", style=discord.ButtonStyle.secondary, row=0)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.page < self.total_pages - 1:
+            self.page += 1
+        state = self.cog._get_state(self.guild_id)
+        await interaction.response.edit_message(
+            embed=_dashboard_history_embed(state, self.page), view=self
+        )
+
+    @discord.ui.button(label="\u2190 Back", style=discord.ButtonStyle.danger, row=0)
+    async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.parent.return_to_main(interaction)
+
+
+# ── Playlists Sub-View ───────────────────────────────────────────────
+
+class DashboardPlaylistsView(discord.ui.View):
+    """Sub-view showing user's playlists with a select menu to play them."""
+
+    def __init__(
+        self,
+        cog: "MusicCog",
+        guild_id: int,
+        parent: "MusicDashboardView",
+        playlists: List[Dict[str, Any]],
+        user_id: int,
+    ) -> None:
+        super().__init__(timeout=DASH_TIMEOUT)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.parent = parent
+        self.playlists = playlists
+        self.user_id = user_id
+        self._build()
+
+    def _build(self) -> None:
+        if not self.playlists:
+            return
+
+        options: List[discord.SelectOption] = []
+        for pl in self.playlists[:25]:
+            label = pl["name"][:100]
+            desc = f"{pl['song_count']} song{'s' if pl['song_count'] != 1 else ''}"
+            options.append(
+                discord.SelectOption(label=label, description=desc, value=str(pl["id"]))
+            )
+
+        select = discord.ui.Select(
+            placeholder="Select a playlist to play\u2026",
+            options=options,
+            custom_id="dpl_select",
+            row=0,
+        )
+        select.callback = self._on_select
+        self.add_item(select)
+
+        back_btn = discord.ui.Button(label="\u2190 Back", style=discord.ButtonStyle.danger, custom_id="dpl_back", row=1)
+        back_btn.callback = self._go_back
+        self.add_item(back_btn)
+
+    def _build_embed(self) -> discord.Embed:
+        if not self.playlists:
+            return Embedder.standard(
+                "\U0001f4c1 Your Playlists",
+                "You don\u2019t have any playlists yet!\n\nUse `/playlist create` to make one.",
+                footer=BRAND,
+            )
+
+        lines: List[str] = []
+        for i, pl in enumerate(self.playlists, 1):
+            lines.append(f"**{i}.** {pl['name']} \u2014 `{pl['song_count']} songs`")
+
+        return Embedder.standard(
+            "\U0001f4c1 Your Playlists",
+            "\n".join(lines)[:MAX_EMBED_DESC],
+            footer=f"{len(self.playlists)} playlists \u2022 Select one to play \u2022 {BRAND}",
+        )
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        playlist_id = int(interaction.data["values"][0])
+        playlist = next((p for p in self.playlists if p["id"] == playlist_id), None)
+        if not playlist:
+            await interaction.response.send_message("\u274c Playlist not found.", ephemeral=True)
+            return
+
+        premium_cog = self.cog.bot.get_cog("MusicPremium")
+        if not premium_cog:
+            await interaction.response.send_message(
+                embed=Embedder.error("Unavailable", "Playlist system unavailable."),
+                ephemeral=True,
+            )
+            return
+
+        db = getattr(self.cog.bot, "database", None)
+        if not db:
+            await interaction.response.send_message(
+                embed=Embedder.error("Unavailable", "Database is not available."),
+                ephemeral=True,
+            )
+            return
+        songs = await db.get_playlist_songs(playlist_id)
+        if not songs:
+            await interaction.response.send_message(
+                embed=Embedder.warning("Empty", f"**{playlist['name']}** has no songs."),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+        await premium_cog._queue_songs(interaction, songs, playlist["name"])
+
+        # Return to main after loading
+        await asyncio.sleep(1.0)
+        try:
+            await self.parent.return_to_main(interaction, followup=True)
+        except Exception:
+            pass
+
+    async def _go_back(self, interaction: discord.Interaction) -> None:
+        await self.parent.return_to_main(interaction)
+
+
+# ── Favorites Sub-View ───────────────────────────────────────────────
+
+class DashboardFavoritesView(discord.ui.View):
+    """Sub-view for user's favorites with play-all and shuffle."""
+
+    SONGS_PER_PAGE = 8
+
+    def __init__(
+        self,
+        cog: "MusicCog",
+        guild_id: int,
+        parent: "MusicDashboardView",
+        favorites: List[Dict[str, Any]],
+        user_id: int,
+        page: int = 0,
+    ) -> None:
+        super().__init__(timeout=DASH_TIMEOUT)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.parent = parent
+        self.favorites = favorites
+        self.user_id = user_id
+        self.page = page
+
+    @property
+    def total_pages(self) -> int:
+        total = len(self.favorites)
+        if total == 0:
+            return 1
+        return (total + self.SONGS_PER_PAGE - 1) // self.SONGS_PER_PAGE
+
+    def _build_embed(self) -> discord.Embed:
+        if not self.favorites:
+            return Embedder.standard(
+                "\u2764\ufe0f Your Favorites",
+                "No favorites yet! Use the \u2764 button while a song plays.",
+                footer=BRAND,
+            )
+
+        start = self.page * self.SONGS_PER_PAGE
+        end = start + self.SONGS_PER_PAGE
+        page_songs = self.favorites[start:end]
+
+        lines: List[str] = []
+        for i, song in enumerate(page_songs, start + 1):
+            dur = song.get("duration_formatted", "?:??")
+            lines.append(f"**{i}.** {song['name']} \u2014 {song['artist']}  `{dur}`")
+
+        return Embedder.standard(
+            "\u2764\ufe0f Your Favorites",
+            "\n".join(lines)[:MAX_EMBED_DESC],
+            footer=f"{len(self.favorites)} songs \u2022 Page {self.page + 1}/{self.total_pages} \u2022 {BRAND}",
+        )
+
+    @discord.ui.button(label="\u25c0 Prev", style=discord.ButtonStyle.secondary, row=0)
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.page > 0:
+            self.page -= 1
+        await interaction.response.edit_message(embed=self._build_embed(), view=self)
+
+    @discord.ui.button(label="\u25b6 Next", style=discord.ButtonStyle.secondary, row=0)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.page < self.total_pages - 1:
+            self.page += 1
+        await interaction.response.edit_message(embed=self._build_embed(), view=self)
+
+    @discord.ui.button(label="\u25b6 Play All", style=discord.ButtonStyle.success, emoji="\U0001f3b5", row=0)
+    async def play_all_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.favorites:
+            await interaction.response.send_message("No favorites to play.", ephemeral=True)
+            return
+        premium_cog = self.cog.bot.get_cog("MusicPremium")
+        if not premium_cog:
+            await interaction.response.send_message("Unavailable.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await premium_cog._queue_songs(interaction, self.favorites, "Favorites")
+        await asyncio.sleep(1.0)
+        try:
+            await self.parent.return_to_main(interaction, followup=True)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="\U0001f500 Shuffle", style=discord.ButtonStyle.primary, row=0)
+    async def shuffle_play_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.favorites:
+            await interaction.response.send_message("No favorites to play.", ephemeral=True)
+            return
+        premium_cog = self.cog.bot.get_cog("MusicPremium")
+        if not premium_cog:
+            await interaction.response.send_message("Unavailable.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        shuffled = list(self.favorites)
+        random.shuffle(shuffled)
+        await premium_cog._queue_songs(interaction, shuffled, "Favorites (Shuffled)")
+        await asyncio.sleep(1.0)
+        try:
+            await self.parent.return_to_main(interaction, followup=True)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="\u2190 Back", style=discord.ButtonStyle.danger, row=1)
+    async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.parent.return_to_main(interaction)
+
+
+# ── More Actions Sub-View ────────────────────────────────────────────
+
+class DashboardMoreView(discord.ui.View):
+    """Sub-view for less-common actions: seek, replay, voteskip, duplicates, grab, save queue."""
+
+    def __init__(self, cog: "MusicCog", guild_id: int, parent: "MusicDashboardView") -> None:
+        super().__init__(timeout=DASH_TIMEOUT)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.parent = parent
+
+    @discord.ui.button(label="Seek", style=discord.ButtonStyle.primary, emoji="\u23e9", row=0)
+    async def seek_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        if not state.current:
+            await interaction.response.send_message("Nothing playing.", ephemeral=True)
+            return
+        modal = DashboardSeekModal(self.cog, self.guild_id, self.parent)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Replay", style=discord.ButtonStyle.primary, emoji="\U0001f501", row=0)
+    async def replay_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        if not state.current:
+            await interaction.response.send_message("Nothing playing.", ephemeral=True)
+            return
+        stream_url = state._current_stream_url
+        if not stream_url:
+            stream_url = _pick_best_url(state.current.get("download_urls", []), "320kbps")
+        if not stream_url:
+            await interaction.response.send_message("No stream URL.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        async with state._lock:
+            state._seeking = True
+            if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
+                state.voice_client.stop()
+            await asyncio.sleep(0.3)
+            await self.cog._start_playback(self.guild_id, stream_url, seek_to=0.0)
+
+        await self.parent.return_to_main(interaction, followup=True)
+
+    @discord.ui.button(label="Vote Skip", style=discord.ButtonStyle.primary, emoji="\U0001f5f3", row=0)
+    async def voteskip_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        if not state.voice_client or not state.voice_client.is_playing():
+            await interaction.response.send_message("Nothing to skip.", ephemeral=True)
+            return
+
+        member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+        if not member or not member.voice or member.voice.channel != state.voice_client.channel:
+            await interaction.response.send_message("You must be in the VC.", ephemeral=True)
+            return
+
+        state.skip_votes.add(interaction.user.id)
+        humans = sum(1 for m in state.voice_client.channel.members if not m.bot)
+        needed = max(1, (humans + 1) // 2)
+        current_votes = len(state.skip_votes)
+
+        if current_votes >= needed:
+            skipped = state.current["name"] if state.current else "song"
+            state.skip_votes.clear()
+            state.voice_client.stop()
+            await interaction.response.send_message(
+                embed=Embedder.success("Vote Skip", f"\u23ed Passed! Skipped **{skipped}** ({current_votes}/{needed})"),
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                embed=Embedder.info("Vote Skip", f"\U0001f5f3 {current_votes}/{needed} votes"),
+                ephemeral=True,
+            )
+
+    @discord.ui.button(label="Grab", style=discord.ButtonStyle.secondary, emoji="\U0001f4be", row=0)
+    async def grab_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        if not state.current:
+            await interaction.response.send_message("Nothing playing.", ephemeral=True)
+            return
+        song = state.current
+        desc = (
+            f"**{song['name']}**\n"
+            f"\U0001f3a4 {song['artist']}\n"
+            f"\U0001f4bf {song['album']} \u2022 {song['year']}\n"
+            f"\u23f1 {song['duration_formatted']}"
+        )
+        embed = Embedder.standard(
+            "\U0001f4be Saved Song", desc, footer=BRAND, thumbnail=song.get("image"),
+        )
+        try:
+            await interaction.user.send(embed=embed)
+            await interaction.response.send_message(
+                embed=Embedder.success("Saved", "\U0001f4be Sent to your DMs!"), ephemeral=True,
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                embed=Embedder.error("DMs Closed", "Enable DMs from server members."), ephemeral=True,
+            )
+
+    @discord.ui.button(label="Dupes", style=discord.ButtonStyle.secondary, emoji="\U0001f9f9", row=0)
+    async def dupes_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        if not state.queue:
+            await interaction.response.send_message("Queue is empty.", ephemeral=True)
+            return
+        seen: set = set()
+        unique: List[Dict[str, Any]] = []
+        removed = 0
+        for s in state.queue:
+            sid = s.get("id", "")
+            if sid and sid in seen:
+                removed += 1
+            else:
+                seen.add(sid)
+                unique.append(s)
+        state.queue = unique
+        msg = f"Removed **{removed}** duplicate{'s' if removed != 1 else ''}." if removed else "No duplicates found."
+        await interaction.response.send_message(embed=Embedder.info("Duplicates", msg), ephemeral=True)
+
+    @discord.ui.button(label="Save Queue", style=discord.ButtonStyle.secondary, emoji="\U0001f4be", row=1)
+    async def save_queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        all_songs: List[Dict[str, Any]] = []
+        if state.current:
+            all_songs.append(state.current)
+        all_songs.extend(state.queue)
+        if not all_songs:
+            await interaction.response.send_message("No songs to save.", ephemeral=True)
+            return
+        # Quick-save with auto name
+        import datetime
+        name = f"Queue {datetime.datetime.now().strftime('%b %d %H:%M')}"
+        db = getattr(self.cog.bot, "database", None)
+        if not db:
+            await interaction.response.send_message("Database unavailable.", ephemeral=True)
+            return
+        uid = str(interaction.user.id)
+        from cogs.music_premium import _song_key as _pk, MAX_SONGS_PER_PLAYLIST
+        pl_id = await db.create_playlist(uid, name)
+        if pl_id is None:
+            await interaction.response.send_message("Could not create playlist.", ephemeral=True)
+            return
+        count = 0
+        for song in all_songs[:MAX_SONGS_PER_PLAYLIST]:
+            key = _pk(song)
+            if await db.add_song_to_playlist(pl_id, key):
+                count += 1
+        await interaction.response.send_message(
+            embed=Embedder.success("Saved", f"\U0001f4be Saved **{count}** songs to **{name}**"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Profile", style=discord.ButtonStyle.secondary, emoji="\U0001f4ca", row=1)
+    async def profile_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        premium_cog = self.cog.bot.get_cog("MusicPremium")
+        if not premium_cog:
+            await interaction.response.send_message("Unavailable.", ephemeral=True)
+            return
+        db = getattr(self.cog.bot, "database", None)
+        if not db:
+            await interaction.response.send_message(
+                embed=Embedder.error("Unavailable", "Database is not available."),
+                ephemeral=True,
+            )
+            return
+        profile = await db.get_music_profile(str(interaction.user.id))
+        total_time = profile.get("total_listening_seconds", 0)
+        total_songs = profile.get("total_songs_played", 0)
+        top_artists = profile.get("top_artists", [])
+        fav_count = await db.get_favorites_count(str(interaction.user.id))
+
+        from cogs.music_premium import _fmt_duration
+        lines: List[str] = [
+            f"\U0001f3b5 **Songs:** {total_songs:,}",
+            f"\u23f1 **Time:** {_fmt_duration(total_time)}",
+            f"\u2764\ufe0f **Favorites:** {fav_count}",
+        ]
+        if top_artists:
+            lines.append("")
+            for i, a in enumerate(top_artists[:3], 1):
+                medals = ["\U0001f947", "\U0001f948", "\U0001f949"]
+                lines.append(f"{medals[i-1]} {a['name']} \u2014 {a['plays']} plays")
+
+        embed = Embedder.standard(
+            f"\U0001f4ca {interaction.user.display_name}'s Profile",
+            "\n".join(lines),
+            footer=BRAND,
+            thumbnail=interaction.user.display_avatar.url if interaction.user.display_avatar else None,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="\u2190 Back", style=discord.ButtonStyle.danger, row=1)
+    async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.parent.return_to_main(interaction)
+
+
+# =====================================================================
+#  THE MAIN MUSIC DASHBOARD VIEW
+# =====================================================================
+
+class MusicDashboardView(discord.ui.View):
+    """The all-in-one music dashboard — a full music app in Discord buttons.
+
+    Provides button access to every music function:
+    - Row 1: Transport controls (previous, play/pause, skip, stop, search)
+    - Row 2: Queue management (queue, shuffle, loop, volume, filters)
+    - Row 3: Extras (favorite, lyrics, sleep, autoplay, 24/7)
+    - Row 4: Collections (playlists, favorites, history, download, more)
+    - Row 5: Meta (refresh, close)
+    """
+
+    def __init__(self, cog: "MusicCog", guild_id: int, user_id: int) -> None:
+        super().__init__(timeout=DASH_TIMEOUT)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self._message: Optional[discord.Message] = None
+
+    # ── Helper: Refresh/return to main dashboard ─────────────────────
+
+    async def return_to_main(self, interaction: discord.Interaction, *, followup: bool = False) -> None:
+        """Rebuild and show the main dashboard (used by sub-views to go back)."""
+        state = self.cog._get_state(self.guild_id)
+        guild = self.cog.bot.get_guild(self.guild_id)
+        embed = _dashboard_embed(state, self.cog, guild)
+        new_view = MusicDashboardView(self.cog, self.guild_id, self.user_id)
+        new_view._message = self._message
+        try:
+            if followup or interaction.response.is_done():
+                if self._message:
+                    await self._message.edit(embed=embed, view=new_view)
+            else:
+                await interaction.response.edit_message(embed=embed, view=new_view)
+        except Exception:
+            pass
+
+    async def refresh_dashboard(self, interaction: discord.Interaction) -> None:
+        """Refresh the dashboard embed in-place (called after actions)."""
+        if self._message:
+            state = self.cog._get_state(self.guild_id)
+            guild = self.cog.bot.get_guild(self.guild_id)
+            embed = _dashboard_embed(state, self.cog, guild)
+            new_view = MusicDashboardView(self.cog, self.guild_id, self.user_id)
+            new_view._message = self._message
+            try:
+                await self._message.edit(embed=embed, view=new_view)
+            except Exception:
+                pass
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  ROW 1 — Transport Controls
+    # ═══════════════════════════════════════════════════════════════════
+
+    @discord.ui.button(label="Prev", style=discord.ButtonStyle.secondary, emoji="\u23ee", row=0)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        if not state.previous_song:
+            await interaction.response.send_message("No previous song.", ephemeral=True)
+            return
+        if not state.voice_client or not state.voice_client.is_connected():
+            await interaction.response.send_message("Not connected.", ephemeral=True)
+            return
+
+        prev = state.previous_song
+        prev = await self.cog.music_api.ensure_download_urls(prev)
+        stream_url = _pick_best_url(prev.get("download_urls", []), "320kbps")
+        if not stream_url:
+            await interaction.response.send_message("Could not get stream URL.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        async with state._lock:
+            if state.current:
+                state.queue.insert(0, state.current)
+            state._seeking = True
+            if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
+                state.voice_client.stop()
+            await asyncio.sleep(0.3)
+            state.current = prev
+            state.previous_song = None
+            await self.cog._start_playback(self.guild_id, stream_url)
+
+        await asyncio.sleep(0.5)
+        await self.refresh_dashboard(interaction)
+
+    @discord.ui.button(label="Play/Pause", style=discord.ButtonStyle.success, emoji="\u23ef", row=0)
+    async def playpause_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        if state.voice_client and state.voice_client.is_playing():
+            state.pause_start_time = time.monotonic()
+            state.voice_client.pause()
+        elif state.voice_client and state.voice_client.is_paused():
+            if state.pause_start_time > 0:
+                state.paused_elapsed += time.monotonic() - state.pause_start_time
+                state.pause_start_time = 0.0
+            state.voice_client.resume()
+        else:
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            return
+        # Refresh the dashboard to show updated state
+        state_obj = self.cog._get_state(self.guild_id)
+        guild = self.cog.bot.get_guild(self.guild_id)
+        embed = _dashboard_embed(state_obj, self.cog, guild)
+        new_view = MusicDashboardView(self.cog, self.guild_id, self.user_id)
+        new_view._message = self._message
+        await interaction.response.edit_message(embed=embed, view=new_view)
+
+    @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary, emoji="\u23ed", row=0)
+    async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
+            state.voice_client.stop()
+            await interaction.response.defer()
+            await asyncio.sleep(1.0)
+            await self.refresh_dashboard(interaction)
+        else:
+            await interaction.response.send_message("Nothing to skip.", ephemeral=True)
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, emoji="\u23f9", row=0)
+    async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        if state.voice_client:
+            await self.cog._stop_and_leave(self.guild_id)
+            state_obj = self.cog._get_state(self.guild_id)
+            guild = self.cog.bot.get_guild(self.guild_id)
+            embed = _dashboard_embed(state_obj, self.cog, guild)
+            new_view = MusicDashboardView(self.cog, self.guild_id, self.user_id)
+            new_view._message = self._message
+            await interaction.response.edit_message(embed=embed, view=new_view)
+        else:
+            await interaction.response.send_message("Not connected.", ephemeral=True)
+
+    @discord.ui.button(label="Search", style=discord.ButtonStyle.primary, emoji="\U0001f50d", row=0)
+    async def search_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.cog._services_ready():
+            await interaction.response.send_message("Music services unavailable.", ephemeral=True)
+            return
+        modal = DashboardSearchModal(self.cog, self.guild_id, self)
+        await interaction.response.send_modal(modal)
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  ROW 2 — Queue & Sound Controls
+    # ═══════════════════════════════════════════════════════════════════
+
+    @discord.ui.button(label="Queue", style=discord.ButtonStyle.secondary, emoji="\U0001f4cb", row=1)
+    async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        sub_view = DashboardQueueView(self.cog, self.guild_id, self)
+        await interaction.response.edit_message(
+            embed=_dashboard_queue_embed(state), view=sub_view
+        )
+
+    @discord.ui.button(label="Shuffle", style=discord.ButtonStyle.secondary, emoji="\U0001f500", row=1)
+    async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        if len(state.queue) >= 2:
+            random.shuffle(state.queue)
+            await interaction.response.send_message(
+                embed=Embedder.success("Shuffled", f"\U0001f500 Shuffled **{len(state.queue)}** songs."),
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message("Need 2+ songs to shuffle.", ephemeral=True)
+
+    @discord.ui.button(label="Loop", style=discord.ButtonStyle.secondary, emoji="\U0001f501", row=1)
+    async def loop_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        # Cycle: off -> track -> queue -> off
+        cycle = {"off": "track", "track": "queue", "queue": "off"}
+        state.loop_mode = cycle.get(state.loop_mode, "off")
+        icons = {"off": "\u274c", "track": "\U0001f502", "queue": "\U0001f501"}
+        # Refresh dashboard to show new loop mode
+        guild = self.cog.bot.get_guild(self.guild_id)
+        embed = _dashboard_embed(state, self.cog, guild)
+        new_view = MusicDashboardView(self.cog, self.guild_id, self.user_id)
+        new_view._message = self._message
+        await interaction.response.edit_message(embed=embed, view=new_view)
+
+    @discord.ui.button(label="Volume", style=discord.ButtonStyle.secondary, emoji="\U0001f50a", row=1)
+    async def volume_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        vol = int(state.volume * 100)
+        sub_view = DashboardVolumeView(self.cog, self.guild_id, self)
+        embed = Embedder.standard(
+            "\U0001f50a Volume Control",
+            f"Current volume: **{vol}%**\n\nSelect a preset or use \u00b110 buttons.",
+            footer=BRAND,
+        )
+        await interaction.response.edit_message(embed=embed, view=sub_view)
+
+    @discord.ui.button(label="Filters", style=discord.ButtonStyle.secondary, emoji="\U0001f3db", row=1)
+    async def filters_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        current = state.audio_filter
+        label = current.title() if current != "off" else "None"
+        sub_view = DashboardFiltersView(self.cog, self.guild_id, self)
+        embed = Embedder.standard(
+            "\U0001f3db Audio Filters",
+            f"Current filter: **{label}**\n\nSelect a filter from the menu below.",
+            footer=BRAND,
+        )
+        await interaction.response.edit_message(embed=embed, view=sub_view)
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  ROW 3 — Extras & Toggles
+    # ═══════════════════════════════════════════════════════════════════
+
+    @discord.ui.button(label="Favorite", style=discord.ButtonStyle.secondary, emoji="\u2764", row=2)
+    async def favorite_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        if not state.current:
+            await interaction.response.send_message("Nothing playing.", ephemeral=True)
+            return
+        db = getattr(self.cog.bot, "database", None)
+        if not db:
+            await interaction.response.send_message("Database unavailable.", ephemeral=True)
+            return
+        uid = str(interaction.user.id)
+        key = _song_key(state.current)
+        is_fav = await db.is_favorite(uid, key)
+        if is_fav:
+            await db.remove_favorite(uid, key)
+            await interaction.response.send_message(
+                f"\U0001f494 Removed **{state.current['name']}** from favorites.", ephemeral=True,
+            )
+        else:
+            await db.add_favorite(uid, key)
+            await interaction.response.send_message(
+                f"\u2764\ufe0f Added **{state.current['name']}** to favorites!", ephemeral=True,
+            )
+
+    @discord.ui.button(label="Lyrics", style=discord.ButtonStyle.secondary, emoji="\U0001f4dd", row=2)
+    async def lyrics_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        if not state.current:
+            await interaction.response.send_message("Nothing playing.", ephemeral=True)
+            return
+        query = f"{state.current['artist']} {state.current['name']}"
+        await self.cog._send_lyrics(
+            interaction, query, state.current["artist"], state.current["name"]
+        )
+
+    @discord.ui.button(label="Sleep", style=discord.ButtonStyle.secondary, emoji="\U0001f634", row=2)
+    async def sleep_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        modal = DashboardSleepModal(self.cog, self.guild_id)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Autoplay", style=discord.ButtonStyle.secondary, emoji="\U0001f525", row=2)
+    async def autoplay_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        state.autoplay = not state.autoplay
+        status = "**ON**" if state.autoplay else "**OFF**"
+        # Refresh dashboard
+        guild = self.cog.bot.get_guild(self.guild_id)
+        embed = _dashboard_embed(state, self.cog, guild)
+        new_view = MusicDashboardView(self.cog, self.guild_id, self.user_id)
+        new_view._message = self._message
+        await interaction.response.edit_message(embed=embed, view=new_view)
+
+    @discord.ui.button(label="24/7", style=discord.ButtonStyle.secondary, emoji="\U0001f504", row=2)
+    async def always_on_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        state.always_connected = not state.always_connected
+        if state.always_connected and state.idle_task and not state.idle_task.done():
+            state.idle_task.cancel()
+            state.idle_task = None
+        # Refresh dashboard
+        guild = self.cog.bot.get_guild(self.guild_id)
+        embed = _dashboard_embed(state, self.cog, guild)
+        new_view = MusicDashboardView(self.cog, self.guild_id, self.user_id)
+        new_view._message = self._message
+        await interaction.response.edit_message(embed=embed, view=new_view)
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  ROW 4 — Collections
+    # ═══════════════════════════════════════════════════════════════════
+
+    @discord.ui.button(label="Playlists", style=discord.ButtonStyle.secondary, emoji="\U0001f4c1", row=3)
+    async def playlists_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        db = getattr(self.cog.bot, "database", None)
+        if not db:
+            await interaction.response.send_message("Database unavailable.", ephemeral=True)
+            return
+        playlists = await db.get_playlists(str(interaction.user.id))
+        sub_view = DashboardPlaylistsView(self.cog, self.guild_id, self, playlists, interaction.user.id)
+        await interaction.response.edit_message(embed=sub_view._build_embed(), view=sub_view)
+
+    @discord.ui.button(label="Favorites", style=discord.ButtonStyle.secondary, emoji="\u2b50", row=3)
+    async def favorites_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        db = getattr(self.cog.bot, "database", None)
+        if not db:
+            await interaction.response.send_message("Database unavailable.", ephemeral=True)
+            return
+        favorites = await db.get_favorites(str(interaction.user.id), limit=500)
+        sub_view = DashboardFavoritesView(self.cog, self.guild_id, self, favorites, interaction.user.id)
+        await interaction.response.edit_message(embed=sub_view._build_embed(), view=sub_view)
+
+    @discord.ui.button(label="History", style=discord.ButtonStyle.secondary, emoji="\U0001f553", row=3)
+    async def history_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        sub_view = DashboardHistoryView(self.cog, self.guild_id, self)
+        await interaction.response.edit_message(
+            embed=_dashboard_history_embed(state), view=sub_view
+        )
+
+    @discord.ui.button(label="Download", style=discord.ButtonStyle.secondary, emoji="\U0001f4e5", row=3)
+    async def download_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        if not state.current:
+            await interaction.response.send_message("Nothing playing to download.", ephemeral=True)
+            return
+        song = await self.cog.music_api.ensure_download_urls(state.current)
+        # Show quality buttons for the current song in an ephemeral
+        view = QualitySelectView(song, self.cog, interaction)
+        embed = _song_detail_embed(song)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    @discord.ui.button(label="More", style=discord.ButtonStyle.primary, emoji="\u2699", row=3)
+    async def more_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        sub_view = DashboardMoreView(self.cog, self.guild_id, self)
+        embed = Embedder.standard(
+            "\u2699 More Actions",
+            "**Seek** \u2014 Jump to a time position\n"
+            "**Replay** \u2014 Restart the current song\n"
+            "**Vote Skip** \u2014 Vote to skip (majority needed)\n"
+            "**Grab** \u2014 Save song info to your DMs\n"
+            "**Dupes** \u2014 Remove duplicate songs from queue\n"
+            "**Save Queue** \u2014 Save current queue as playlist\n"
+            "**Profile** \u2014 View your music stats",
+            footer=BRAND,
+        )
+        await interaction.response.edit_message(embed=embed, view=sub_view)
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  ROW 5 — Meta Controls
+    # ═══════════════════════════════════════════════════════════════════
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.success, emoji="\U0001f504", row=4)
+    async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        state = self.cog._get_state(self.guild_id)
+        guild = self.cog.bot.get_guild(self.guild_id)
+        embed = _dashboard_embed(state, self.cog, guild)
+        new_view = MusicDashboardView(self.cog, self.guild_id, self.user_id)
+        new_view._message = self._message
+        await interaction.response.edit_message(embed=embed, view=new_view)
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, emoji="\u274c", row=4)
+    async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        # Disable all buttons and show closed state
+        for item in self.children:
+            if isinstance(item, (discord.ui.Select, discord.ui.Button)):
+                item.disabled = True
+        embed = Embedder.standard(
+            "\U0001f3b5 Dashboard Closed",
+            "Use `/dashboard` to open a new one.",
+            footer=BRAND,
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+        self.stop()
+
+    # ── Timeout ──────────────────────────────────────────────────────
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            if isinstance(item, (discord.ui.Select, discord.ui.Button)):
+                item.disabled = True
+        if self._message:
+            try:
+                embed = Embedder.standard(
+                    "\U0001f3b5 Dashboard Expired",
+                    "\u23f0 This dashboard has expired. Use `/dashboard` to open a new one.",
+                    footer=BRAND,
+                )
+                await self._message.edit(embed=embed, view=self)
+            except Exception:
+                pass
+
 
 # =====================================================================
 #  Setup
