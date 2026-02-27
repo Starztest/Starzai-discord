@@ -3,8 +3,7 @@ Music Cog — download, VC playback, lyrics, and platform URL resolution.
 
 Commands:
     /music      — Search & download a song with quality selection
-    /play       — Search & play in voice channel
-    /playnext   — Search & insert a song at the front of the queue
+    /play       — Search & play in voice channel (auto-queues if already playing)
     /skip       — Skip current song
     /music-stop — Stop playback & leave VC
     /queue      — Show the current queue (paginated)
@@ -41,6 +40,7 @@ import json
 import logging
 import os
 import random
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -101,6 +101,7 @@ MAX_FILENAME_LEN = 100  # max chars for sanitised filenames
 # ── Timeouts ─────────────────────────────────────────────────────────
 VIEW_TIMEOUT = 60  # seconds for interactive views
 VC_IDLE_TIMEOUT = 300  # 5 minutes idle before auto-disconnect
+NP_UPDATE_INTERVAL = 10  # seconds between live progress-bar edits
 
 # ── FFmpeg / voice quality ──────────────────────────────────────────
 # NOTE: FFmpeg must be installed on the host system for VC playback.
@@ -174,6 +175,9 @@ class GuildMusicState:
         "autoplay",
         # Vote-skip tracking
         "skip_votes",
+        # Live progress-bar updater
+        "_np_message",
+        "_progress_task",
     )
 
     def __init__(self) -> None:
@@ -212,6 +216,9 @@ class GuildMusicState:
         self.autoplay: bool = False
         # Set of user IDs who voted to skip the current song
         self.skip_votes: set = set()
+        # Live progress updater state
+        self._np_message: Optional[discord.Message] = None
+        self._progress_task: Optional[asyncio.Task] = None
 
     @property
     def current_position(self) -> float:
@@ -242,6 +249,10 @@ class GuildMusicState:
         self.audio_filter = "off"
         self.autoplay = False
         self.skip_votes.clear()
+        if self._progress_task and not self._progress_task.done():
+            self._progress_task.cancel()
+            self._progress_task = None
+        self._np_message = None
         if self.idle_task and not self.idle_task.done():
             self.idle_task.cancel()
             self.idle_task = None
@@ -523,24 +534,6 @@ class NowPlayingView(discord.ui.View):
         query = f"{self.song['artist']} {self.song['name']}"
         await self.cog._send_lyrics(interaction, query, self.song["artist"], self.song["name"])
 
-    @discord.ui.button(label="\U0001f504 Refresh", style=discord.ButtonStyle.secondary)
-    async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        """Refresh the now-playing embed with updated progress bar."""
-        guild_id = interaction.guild_id
-        if not guild_id:
-            return
-        try:
-            state = self.cog._get_state(guild_id)
-            if state.current and state.current.get("id") == self.song.get("id"):
-                requester_id = state.requester_map.get(state.current["id"])
-                requester = self.cog.bot.get_user(requester_id) if requester_id else None
-                embed = _now_playing_embed(state, state.current, requester)
-                await interaction.response.edit_message(embed=embed, view=self)
-            else:
-                await interaction.response.send_message("This song is no longer playing.", ephemeral=True)
-        except discord.NotFound:
-            pass
-
     async def on_timeout(self) -> None:
         for item in self.children:
             if isinstance(item, (discord.ui.Select, discord.ui.Button)):
@@ -668,20 +661,24 @@ def _song_detail_embed(song: Dict[str, Any]) -> discord.Embed:
     )
 
 
-def _progress_bar(position: float, duration: float, width: int = 16) -> str:
-    """Build a Unicode progress bar like ▬▬▬▬🔘▬▬▬▬▬▬▬ 1:23 / 4:30."""
+def _progress_bar(position: float, duration: float, width: int = 12) -> str:
+    """Build a compact Unicode progress bar: ``━━━━●━━━━━━━ 1:23/4:30``.
+
+    Uses thin ``━``/``─`` characters and ``●`` instead of the wider ``🔘``
+    emoji so the line never wraps on mobile clients.
+    """
     duration = max(duration, 1)
     position = max(0.0, min(position, duration))
     filled = int((position / duration) * width)
     filled = min(filled, width - 1)
 
-    bar = "\u25ac" * filled + "\U0001f518" + "\u25ac" * (width - filled - 1)
+    bar = "\u2501" * filled + "\u25cf" + "\u2500" * (width - filled - 1)
 
     def _fmt(s: float) -> str:
         m, sec = divmod(int(s), 60)
         return f"{m}:{sec:02d}"
 
-    return f"{bar}  {_fmt(position)} / {_fmt(duration)}"
+    return f"{bar} {_fmt(position)}/{_fmt(duration)}"
 
 
 def _loop_badge(mode: str) -> str:
@@ -848,6 +845,54 @@ def _split_text(text: str, max_len: int = 4000) -> List[str]:
         chunks.append(text[:split_at])
         text = text[split_at:].lstrip("\n")
     return chunks
+
+
+# ── LRC synced-lyrics parser ─────────────────────────────────────────
+
+_LRC_LINE = re.compile(r"\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]\s*(.*)")
+
+
+def _parse_synced_lyrics(raw: str) -> Optional[str]:
+    """Parse LRC-format synced lyrics into timestamped text.
+
+    Input  (from LRCLIB ``syncedLyrics``)::
+
+        [00:12.34] First line
+        [00:18.56] Second line
+
+    Output::
+
+        **[0:12]** First line
+        **[0:18]** Second line
+
+    Returns ``None`` if *raw* is empty or contains no valid LRC lines.
+    """
+    if not raw or not raw.strip():
+        return None
+
+    lines: List[str] = []
+    for raw_line in raw.splitlines():
+        m = _LRC_LINE.match(raw_line.strip())
+        if not m:
+            # Keep blank lines for verse separation
+            if not raw_line.strip() and lines:
+                lines.append("")
+            continue
+        mins, secs = int(m.group(1)), int(m.group(2))
+        text = m.group(4).strip()
+        # Skip empty timestamp-only lines
+        if not text:
+            if lines:
+                lines.append("")
+            continue
+        ts = f"{mins}:{secs:02d}"
+        lines.append(f"**[{ts}]** {text}")
+
+    # Strip trailing blank lines
+    while lines and lines[-1] == "":
+        lines.pop()
+
+    return "\n".join(lines) if lines else None
 
 
 # =====================================================================
@@ -1095,7 +1140,11 @@ class MusicCog(commands.Cog, name="Music"):
     @app_commands.command(name="play", description="Search and play a song in your voice channel")
     @app_commands.describe(query="Song name, artist, or link (Spotify, YouTube Music, YouTube, Deezer, Apple Music, SoundCloud, Tidal)")
     async def play_cmd(self, interaction: discord.Interaction, query: str) -> None:
-        """Search for a song and play it in the user's voice channel."""
+        """Search for a song and immediately play or queue it.
+
+        Always auto-picks the best match — no dropdown menu.  If something
+        is already playing the song is appended to the queue automatically.
+        """
         if not await _check_rate_limit(self.bot, interaction, expensive=True):
             return
         if not await self._ensure_services(interaction):
@@ -1120,7 +1169,7 @@ class MusicCog(commands.Cog, name="Music"):
         start = time.monotonic()
 
         search_query = await self._resolve_query(query)
-        songs = await self.music_api.search(search_query, limit=5)
+        songs = await self.music_api.search(search_query, limit=1)
 
         latency_ms = (time.monotonic() - start) * 1000
 
@@ -1141,14 +1190,8 @@ class MusicCog(commands.Cog, name="Music"):
             await self._log_usage(interaction, "play", latency_ms=latency_ms, success=False, error_message="No results")
             return
 
-        if len(songs) == 1:
-            song = await self.music_api.ensure_download_urls(songs[0])
-            await self._play_song_in_vc(interaction, song, followup=True)
-        else:
-            embed = _search_results_embed(search_query, songs)
-            view = SongSelectView(songs, self, interaction, for_play=True)
-            msg = await interaction.followup.send(embed=embed, view=view)
-            view.message = msg
+        song = await self.music_api.ensure_download_urls(songs[0])
+        await self._play_song_in_vc(interaction, song, followup=True)
         await self._log_usage(interaction, "play", latency_ms=latency_ms)
 
     # ── /skip ─────────────────────────────────────────────────────────
@@ -1228,6 +1271,13 @@ class MusicCog(commands.Cog, name="Music"):
             embed = _now_playing_embed(state, state.current, requester)
             view = NowPlayingView(state.current, self, interaction.guild_id)
             await interaction.response.send_message(embed=embed, view=view)
+            # Update the live-updater to target this new message
+            try:
+                msg = await interaction.original_response()
+                state._np_message = msg
+                self._start_progress_updater(interaction.guild_id)
+            except Exception:
+                pass
         else:
             await interaction.response.send_message(
                 embed=Embedder.warning("Nothing Playing", "No song is currently playing."),
@@ -1486,69 +1536,6 @@ class MusicCog(commands.Cog, name="Music"):
                 "Currently playing song will finish, then playback stops.",
             )
         )
-
-    # ── /playnext ────────────────────────────────────────────────────
-
-    @app_commands.command(name="playnext", description="Search and add a song to the front of the queue")
-    @app_commands.describe(query="Song name, artist, or link")
-    async def playnext_cmd(self, interaction: discord.Interaction, query: str) -> None:
-        if not await _check_rate_limit(self.bot, interaction, expensive=True):
-            return
-        if not await self._ensure_services(interaction):
-            return
-
-        if not interaction.guild:
-            await interaction.response.send_message(
-                embed=Embedder.error("Server Only", "This command can only be used in a server."),
-                ephemeral=True,
-            )
-            return
-
-        member = interaction.guild.get_member(interaction.user.id)
-        if not member or not member.voice or not member.voice.channel:
-            await interaction.response.send_message(
-                embed=Embedder.error("Not in VC", "\U0001f50a Join a voice channel first!"),
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer()
-
-        search_query = await self._resolve_query(query)
-        songs = await self.music_api.search(search_query, limit=1)
-
-        if not songs:
-            await interaction.followup.send(
-                embed=Embedder.error("No Results", "\u274c No songs found. Try a different search.")
-            )
-            return
-
-        song = await self.music_api.ensure_download_urls(songs[0])
-        guild_id = interaction.guild.id
-        state = self._get_state(guild_id)
-
-        if song.get("id"):
-            state.requester_map[song["id"]] = interaction.user.id
-
-        # Use the lock to safely check playback state and mutate the queue
-        async with state._lock:
-            # If nothing is playing, just play it directly (release lock first)
-            if not state.voice_client or not (state.voice_client.is_playing() or state.voice_client.is_paused()):
-                pass  # fall through — will call _play_song_in_vc below
-            else:
-                # Insert at the front of the queue
-                state.queue.insert(0, song)
-                await interaction.followup.send(
-                    embed=Embedder.success(
-                        "\u23cf\ufe0f Play Next",
-                        f"**{song['name']}** \u2014 {song['artist']} will play next!",
-                    )
-                )
-                return
-
-        # Nothing playing — delegate to _play_song_in_vc which handles
-        # its own locking.
-        await self._play_song_in_vc(interaction, song, followup=True)
 
     # ── /skipto ──────────────────────────────────────────────────────
 
@@ -2203,11 +2190,19 @@ class MusicCog(commands.Cog, name="Music"):
             await self._log_usage(interaction, "lyrics", latency_ms=latency_ms)
             return
 
-        lyrics_text = result["lyrics"]
         track_name = result.get("track", query)
         artist_name = result.get("artist", "")
 
+        # Prefer synced (timestamped) lyrics when available
+        synced_raw = result.get("synced_lyrics") or ""
+        synced_text = _parse_synced_lyrics(synced_raw)
+        lyrics_text = synced_text or result["lyrics"]
+        has_timestamps = synced_text is not None
+
         header = f"\U0001f3a4 {artist_name}" if artist_name else ""
+        source_tag = result.get("source", "Unknown")
+        if has_timestamps:
+            source_tag += " \u2022 Synced"
         chunks = _split_text(lyrics_text, MAX_EMBED_DESC - len(header) - 10)
 
         embeds: List[discord.Embed] = []
@@ -2216,7 +2211,7 @@ class MusicCog(commands.Cog, name="Music"):
             embed = Embedder.standard(
                 f"\U0001f4dd {track_name}" if i == 0 else f"\U0001f4dd {track_name} (cont.)",
                 desc[:MAX_EMBED_DESC],
-                footer=f"Source: {result.get('source', 'Unknown')} \u2022 {BRAND}" if i == len(chunks) - 1 else BRAND,
+                footer=f"Source: {source_tag} \u2022 {BRAND}" if i == len(chunks) - 1 else BRAND,
             )
             embeds.append(embed)
 
@@ -2493,15 +2488,20 @@ class MusicCog(commands.Cog, name="Music"):
         view: Optional[discord.ui.View] = None,
         ephemeral: bool = False,
         followup: bool = False,
-    ) -> None:
-        """Send an embed via the most appropriate method (response / followup)."""
+    ) -> Optional[discord.Message]:
+        """Send an embed via the most appropriate method (response / followup).
+
+        Returns the :class:`discord.Message` when possible so callers can
+        store it for later edits (e.g. live progress bar).
+        """
         try:
             if followup or interaction.response.is_done():
-                await interaction.followup.send(embed=embed, view=view, ephemeral=ephemeral)
+                return await interaction.followup.send(embed=embed, view=view, ephemeral=ephemeral)
             else:
                 await interaction.response.send_message(embed=embed, view=view, ephemeral=ephemeral)
+                return await interaction.original_response()
         except Exception:
-            pass
+            return None
 
     # ── Internal: play song in VC ─────────────────────────────────────
 
@@ -2619,7 +2619,11 @@ class MusicCog(commands.Cog, name="Music"):
         requester = self.bot.get_user(interaction.user.id)
         embed = _now_playing_embed(state, song, requester)
         view = NowPlayingView(song, self, guild_id)
-        await self._send(interaction, embed=embed, view=view, followup=followup)
+        msg = await self._send(interaction, embed=embed, view=view, followup=followup)
+        # Start live progress-bar updates on the message we just sent
+        if msg:
+            state._np_message = msg
+            self._start_progress_updater(guild_id)
 
     # ── Internal: start FFmpeg playback ───────────────────────────────
 
@@ -2693,6 +2697,12 @@ class MusicCog(commands.Cog, name="Music"):
         text_ch = None
         np_song: Optional[Dict[str, Any]] = None
         autoplay_triggered = False
+
+        # Cancel the live progress updater for the song that just ended
+        if state._progress_task and not state._progress_task.done():
+            state._progress_task.cancel()
+            state._progress_task = None
+        state._np_message = None
 
         async with state._lock:
             # ── Track history & previous ─────────────────────────────
@@ -2772,9 +2782,66 @@ class MusicCog(commands.Cog, name="Music"):
                 if autoplay_triggered:
                     embed.set_footer(text=f"Autoplay \u2022 {BRAND}")
                 view = NowPlayingView(np_song, self, guild_id)
-                await text_ch.send(embed=embed, view=view)
+                msg = await text_ch.send(embed=embed, view=view)
+                # Start live progress-bar updates
+                state._np_message = msg
+                self._start_progress_updater(guild_id)
             except Exception:
                 pass
+
+    # ── Internal: live progress-bar updater ─────────────────────────────
+
+    def _start_progress_updater(self, guild_id: int) -> None:
+        """Spawn (or restart) the background task that live-edits the
+        now-playing embed every ``NP_UPDATE_INTERVAL`` seconds."""
+        state = self._get_state(guild_id)
+        # Cancel any existing updater first
+        if state._progress_task and not state._progress_task.done():
+            state._progress_task.cancel()
+        state._progress_task = asyncio.ensure_future(
+            self._progress_loop(guild_id)
+        )
+
+    async def _progress_loop(self, guild_id: int) -> None:
+        """Background loop: edit the NP message with a fresh progress bar."""
+        try:
+            while True:
+                await asyncio.sleep(NP_UPDATE_INTERVAL)
+                state = self._get_state(guild_id)
+
+                # Stop conditions
+                if (
+                    not state.current
+                    or not state._np_message
+                    or not state.voice_client
+                    or not state.voice_client.is_connected()
+                ):
+                    break
+
+                # Don't update while paused (position isn't changing)
+                if state.voice_client.is_paused():
+                    continue
+
+                try:
+                    requester_id = state.requester_map.get(
+                        state.current.get("id", "")
+                    )
+                    requester = (
+                        self.bot.get_user(requester_id) if requester_id else None
+                    )
+                    embed = _now_playing_embed(state, state.current, requester)
+                    await state._np_message.edit(embed=embed)
+                except discord.NotFound:
+                    # Message was deleted — stop updating
+                    state._np_message = None
+                    break
+                except discord.HTTPException:
+                    # Rate-limited or other transient error — skip this tick
+                    continue
+                except Exception:
+                    break
+        except asyncio.CancelledError:
+            pass  # Normal cancellation when song changes
 
     # ── Internal: idle disconnect ─────────────────────────────────────
 
