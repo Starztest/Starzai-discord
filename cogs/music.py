@@ -689,7 +689,7 @@ class MusicCog(commands.Cog, name="Music"):
     # ── /music ────────────────────────────────────────────────────────
 
     @app_commands.command(name="music", description="Search and download a song")
-    @app_commands.describe(query="Song name, artist, or Spotify/Deezer/Apple Music URL")
+    @app_commands.describe(query="Song name, artist, or link (Spotify, YouTube Music, YouTube, Deezer, Apple Music, SoundCloud, Tidal)")
     async def music_cmd(self, interaction: discord.Interaction, query: str) -> None:
         """Search for a song and present download/play options."""
         if not await _check_rate_limit(self.bot, interaction, expensive=True):
@@ -731,7 +731,7 @@ class MusicCog(commands.Cog, name="Music"):
     # ── /play ─────────────────────────────────────────────────────────
 
     @app_commands.command(name="play", description="Search and play a song in your voice channel")
-    @app_commands.describe(query="Song name, artist, or Spotify/Deezer/Apple Music URL")
+    @app_commands.describe(query="Song name, artist, or link (Spotify, YouTube Music, YouTube, Deezer, Apple Music, SoundCloud, Tidal)")
     async def play_cmd(self, interaction: discord.Interaction, query: str) -> None:
         """Search for a song and play it in the user's voice channel."""
         if not await _check_rate_limit(self.bot, interaction, expensive=True):
@@ -1367,13 +1367,21 @@ class MusicCog(commands.Cog, name="Music"):
             elif state.voice_client.channel.id != voice_channel.id:
                 await state.voice_client.move_to(voice_channel)
 
-            # Max out the Opus encoder bitrate for best VC audio quality
+            # Max out every Opus encoder knob for the best music quality
             if state.voice_client and hasattr(state.voice_client, 'encoder'):
                 try:
-                    state.voice_client.encoder.set_bitrate(MAX_ENCODER_BITRATE)
-                    logger.debug("Set VC encoder bitrate to %d bps", MAX_ENCODER_BITRATE)
+                    enc = state.voice_client.encoder
+                    enc.set_bitrate(MAX_ENCODER_BITRATE)       # 512 kbps ceiling
+                    enc.set_signal_type('music')                # optimise for music (not voice)
+                    enc.set_bandwidth('full')                   # full 20 kHz bandwidth
+                    enc.set_fec(True)                           # forward error correction on
+                    enc.set_expected_packet_loss_percent(0.05)  # 5% — low, keeps quality high
+                    logger.debug(
+                        "Opus encoder tuned: %d bps, music signal, full BW, FEC on",
+                        MAX_ENCODER_BITRATE,
+                    )
                 except Exception as exc:
-                    logger.debug("Could not set encoder bitrate: %s", exc)
+                    logger.debug("Could not tune encoder: %s", exc)
         except Exception as exc:
             logger.error("VC connection error: %s", exc, exc_info=True)
             embed = Embedder.error("Connection Error", "\u274c Could not join the voice channel.")
