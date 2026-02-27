@@ -24,6 +24,8 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
+import tempfile
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -72,8 +74,9 @@ class _OwnerDMView(discord.ui.View):
             )
 
 # ── Discord limits ───────────────────────────────────────────────────
-DISCORD_UPLOAD_LIMIT = 25 * 1024 * 1024  # 25 MB per attachment
-MAX_DOWNLOAD_SIZE = 200 * 1024 * 1024    # 200 MB max download buffer
+DISCORD_UPLOAD_FALLBACK = 25 * 1024 * 1024  # 25 MB fallback (no guild / DM)
+MAX_DOWNLOAD_SIZE = 200 * 1024 * 1024       # 200 MB max download buffer
+MIN_BITRATE_KBPS = 64  # floor — below this quality is unacceptable
 MAX_EMBED_DESC = 4096
 MAX_SELECT_OPTIONS = 25
 MAX_FILENAME_LEN = 100  # max chars for sanitised filenames
@@ -1004,18 +1007,56 @@ class MusicCog(commands.Cog, name="Music"):
 
     # ── Internal: download a song ─────────────────────────────────────
 
+    def _guild_upload_limit(self, interaction: discord.Interaction) -> int:
+        """Return the upload-size ceiling for the current guild.
+
+        Uses discord.py's ``Guild.filesize_limit`` which already accounts
+        for the server's Nitro Boost tier (25 MB / 50 MB / 100 MB).
+        Falls back to 25 MB when used in DMs or if unavailable.
+        """
+        if interaction.guild is not None:
+            try:
+                return interaction.guild.filesize_limit
+            except Exception:
+                pass
+        return DISCORD_UPLOAD_FALLBACK
+
+    @staticmethod
+    async def _ffmpeg_reencode(src: str, dst: str, bitrate_kbps: int) -> bool:
+        """Re-encode *src* MP3 to *dst* at the given bitrate using FFmpeg.
+
+        Returns True on success, False on failure.
+        """
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", src,
+            "-b:a", f"{bitrate_kbps}k",
+            "-map", "a",           # audio only
+            "-write_xing", "1",    # proper VBR header
+            dst,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.error("FFmpeg re-encode failed (rc=%s): %s", proc.returncode, stderr.decode(errors="replace")[:500])
+            return False
+        return True
+
     async def _download_song(
         self,
         interaction: discord.Interaction,
         song: Dict[str, Any],
         quality: str,
     ) -> None:
-        """Download a song at the given quality and send it as file(s).
+        """Download a song and send it as a **single playable .mp3**.
 
-        If the file exceeds Discord's per-attachment limit it is
-        automatically split into numbered parts so the full-quality
-        MP3 still reaches the user.  The API download URL is **never**
-        exposed — the raw bytes are sent directly as attachments.
+        Flow:
+        1. Download the full-quality file from the API into a temp file.
+        2. If it already fits within the guild's upload limit → send as-is.
+        3. If it's too large → use FFmpeg to re-encode to the highest
+           bitrate that fits, then send the re-encoded file.
+
+        The API download URL is **never** exposed to users.
         """
         try:
             if not interaction.response.is_done():
@@ -1051,7 +1092,15 @@ class MusicCog(commands.Cog, name="Music"):
             await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message="No download URL")
             return
 
+        upload_limit = self._guild_upload_limit(interaction)
+        tmp_original: Optional[str] = None
+        tmp_reencoded: Optional[str] = None
+
         try:
+            # ── 1. Download full-quality file to a temp file ─────────
+            tmp_fd, tmp_original = tempfile.mkstemp(suffix=".mp3")
+            os.close(tmp_fd)
+
             async with self._session.get(
                 download_url,
                 timeout=aiohttp.ClientTimeout(total=120),
@@ -1065,13 +1114,13 @@ class MusicCog(commands.Cog, name="Music"):
                     await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message=f"HTTP {resp.status}")
                     return
 
-                # Reject absurdly large files (safety cap)
+                # Reject absurdly large files up-front via Content-Length
                 content_length = resp.headers.get("Content-Length")
                 if content_length is not None:
                     try:
                         declared_size = int(content_length)
                     except (TypeError, ValueError):
-                        declared_size = None
+                        pass
                     else:
                         if declared_size > MAX_DOWNLOAD_SIZE:
                             latency_ms = (time.monotonic() - start) * 1000
@@ -1087,10 +1136,9 @@ class MusicCog(commands.Cog, name="Music"):
                             await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message=f"File too large ({size_mb:.1f} MB)")
                             return
 
-                # Stream the entire file into memory (up to MAX_DOWNLOAD_SIZE)
-                buffer = io.BytesIO()
-                try:
-                    downloaded = 0
+                # Stream to temp file
+                downloaded = 0
+                with open(tmp_original, "wb") as fp:
                     async for chunk in resp.content.iter_chunked(64 * 1024):
                         if not chunk:
                             continue
@@ -1106,55 +1154,87 @@ class MusicCog(commands.Cog, name="Music"):
                             )
                             await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message="File too large (streamed)")
                             return
-                        buffer.write(chunk)
+                        fp.write(chunk)
 
-                    size_bytes = downloaded
-                    size_mb = size_bytes / (1024 * 1024)
-                    filename = _sanitise_filename(song["artist"], song["name"])
+            original_size = os.path.getsize(tmp_original)
+            filename = _sanitise_filename(song["artist"], song["name"])
 
-                    # ── Single-message path (fits in one attachment) ──
-                    if size_bytes <= DISCORD_UPLOAD_LIMIT:
-                        buffer.seek(0)
-                        file = discord.File(buffer, filename=filename)
-                        embed = _download_embed(song, quality, size_mb)
-                        await interaction.followup.send(embed=embed, file=file)
+            # ── 2. Decide: send as-is or re-encode ──────────────────
+            send_path = tmp_original
+            actual_quality = quality
 
-                    # ── Multi-part path (split into chunks) ──────────
-                    else:
-                        total_parts = (size_bytes + DISCORD_UPLOAD_LIMIT - 1) // DISCORD_UPLOAD_LIMIT
-                        buffer.seek(0)
+            if original_size > upload_limit:
+                # Calculate the highest bitrate that fits within ~95% of
+                # the upload limit (margin for container overhead / VBR).
+                duration = song.get("duration", 0) or 0
+                if duration <= 0:
+                    # Estimate duration from original file size at 320 kbps
+                    duration = max((original_size * 8) / (320 * 1000), 30)
 
-                        # Info embed explaining the split
-                        info_embed = _download_embed(song, quality, size_mb)
-                        info_embed.description += (
-                            f"\n\n\U0001f4e6 **File is {size_mb:.1f} MB** \u2014 sending in "
-                            f"**{total_parts} parts**.\n"
-                            "Combine them afterwards:\n"
-                            f"\u2022 **Linux / Mac:** `cat \"{filename}.part\"* > \"{filename}\"`\n"
-                            f"\u2022 **Windows:** `copy /b \"{filename}.part\"* \"{filename}\"`"
-                        )
-                        await interaction.followup.send(embed=info_embed)
+                target_bytes = int(upload_limit * 0.95)
+                target_kbps = int((target_bytes * 8) / (duration * 1000))
+                target_kbps = max(target_kbps, MIN_BITRATE_KBPS)
 
-                        part_num = 0
-                        while True:
-                            chunk_data = buffer.read(DISCORD_UPLOAD_LIMIT)
-                            if not chunk_data:
-                                break
-                            part_num += 1
-                            part_name = f"{filename}.part{part_num:02d}"
-                            part_buf = io.BytesIO(chunk_data)
-                            part_file = discord.File(part_buf, filename=part_name)
-                            part_mb = len(chunk_data) / (1024 * 1024)
-                            await interaction.followup.send(
-                                content=f"\U0001f4e5 Part **{part_num}/{total_parts}** \u2014 {part_mb:.1f} MB",
-                                file=part_file,
-                            )
-                            part_buf.close()
-
+                if target_kbps < MIN_BITRATE_KBPS:
+                    # Song is so long that even 64 kbps won't fit
                     latency_ms = (time.monotonic() - start) * 1000
-                    await self._log_usage(interaction, "music-download", latency_ms=latency_ms)
-                finally:
-                    buffer.close()
+                    limit_mb = upload_limit / (1024 * 1024)
+                    await interaction.followup.send(
+                        embed=Embedder.warning(
+                            "Song Too Long",
+                            f"\u26a0\ufe0f This song is too long to fit in a single "
+                            f"{limit_mb:.0f} MB upload even at minimum quality.\n"
+                            "Try a shorter song or use `/play` to stream it in VC instead.",
+                        ),
+                        ephemeral=True,
+                    )
+                    await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message="Song too long for re-encode")
+                    return
+
+                # Re-encode with FFmpeg
+                tmp_fd2, tmp_reencoded = tempfile.mkstemp(suffix=".mp3")
+                os.close(tmp_fd2)
+
+                logger.info(
+                    "Re-encoding '%s' from %s (%.1f MB) → %d kbps to fit %d MB limit",
+                    song.get("name"), quality,
+                    original_size / (1024 * 1024),
+                    target_kbps,
+                    upload_limit / (1024 * 1024),
+                )
+
+                ok = await self._ffmpeg_reencode(tmp_original, tmp_reencoded, target_kbps)
+                if not ok or not os.path.exists(tmp_reencoded) or os.path.getsize(tmp_reencoded) == 0:
+                    latency_ms = (time.monotonic() - start) * 1000
+                    await interaction.followup.send(
+                        embed=Embedder.error("Re-encode Failed", "\u274c Could not compress the song. Try a lower quality."),
+                        ephemeral=True,
+                    )
+                    await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message="FFmpeg re-encode failed")
+                    return
+
+                send_path = tmp_reencoded
+                actual_quality = f"~{target_kbps}kbps"
+
+            # ── 3. Send the single .mp3 ─────────────────────────────
+            final_size = os.path.getsize(send_path)
+            final_mb = final_size / (1024 * 1024)
+
+            with open(send_path, "rb") as fp:
+                file = discord.File(fp, filename=filename)
+                embed = _download_embed(song, actual_quality, final_mb)
+
+                # If we re-encoded, note it on the embed
+                if send_path == tmp_reencoded:
+                    embed.description += (
+                        f"\n\n\u2139\ufe0f Re-encoded to **{actual_quality}** to fit "
+                        f"the server's {upload_limit / (1024 * 1024):.0f} MB upload limit."
+                    )
+
+                await interaction.followup.send(embed=embed, file=file)
+
+            latency_ms = (time.monotonic() - start) * 1000
+            await self._log_usage(interaction, "music-download", latency_ms=latency_ms)
 
         except asyncio.TimeoutError:
             latency_ms = (time.monotonic() - start) * 1000
@@ -1171,6 +1251,14 @@ class MusicCog(commands.Cog, name="Music"):
                 ephemeral=True,
             )
             await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message=str(exc))
+        finally:
+            # Clean up temp files
+            for path in (tmp_original, tmp_reencoded):
+                if path:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
 
     # ── Internal: play song in VC ─────────────────────────────────────
 
