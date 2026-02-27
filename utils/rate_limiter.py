@@ -137,7 +137,7 @@ class RateLimiter:
             return result
 
         # 2. Server
-        if server_id:
+        if server_id is not None:
             result = self._get_server_bucket(server_id).acquire()
             if not result.allowed:
                 result.reason = "Server rate limit reached"
@@ -164,11 +164,34 @@ class RateLimiter:
         server_id: Optional[int] = None,
         estimated_tokens: int = 0,
     ) -> RateLimitResult:
-        """Check if user/server has remaining daily token budget.
-        
-        NOTE: Token limits are disabled - unlimited API usage allowed.
-        """
-        # Token limits disabled - always allow
+        """Check if user/server has remaining daily token budget."""
+        estimated = max(0, int(estimated_tokens or 0))
+
+        user_limit = int(self.daily_token_limit_user or 0)
+        if user_limit > 0:
+            used = self._user_tokens.get(user_id, 0)
+            if used + estimated > user_limit:
+                return RateLimitResult(
+                    allowed=False,
+                    reason=(
+                        f"User daily token limit reached ({used}/{user_limit}). "
+                        "Try again later."
+                    ),
+                )
+
+        if server_id is not None:
+            server_limit = int(self.daily_token_limit_server or 0)
+            if server_limit > 0:
+                used = self._server_tokens.get(server_id, 0)
+                if used + estimated > server_limit:
+                    return RateLimitResult(
+                        allowed=False,
+                        reason=(
+                            f"Server daily token limit reached ({used}/{server_limit}). "
+                            "Try again later."
+                        ),
+                    )
+
         return RateLimitResult(allowed=True)
 
     def record_tokens(
@@ -178,8 +201,9 @@ class RateLimiter:
         server_id: Optional[int] = None,
     ) -> None:
         """Record token usage after a successful API call."""
+        tokens = max(0, int(tokens or 0))
         self._user_tokens[user_id] = self._user_tokens.get(user_id, 0) + tokens
-        if server_id:
+        if server_id is not None:
             self._server_tokens[server_id] = (
                 self._server_tokens.get(server_id, 0) + tokens
             )

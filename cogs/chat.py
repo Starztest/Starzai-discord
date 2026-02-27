@@ -509,7 +509,9 @@ class ChatCog(commands.Cog, name="Chat"):
         user_id = interaction.user.id
         
         # Check both conversation types
-        db_conv = await self.bot.database.get_conversation(user_id)
+        db_conv = await self.bot.database.get_active_conversation(
+            user_id, interaction.guild_id
+        )
         mention_conv = self.mention_conversations.get(user_id)
         
         if not db_conv and not mention_conv:
@@ -524,7 +526,8 @@ class ChatCog(commands.Cog, name="Chat"):
         
         # Clear both types
         if db_conv:
-            await self.bot.database.clear_conversation(user_id)
+            await self.bot.database.clear_conversation(db_conv["id"])
+            await self.bot.database.end_conversation(user_id, interaction.guild_id)
         if mention_conv:
             del self.mention_conversations[user_id]
         
@@ -1446,19 +1449,7 @@ Format with bullet points and emojis. Be insightful and respectful."""
         # Ignore DMs
         if not message.guild:
             return
-        
-        # Log non-bot messages to database for future analysis (async, don't await)
-        if not message.author.bot and message.content.strip():
-            try:
-                await self.bot.database.store_user_message(
-                    str(message.author.id),
-                    str(message.guild.id),
-                    str(message.channel.id),
-                    message.content
-                )
-            except Exception as e:
-                logger.debug(f"Failed to log message: {e}")
-        
+
         # Ignore bots for conversation handling
         if message.author.bot:
             return
@@ -1591,11 +1582,13 @@ Format with bullet points and emojis. Be insightful and respectful."""
                     
                     # Estimate tokens and log
                     estimated_tokens = _estimate_tokens(content + collected)
-                    self.bot.rate_limiter.record_tokens(user_id, message.guild.id, estimated_tokens)
+                    self.bot.rate_limiter.record_tokens(user_id, estimated_tokens, message.guild.id)
+                    await self.bot.database.add_user_tokens(user_id, estimated_tokens)
                     await self.bot.database.log_usage(
                         user_id=user_id,
                         command="mention",
                         guild_id=message.guild.id,
+                        model=model,
                         tokens_used=estimated_tokens,
                     )
                 else:

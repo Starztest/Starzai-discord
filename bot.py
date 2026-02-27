@@ -12,6 +12,7 @@ from typing import Optional
 
 import discord
 from aiohttp import web
+from cachetools import TTLCache
 from discord.ext import commands
 
 from config.settings import Settings
@@ -87,6 +88,11 @@ class StarzaiBot(commands.Bot):
         self.database = DatabaseManager()
         self.background_tasks = None  # Will be initialized after setup
         self._health_runner: Optional[web.AppRunner] = None
+        # Bounded cache for per-(user, guild) message counters; TTL=1h to
+        # avoid unbounded memory growth in long-running bots.
+        self._message_counts: TTLCache[tuple[int, int], int] = TTLCache(
+            maxsize=10_000, ttl=3600
+        )
 
     # ── Startup ──────────────────────────────────────────────────────
 
@@ -147,7 +153,9 @@ class StarzaiBot(commands.Bot):
             )
 
             # Update user context every 5 messages
-            if message.author.id % 5 == 0:  # Simple modulo check
+            key = (message.author.id, message.guild.id)
+            self._message_counts[key] = self._message_counts.get(key, 0) + 1
+            if self._message_counts[key] % 5 == 0:
                 recent = await self.database.get_recent_messages(
                     str(message.author.id), str(message.guild.id), limit=20
                 )

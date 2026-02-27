@@ -33,6 +33,7 @@ class DatabaseManager:
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA foreign_keys=ON")
         await self._create_tables()
+        await self._migrate_user_context_table()
         logger.info("Database initialized at %s", self.db_path)
 
     async def close(self) -> None:
@@ -45,6 +46,58 @@ class DatabaseManager:
         if self._db is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         return self._db
+
+    async def _migrate_user_context_table(self) -> None:
+        """Ensure user_context uses (user_id, guild_id) as the primary key."""
+        async with self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_context'"
+        ) as cur:
+            exists = await cur.fetchone()
+        if not exists:
+            return
+
+        async with self.db.execute("PRAGMA table_info(user_context)") as cur:
+            cols = await cur.fetchall()
+
+        pk_cols = [col["name"] for col in cols if col["pk"]]
+        if pk_cols != ["user_id"]:
+            return
+
+        logger.info(
+            "Migrating user_context table to composite primary key (user_id, guild_id)"
+        )
+        await self.db.executescript(
+            """
+            ALTER TABLE user_context RENAME TO user_context_old;
+
+            CREATE TABLE user_context (
+                user_id             TEXT    NOT NULL,
+                guild_id            TEXT    NOT NULL,
+                recent_messages     TEXT    DEFAULT '[]',
+                personality_summary TEXT    DEFAULT NULL,
+                interests           TEXT    DEFAULT '[]',
+                last_updated        TEXT    DEFAULT (datetime('now')),
+                PRIMARY KEY (user_id, guild_id)
+            );
+
+            INSERT INTO user_context
+                (user_id, guild_id, recent_messages, personality_summary, interests, last_updated)
+            SELECT
+                user_id,
+                COALESCE(guild_id, '0') AS guild_id,
+                recent_messages,
+                personality_summary,
+                interests,
+                last_updated
+            FROM user_context_old;
+
+            DROP TABLE user_context_old;
+
+            CREATE INDEX IF NOT EXISTS idx_user_context
+                ON user_context(user_id, guild_id);
+            """
+        )
+        await self.db.commit()
 
     # ── Schema ───────────────────────────────────────────────────────
 
@@ -101,12 +154,13 @@ class DatabaseManager:
             );
 
             CREATE TABLE IF NOT EXISTS user_context (
-                user_id             TEXT    PRIMARY KEY,
+                user_id             TEXT    NOT NULL,
                 guild_id            TEXT    NOT NULL,
                 recent_messages     TEXT    DEFAULT '[]',
                 personality_summary TEXT    DEFAULT NULL,
                 interests           TEXT    DEFAULT '[]',
-                last_updated        TEXT    DEFAULT (datetime('now'))
+                last_updated        TEXT    DEFAULT (datetime('now')),
+                PRIMARY KEY (user_id, guild_id)
             );
 
             CREATE TABLE IF NOT EXISTS user_privacy (
@@ -588,25 +642,23 @@ class DatabaseManager:
 
     async def set_analysis_opt_in(self, user_id: str, guild_id: str, opted_in: bool) -> None:
         """Set user's analysis opt-in preference."""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """
-                INSERT INTO analysis_opt_in (user_id, guild_id, opted_in, updated_at)
-                VALUES (?, ?, ?, datetime('now'))
-                ON CONFLICT(user_id, guild_id) DO UPDATE SET
-                    opted_in = excluded.opted_in,
-                    updated_at = datetime('now')
-                """,
-                (user_id, guild_id, 1 if opted_in else 0)
-            )
-            await db.commit()
-    
+        await self.db.execute(
+            """
+            INSERT INTO analysis_opt_in (user_id, guild_id, opted_in, updated_at)
+            VALUES (?, ?, ?, datetime('now'))
+            ON CONFLICT(user_id, guild_id) DO UPDATE SET
+                opted_in = excluded.opted_in,
+                updated_at = datetime('now')
+            """,
+            (user_id, guild_id, 1 if opted_in else 0),
+        )
+        await self.db.commit()
+
     async def get_analysis_opt_in(self, user_id: str, guild_id: str) -> bool:
         """Check if user has opted in to analysis features."""
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(
-                "SELECT opted_in FROM analysis_opt_in WHERE user_id = ? AND guild_id = ?",
-                (user_id, guild_id)
-            ) as cursor:
-                row = await cursor.fetchone()
-                return bool(row[0]) if row else False
+        async with self.db.execute(
+            "SELECT opted_in FROM analysis_opt_in WHERE user_id = ? AND guild_id = ?",
+            (user_id, guild_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return bool(row["opted_in"]) if row else False

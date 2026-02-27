@@ -47,18 +47,21 @@ class LLMClient:
         self.base_url = base_url.rstrip("/")
         self.default_model = default_model
         self._session: Optional[aiohttp.ClientSession] = None
+        self._session_lock = asyncio.Lock()
 
     # ── Session Management ───────────────────────────────────────────
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                timeout=aiohttp.ClientTimeout(total=API_TIMEOUT),
-            )
+            async with self._session_lock:
+                if self._session is None or self._session.closed:
+                    self._session = aiohttp.ClientSession(
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        timeout=aiohttp.ClientTimeout(total=API_TIMEOUT),
+                    )
         return self._session
 
     async def close(self) -> None:
@@ -96,12 +99,22 @@ class LLMClient:
                     latency = (time.monotonic() - start) * 1000
 
                     if resp.status == 200:
-                        data = await resp.json()
-                        choice = data["choices"][0]
-                        usage = data.get("usage", {})
+                        try:
+                            data = await resp.json(content_type=None)
+                            choice = data["choices"][0]
+                            usage = data.get("usage", {})
+                            content = choice["message"]["content"]
+                        except (
+                            aiohttp.ContentTypeError,
+                            json.JSONDecodeError,
+                            KeyError,
+                            IndexError,
+                            TypeError,
+                        ) as exc:
+                            raise LLMClientError(f"Malformed API response: {exc}") from exc
 
                         return LLMResponse(
-                            content=choice["message"]["content"],
+                            content=content,
                             model=data.get("model", model),
                             prompt_tokens=usage.get("prompt_tokens", 0),
                             completion_tokens=usage.get("completion_tokens", 0),
@@ -111,23 +124,42 @@ class LLMClient:
                         )
 
                     body = await resp.text()
-                    if resp.status == 429:
-                        wait = API_RETRY_BASE_DELAY * (2**attempt)
-                        logger.warning(
-                            "Rate limited (attempt %d/%d), waiting %.1fs",
-                            attempt + 1, API_MAX_RETRIES, wait,
-                        )
-                        await asyncio.sleep(wait)
-                        continue
 
-                    if resp.status >= 500:
-                        wait = API_RETRY_BASE_DELAY * (2**attempt)
-                        logger.warning(
-                            "Server error %d (attempt %d/%d): %s",
-                            resp.status, attempt + 1, API_MAX_RETRIES, body[:200],
+                    if resp.status == 429 or resp.status >= 500:
+                        last_error = LLMClientError(
+                            f"API error {resp.status}: {body[:200]}",
+                            status_code=resp.status,
                         )
-                        await asyncio.sleep(wait)
-                        continue
+
+                        retry_after = resp.headers.get("Retry-After")
+                        if resp.status == 429 and retry_after:
+                            try:
+                                wait = float(retry_after)
+                            except ValueError:
+                                wait = API_RETRY_BASE_DELAY * (2**attempt)
+                        else:
+                            wait = API_RETRY_BASE_DELAY * (2**attempt)
+
+                        if attempt < API_MAX_RETRIES - 1:
+                            if resp.status == 429:
+                                logger.warning(
+                                    "Rate limited (attempt %d/%d), waiting %.1fs",
+                                    attempt + 1,
+                                    API_MAX_RETRIES,
+                                    wait,
+                                )
+                            else:
+                                logger.warning(
+                                    "Server error %d (attempt %d/%d): %s",
+                                    resp.status,
+                                    attempt + 1,
+                                    API_MAX_RETRIES,
+                                    body[:200],
+                                )
+                            await asyncio.sleep(wait)
+                            continue
+
+                        raise last_error
 
                     raise LLMClientError(
                         f"API error {resp.status}: {body[:200]}",
@@ -139,14 +171,14 @@ class LLMClient:
                 wait = API_RETRY_BASE_DELAY * (2**attempt)
                 logger.warning(
                     "Network error (attempt %d/%d): %s",
-                    attempt + 1, API_MAX_RETRIES, exc,
+                    attempt + 1,
+                    API_MAX_RETRIES,
+                    exc,
                 )
                 if attempt < API_MAX_RETRIES - 1:
                     await asyncio.sleep(wait)
 
-        raise LLMClientError(
-            f"All {API_MAX_RETRIES} retries failed: {last_error}"
-        )
+        raise LLMClientError(f"All {API_MAX_RETRIES} retries failed: {last_error}")
 
     # ── Streaming Chat ───────────────────────────────────────────────
 
@@ -167,42 +199,107 @@ class LLMClient:
             "stream": True,
         }
 
-        session = await self._get_session()
+        last_error: Optional[Exception] = None
         timeout = aiohttp.ClientTimeout(total=API_TIMEOUT * 2)
+        content_yielded = False
 
-        async with session.post(
-            f"{self.base_url}/chat/completions",
-            json=payload,
-            timeout=timeout,
-        ) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise LLMClientError(
-                    f"Stream error {resp.status}: {body[:200]}",
-                    status_code=resp.status,
+        for attempt in range(API_MAX_RETRIES):
+            try:
+                session = await self._get_session()
+                async with session.post(
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    timeout=timeout,
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+
+                        if resp.status == 429 or resp.status >= 500:
+                            last_error = LLMClientError(
+                                f"Stream error {resp.status}: {body[:200]}",
+                                status_code=resp.status,
+                            )
+
+                            retry_after = resp.headers.get("Retry-After")
+                            if resp.status == 429 and retry_after:
+                                try:
+                                    wait = float(retry_after)
+                                except ValueError:
+                                    wait = API_RETRY_BASE_DELAY * (2**attempt)
+                            else:
+                                wait = API_RETRY_BASE_DELAY * (2**attempt)
+
+                            if attempt < API_MAX_RETRIES - 1:
+                                logger.warning(
+                                    "Stream %s (attempt %d/%d), waiting %.1fs",
+                                    "rate limited" if resp.status == 429 else f"error {resp.status}",
+                                    attempt + 1,
+                                    API_MAX_RETRIES,
+                                    wait,
+                                )
+                                await asyncio.sleep(wait)
+                                continue
+
+                            raise last_error
+
+                        raise LLMClientError(
+                            f"Stream error {resp.status}: {body[:200]}",
+                            status_code=resp.status,
+                        )
+
+                    # Buffer for incomplete lines across chunks
+                    buffer = b""
+                    async for chunk in resp.content.iter_any():
+                        buffer += chunk
+                        # Process complete lines
+                        while b"\n" in buffer:
+                            line, buffer = buffer.split(b"\n", 1)
+                            try:
+                                decoded = line.decode("utf-8").strip()
+                            except UnicodeDecodeError:
+                                continue
+
+                            if not decoded or not decoded.startswith("data:"):
+                                continue
+
+                            data_str = decoded[5:].strip()
+                            if data_str == "[DONE]":
+                                return
+
+                            try:
+                                data = json.loads(data_str)
+                                delta = data["choices"][0].get("delta", {})
+                                content = delta.get("content")
+                                if content:
+                                    content_yielded = True
+                                    yield content
+                            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                                continue
+
+                    return
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                # Never retry after content has been partially yielded — it
+                # would duplicate chunks already sent to the caller.
+                if content_yielded:
+                    raise LLMClientError(
+                        f"Stream interrupted after partial content: {exc}"
+                    ) from exc
+
+                last_error = exc
+                wait = API_RETRY_BASE_DELAY * (2**attempt)
+                logger.warning(
+                    "Stream network error (attempt %d/%d): %s",
+                    attempt + 1,
+                    API_MAX_RETRIES,
+                    exc,
                 )
-
-            # Buffer for incomplete lines across chunks
-            buffer = b""
-            async for chunk in resp.content.iter_any():
-                buffer += chunk
-                # Process complete lines
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    decoded = line.decode("utf-8").strip()
-                    if not decoded or not decoded.startswith("data: "):
-                        continue
-                    data_str = decoded[6:]
-                    if data_str == "[DONE]":
-                        return
-                    try:
-                        data = json.loads(data_str)
-                        delta = data["choices"][0].get("delta", {})
-                        content = delta.get("content")
-                        if content:
-                            yield content
-                    except (json.JSONDecodeError, KeyError, IndexError):
-                        continue
+                if attempt < API_MAX_RETRIES - 1:
+                    await asyncio.sleep(wait)
+                    continue
+                raise LLMClientError(
+                    f"All {API_MAX_RETRIES} stream retries failed: {exc}"
+                ) from exc
 
     # ── Convenience Methods ──────────────────────────────────────────
 

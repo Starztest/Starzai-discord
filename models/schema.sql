@@ -53,12 +53,13 @@ CREATE TABLE IF NOT EXISTS user_messages (
 
 -- User context and personality summary
 CREATE TABLE IF NOT EXISTS user_context (
-    user_id             TEXT    PRIMARY KEY,
+    user_id             TEXT    NOT NULL,
     guild_id            TEXT    NOT NULL,
     recent_messages     TEXT    DEFAULT '[]',   -- JSON array of last 20 messages
     personality_summary TEXT    DEFAULT NULL,   -- AI-generated personality summary
     interests           TEXT    DEFAULT '[]',   -- JSON array of detected interests
-    last_updated        TEXT    DEFAULT (datetime('now'))
+    last_updated        TEXT    DEFAULT (datetime('now')),
+    PRIMARY KEY (user_id, guild_id)
 );
 
 -- Privacy consent tracking

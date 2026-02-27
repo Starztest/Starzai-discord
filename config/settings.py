@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 
@@ -29,6 +29,16 @@ def _parse_aliases(raw: str) -> Dict[str, str]:
     return aliases
 
 
+def _parse_optional_int(raw: str) -> Optional[int]:
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 @dataclass(frozen=True)
 class Settings:
     """Immutable application settings loaded once at startup."""
@@ -36,7 +46,7 @@ class Settings:
     # Discord
     discord_token: str = field(default_factory=lambda: os.getenv("DISCORD_TOKEN", ""))
     application_id: Optional[int] = field(
-        default_factory=lambda: int(os.getenv("DISCORD_APPLICATION_ID", "0")) or None
+        default_factory=lambda: _parse_optional_int(os.getenv("DISCORD_APPLICATION_ID", ""))
     )
 
     # MegaLLM

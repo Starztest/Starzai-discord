@@ -214,7 +214,8 @@ class AdminCog(commands.Cog, name="Admin"):
             value=(
                 "`/horoscope` - Get your daily/weekly/monthly horoscope\n"
                 "`/birth-chart` - Generate detailed birth chart\n"
-                "`/synastry` - Compatibility analysis between two people\n"
+                "`/transits` - Current transit forecast for your chart\n"
+                "`/compatibility` - Compatibility analysis between two people\n"
                 "`/analyze-personality` - Analyze personality from text"
             ),
             inline=False,

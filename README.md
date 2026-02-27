@@ -178,7 +178,7 @@ The bot uses a multi-level rate limiting system:
 ## 🧪 Running Tests
 
 ```bash
-python -m pytest tests/ -v
+python -m unittest discover -s tests -v
 ```
 
 ---
