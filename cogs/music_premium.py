@@ -531,13 +531,13 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
                 continue
 
             try:
-                results = await music_cog.music_api.search(query, limit=1)
+                results = await music_cog.music_api.search(query, limit=5)
                 if not results:
                     failed_count += 1
                     continue
 
-                resolved = await music_cog.music_api.ensure_download_urls(results[0])
-                from utils.music_api import _pick_best_url
+                from utils.music_api import _pick_best_url, pick_best_match
+                resolved = await music_cog.music_api.ensure_download_urls(pick_best_match(results, query))
                 stream_url = _pick_best_url(resolved.get("download_urls", []), "320kbps")
                 if not stream_url:
                     failed_count += 1
@@ -837,7 +837,7 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
 
             await interaction.response.defer()
             search_query = await music_cog._resolve_query(query)
-            results = await music_cog.music_api.search(search_query, limit=1)
+            results = await music_cog.music_api.search(search_query, limit=5)
             if not results:
                 await interaction.followup.send(
                     embed=Embedder.error("No Results", f"\u274c No results for **{query}**."),
@@ -845,7 +845,8 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
                 )
                 return
 
-            song = results[0]
+            from utils.music_api import pick_best_match
+            song = pick_best_match(results, search_query)
             key = _song_key(song)
             ok = await db.add_song_to_playlist(playlist["id"], key)
             if ok:
@@ -1265,14 +1266,14 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
 
             # Resolve URL if needed
             search_query = await music_cog._resolve_query(query)
-            songs = await music_cog.music_api.search(search_query, limit=1)
+            songs = await music_cog.music_api.search(search_query, limit=5)
             if not songs:
                 await message.remove_reaction("\U0001f3b5", self.bot.user)
                 await message.add_reaction("\u274c")
                 return
 
-            song = await music_cog.music_api.ensure_download_urls(songs[0])
-            from utils.music_api import _pick_best_url
+            from utils.music_api import _pick_best_url, pick_best_match
+            song = await music_cog.music_api.ensure_download_urls(pick_best_match(songs, search_query))
             stream_url = _pick_best_url(song.get("download_urls", []), "320kbps")
             if not stream_url:
                 await message.remove_reaction("\U0001f3b5", self.bot.user)
@@ -1603,9 +1604,10 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
                 continue
 
             try:
-                results = await music_cog.music_api.search(query, limit=1)
+                results = await music_cog.music_api.search(query, limit=5)
                 if results:
-                    key = _song_key(results[0])
+                    from utils.music_api import pick_best_match
+                    key = _song_key(pick_best_match(results, query))
                     if await db.add_song_to_playlist(pl_id, key):
                         saved_count += 1
                     else:

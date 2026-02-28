@@ -375,7 +375,14 @@ async def _resolve_soundcloud_short(
 async def _resolve_tidal(
     track_id: str, session: aiohttp.ClientSession
 ) -> Optional[str]:
-    """Resolve a Tidal track URL via their oEmbed endpoint."""
+    """Resolve a Tidal track URL to a search query.
+
+    Strategy:
+        1. Try the oEmbed endpoint (fast, returns ``title`` for most tracks).
+        2. If oEmbed lacks a title (common for single-track pages), fall
+           back to scraping the ``og:title`` meta tag from the track page.
+    """
+    # ── 1) oEmbed attempt ─────────────────────────────────────────
     try:
         oembed_url = (
             f"https://oembed.tidal.com/"
@@ -385,18 +392,39 @@ async def _resolve_tidal(
             oembed_url,
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
         ) as resp:
-            if resp.status != 200:
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
+                title = data.get("title", "")
+                if title:
+                    logger.info("Resolved Tidal URL (oEmbed) to: %s", title)
+                    return title
+            else:
                 logger.warning("Tidal oEmbed returned %d for track %s", resp.status, track_id)
-                # Fallback: can't resolve, just return None
-                return None
-
-            data = await resp.json(content_type=None)
-            title = data.get("title", "")
-            if title:
-                logger.info("Resolved Tidal URL to: %s", title)
-                return title
 
     except Exception as exc:
-        logger.warning("Tidal URL resolution failed: %s", exc)
+        logger.warning("Tidal oEmbed failed for track %s: %s", track_id, exc)
+
+    # ── 2) Fallback: scrape og:title from the track page ──────────
+    try:
+        page_url = f"https://tidal.com/track/{track_id}"
+        async with session.get(
+            page_url,
+            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            headers={"User-Agent": "Mozilla/5.0 (compatible; MusicBot)"},
+        ) as resp:
+            if resp.status == 200:
+                html_text = await resp.text()
+                og_match = re.search(
+                    r'<meta\s+property="og:title"\s+content="([^"]+)"',
+                    html_text,
+                )
+                if og_match:
+                    og_title = unquote(og_match.group(1)).strip()
+                    if og_title:
+                        logger.info("Resolved Tidal URL (og:title) to: %s", og_title)
+                        return og_title
+
+    except Exception as exc:
+        logger.warning("Tidal page scrape failed for track %s: %s", track_id, exc)
 
     return None

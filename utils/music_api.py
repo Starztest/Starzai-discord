@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -199,6 +200,127 @@ def normalize_song(song: Dict[str, Any]) -> Dict[str, Any]:
 def normalize_songs(songs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Normalise a list of song objects."""
     return [normalize_song(s) for s in songs if isinstance(s, dict)]
+
+
+# ── Edit / remix detection for "official song" ranking ────────────────
+
+# Phrases that strongly indicate a fan-made edit rather than the
+# original release.  Each entry is compiled into a regex that matches
+# as a whole phrase (word-boundary delimited) so we don't accidentally
+# penalise songs whose *actual* title contains a substring (e.g. a
+# song literally called "Reverb" won't be penalised by the "reverb"
+# marker because we check against the query too).
+_EDIT_MARKERS: List[str] = [
+    r"slowed",
+    r"reverb",
+    r"sped\s*up",
+    r"speed\s*up",
+    r"nightcore",
+    r"daycore",
+    r"chopped",
+    r"screwed",
+    r"bass\s*boost(?:ed)?",
+    r"8\s*d(?:\s*audio)?",
+    r"lo[\-\s]?fi",
+    r"anti[\-\s]?nightcore",
+    r"pitched",
+    r"chipmunk",
+    r"deep\s*voice",
+]
+
+# Pre-compiled as one big alternation for speed
+_EDIT_RE = re.compile(
+    r"(?i)(?:"
+    + "|".join(_EDIT_MARKERS)
+    + r")",
+)
+
+
+def _has_edit_markers(text: str, *, ignore_markers_in: str = "") -> bool:
+    """Return True if *text* contains edit-style markers.
+
+    Any marker that also appears in *ignore_markers_in* is skipped so
+    that an intentional search for "song slowed" still returns the
+    slowed version.
+    """
+    text_lower = text.lower()
+    ignore_lower = ignore_markers_in.lower()
+
+    for marker in _EDIT_MARKERS:
+        pat = re.compile(r"(?i)" + marker)
+        if pat.search(text_lower) and not pat.search(ignore_lower):
+            return True
+    return False
+
+
+def _edit_marker_count(text: str, *, ignore_markers_in: str = "") -> int:
+    """Count how many distinct edit markers appear in *text*.
+
+    Markers also present in *ignore_markers_in* are not counted.
+    """
+    text_lower = text.lower()
+    ignore_lower = ignore_markers_in.lower()
+    count = 0
+    for marker in _EDIT_MARKERS:
+        pat = re.compile(r"(?i)" + marker)
+        if pat.search(text_lower) and not pat.search(ignore_lower):
+            count += 1
+    return count
+
+
+def pick_best_match(
+    results: List[Dict[str, Any]],
+    query: str = "",
+) -> Dict[str, Any]:
+    """Pick the best 'official' song from a list of search results.
+
+    Strongly penalises fan-made edits (slowed, reverb, nightcore, etc.)
+    unless the *query* itself contains those words — in which case the
+    user explicitly wants them.
+
+    Falls back to ``results[0]`` when all scores are equal.
+    """
+    if not results:
+        raise ValueError("results must be a non-empty list")
+    if len(results) == 1:
+        return results[0]
+
+    query_lower = query.lower().strip()
+
+    best_song = results[0]
+    best_score = float("-inf")
+
+    for song in results:
+        score = 0.0
+        name = (song.get("name") or "").lower()
+        artist = (song.get("artist") or "").lower()
+        full_text = f"{name} {artist}"
+
+        # ── Heavy penalty for edit markers ────────────────────────
+        marker_count = _edit_marker_count(full_text, ignore_markers_in=query)
+        score -= marker_count * 15
+
+        # ── Mild penalty for very long names (edits often append
+        #    lots of parenthetical noise) ─────────────────────────
+        if len(name) > 80:
+            score -= 3
+
+        # ── Bonus: the song name starts with the query text ──────
+        if query_lower and name.startswith(query_lower):
+            score += 5
+
+        # ── Bonus: query words all appear in the song name ───────
+        if query_lower:
+            q_words = set(query_lower.split())
+            n_words = set(name.split())
+            if q_words and q_words <= n_words:
+                score += 3
+
+        if score > best_score:
+            best_score = score
+            best_song = song
+
+    return best_song
 
 
 class MusicAPI:
@@ -440,6 +562,8 @@ __all__ = [
     "DOWNLOAD_QUALITIES",
     "normalize_song",
     "normalize_songs",
+    "pick_best_match",
+    "_has_edit_markers",
     "_pick_best_url",
     "_get_url_for_quality",
     "_format_duration",

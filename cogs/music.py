@@ -57,7 +57,9 @@ from utils.music_api import (
     DOWNLOAD_QUALITIES,
     MusicAPI,
     _get_url_for_quality,
+    _has_edit_markers,
     _pick_best_url,
+    pick_best_match,
 )
 from utils.lyrics import LyricsFetcher
 from utils.platform_resolver import is_music_url, resolve_url
@@ -1221,7 +1223,7 @@ class MusicCog(commands.Cog, name="Music"):
         start = time.monotonic()
 
         search_query = await self._resolve_query(query)
-        songs = await self.music_api.search(search_query, limit=1)
+        songs = await self.music_api.search(search_query, limit=5)
 
         latency_ms = (time.monotonic() - start) * 1000
 
@@ -1242,7 +1244,7 @@ class MusicCog(commands.Cog, name="Music"):
             await self._log_usage(interaction, "play", latency_ms=latency_ms, success=False, error_message="No results")
             return
 
-        song = await self.music_api.ensure_download_urls(songs[0])
+        song = await self.music_api.ensure_download_urls(pick_best_match(songs, search_query))
         await self._play_song_in_vc(interaction, song, followup=True)
         await self._log_usage(interaction, "play", latency_ms=latency_ms)
 
@@ -2818,11 +2820,15 @@ class MusicCog(commands.Cog, name="Music"):
                 try:
                     artist = state.current.get("artist", "")
                     if artist and self.music_api:
-                        suggestions = await self.music_api.search(artist, limit=5)
+                        suggestions = await self.music_api.search(artist, limit=7)
                         if suggestions:
                             # Filter out the song that just played
                             current_id = state.current.get("id", "")
                             for s in suggestions:
+                                # Skip fan-made edits (slowed, reverb, etc.)
+                                song_text = f"{s.get('name', '')} {s.get('artist', '')}"
+                                if _has_edit_markers(song_text):
+                                    continue
                                 # Re-check autoplay each iteration — user may
                                 # toggle it off while we're resolving URLs.
                                 if not state.autoplay:
@@ -3343,7 +3349,7 @@ class DashboardSearchModal(discord.ui.Modal, title="\U0001f50d Search & Play"):
         await interaction.response.defer(ephemeral=True)
 
         search_query = await self.cog._resolve_query(query)
-        songs = await self.cog.music_api.search(search_query, limit=1)
+        songs = await self.cog.music_api.search(search_query, limit=5)
 
         if not songs:
             await interaction.followup.send(
@@ -3352,7 +3358,7 @@ class DashboardSearchModal(discord.ui.Modal, title="\U0001f50d Search & Play"):
             )
             return
 
-        song = await self.cog.music_api.ensure_download_urls(songs[0])
+        song = await self.cog.music_api.ensure_download_urls(pick_best_match(songs, search_query))
         await self.cog._play_song_in_vc(interaction, song, followup=True)
 
         # Refresh the dashboard after a small delay for state to settle

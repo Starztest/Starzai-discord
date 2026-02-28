@@ -7,16 +7,19 @@ import unittest
 from utils.music_api import (
     DOWNLOAD_QUALITIES,
     QUALITY_TIERS,
+    _edit_marker_count,
     _extract_artist,
     _extract_download_urls,
     _extract_image,
     _extract_url,
     _format_duration,
     _get_url_for_quality,
+    _has_edit_markers,
     _pick_best_url,
     _safe_unescape,
     normalize_song,
     normalize_songs,
+    pick_best_match,
 )
 
 
@@ -311,6 +314,137 @@ class TestConstants(unittest.TestCase):
     def test_download_qualities_subset(self):
         for q in DOWNLOAD_QUALITIES:
             self.assertIn(q, QUALITY_TIERS)
+
+
+class TestHasEditMarkers(unittest.TestCase):
+    def test_slowed_reverb_detected(self):
+        self.assertTrue(_has_edit_markers("Song Name (slowed + reverb)"))
+
+    def test_nightcore_detected(self):
+        self.assertTrue(_has_edit_markers("Song Name [Nightcore]"))
+
+    def test_sped_up_detected(self):
+        self.assertTrue(_has_edit_markers("Song Name (sped up)"))
+
+    def test_bass_boosted_detected(self):
+        self.assertTrue(_has_edit_markers("Song Name bass boosted"))
+
+    def test_8d_audio_detected(self):
+        self.assertTrue(_has_edit_markers("Song Name (8D Audio)"))
+
+    def test_clean_title_not_detected(self):
+        self.assertFalse(_has_edit_markers("My Beautiful Song"))
+
+    def test_ignore_markers_in_query(self):
+        """If the query itself says 'slowed', don't penalise."""
+        self.assertFalse(
+            _has_edit_markers("Song (slowed)", ignore_markers_in="Song slowed")
+        )
+
+    def test_partial_ignore(self):
+        """Only ignore markers present in the query."""
+        self.assertTrue(
+            _has_edit_markers(
+                "Song (slowed + reverb)", ignore_markers_in="Song slowed"
+            )
+        )
+
+
+class TestEditMarkerCount(unittest.TestCase):
+    def test_multiple_markers(self):
+        self.assertEqual(
+            _edit_marker_count("Song (slowed + reverb + bass boosted)"), 3
+        )
+
+    def test_no_markers(self):
+        self.assertEqual(_edit_marker_count("Normal Song Title"), 0)
+
+    def test_ignore_query_markers(self):
+        self.assertEqual(
+            _edit_marker_count(
+                "Song (slowed + reverb)", ignore_markers_in="Song slowed"
+            ),
+            1,  # only reverb counted, slowed is in query
+        )
+
+
+class TestPickBestMatch(unittest.TestCase):
+    """Test the official-song ranking logic."""
+
+    def _song(self, name: str, artist: str = "Artist") -> dict:
+        return {"name": name, "artist": artist, "id": name}
+
+    def test_prefers_original_over_slowed(self):
+        results = [
+            self._song("My Song (slowed + reverb)"),
+            self._song("My Song"),
+        ]
+        best = pick_best_match(results, "My Song")
+        self.assertEqual(best["name"], "My Song")
+
+    def test_prefers_original_over_nightcore(self):
+        results = [
+            self._song("Hit Track [Nightcore]"),
+            self._song("Hit Track"),
+            self._song("Hit Track (8D Audio)"),
+        ]
+        best = pick_best_match(results, "Hit Track")
+        self.assertEqual(best["name"], "Hit Track")
+
+    def test_respects_intentional_slowed_query(self):
+        """When the query asks for 'slowed', prefer the slowed version."""
+        results = [
+            self._song("My Song (slowed + reverb)"),
+            self._song("My Song"),
+        ]
+        best = pick_best_match(results, "My Song slowed reverb")
+        # Should NOT penalise the slowed version when query says "slowed reverb"
+        self.assertEqual(best["name"], "My Song (slowed + reverb)")
+
+    def test_single_result_returned(self):
+        results = [self._song("Only Song")]
+        best = pick_best_match(results, "Only Song")
+        self.assertEqual(best["name"], "Only Song")
+
+    def test_empty_results_raises(self):
+        with self.assertRaises(ValueError):
+            pick_best_match([], "query")
+
+    def test_edit_in_artist_name_penalised(self):
+        """Edit markers in the artist field should also be penalised."""
+        results = [
+            self._song("Cool Song", artist="DJ Slowed & Reverb"),
+            self._song("Cool Song", artist="Original Artist"),
+        ]
+        best = pick_best_match(results, "Cool Song")
+        self.assertEqual(best["artist"], "Original Artist")
+
+    def test_all_edits_falls_back_to_first(self):
+        """When every result is an edit, still return something."""
+        results = [
+            self._song("Song (slowed)"),
+            self._song("Song (reverb)"),
+            self._song("Song (nightcore)"),
+        ]
+        best = pick_best_match(results, "Song")
+        # Should return one of them (first one with equal-worst score)
+        self.assertIn(best["name"], [r["name"] for r in results])
+
+    def test_real_world_bbygirl_case(self):
+        """Reproduces the reported bug: slowed+reverb edit picked over original."""
+        results = [
+            self._song(
+                "✻H+3+ЯД✻7luCJIo0T6... (slowed + reverb)",
+                artist="BbyGirl",
+            ),
+            self._song("✻H+3+ЯД✻7luCJIo0T6...", artist="BbyGirl"),
+            self._song(
+                "✻H+3+ЯД✻7luCJIo0T6... (sped up)",
+                artist="BbyGirl",
+            ),
+        ]
+        best = pick_best_match(results, "BbyGirl ✻H+3+ЯД✻7luCJIo0T6...")
+        self.assertEqual(best["name"], "✻H+3+ЯД✻7luCJIo0T6...")
 
 
 if __name__ == "__main__":
