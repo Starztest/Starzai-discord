@@ -269,15 +269,38 @@ def _edit_marker_count(text: str, *, ignore_markers_in: str = "") -> int:
     return count
 
 
+_WORD_CLEAN_RE = re.compile(r"[^\w\s]", re.UNICODE)
+
+
+def _to_words(text: str) -> set:
+    """Lowercase, strip punctuation, and split into a set of words."""
+    return set(_WORD_CLEAN_RE.sub(" ", text.lower()).split())
+
+
+def _word_overlap_ratio(words_a: set, words_b: set) -> float:
+    """Return the fraction of *words_a* that appear in *words_b* (0.0–1.0)."""
+    if not words_a:
+        return 0.0
+    return len(words_a & words_b) / len(words_a)
+
+
 def pick_best_match(
     results: List[Dict[str, Any]],
     query: str = "",
 ) -> Dict[str, Any]:
     """Pick the best 'official' song from a list of search results.
 
-    Strongly penalises fan-made edits (slowed, reverb, nightcore, etc.)
-    unless the *query* itself contains those words — in which case the
-    user explicitly wants them.
+    Scoring (higher is better):
+        • **Text similarity** – how many query words appear in the song
+          name + artist (and vice-versa).  This is the primary signal
+          and ensures we pick the result that actually matches the query.
+        • **Edit-marker penalty** – slowed, reverb, nightcore, etc.
+          are penalised unless the query itself asks for them.
+        • **Edit-marker bonus** – if the query intentionally requests an
+          edit style (e.g. "song slowed reverb"), results containing those
+          markers receive a bonus.
+        • **Position bonus** – a small tie-breaker that trusts the API's
+          relevance ordering (first result gets a tiny bonus).
 
     Falls back to ``results[0]`` when all scores are equal.
     """
@@ -287,35 +310,59 @@ def pick_best_match(
         return results[0]
 
     query_lower = query.lower().strip()
+    q_words = _to_words(query) if query_lower else set()
+
+    # Detect whether the query itself asks for edit markers
+    query_has_edits = _has_edit_markers(query_lower) if query_lower else False
 
     best_song = results[0]
     best_score = float("-inf")
 
-    for song in results:
+    for idx, song in enumerate(results):
         score = 0.0
         name = (song.get("name") or "").lower()
         artist = (song.get("artist") or "").lower()
         full_text = f"{name} {artist}"
+        full_words = _to_words(full_text)
 
         # ── Heavy penalty for edit markers ────────────────────────
         marker_count = _edit_marker_count(full_text, ignore_markers_in=query)
         score -= marker_count * 15
+
+        # ── Bonus when query intentionally asks for edits ─────────
+        # If the user searched "song slowed reverb", results that
+        # contain those markers should be rewarded, not just neutral.
+        if query_has_edits:
+            intended_count = _edit_marker_count(full_text) - marker_count
+            score += intended_count * 10
 
         # ── Mild penalty for very long names (edits often append
         #    lots of parenthetical noise) ─────────────────────────
         if len(name) > 80:
             score -= 3
 
-        # ── Bonus: the song name starts with the query text ──────
-        if query_lower and name.startswith(query_lower):
-            score += 5
+        # ── Text similarity scoring ──────────────────────────────
+        if q_words:
+            # How much of the query is covered by this result?
+            query_in_result = _word_overlap_ratio(q_words, full_words)
+            score += query_in_result * 20  # 0–20 pts
 
-        # ── Bonus: query words all appear in the song name ───────
-        if query_lower:
-            q_words = set(query_lower.split())
-            n_words = set(name.split())
-            if q_words and q_words <= n_words:
+            # How much of the result is relevant to the query?
+            # (penalises results with lots of extra unrelated words)
+            result_in_query = _word_overlap_ratio(full_words, q_words)
+            score += result_in_query * 5  # 0–5 pts
+
+            # Bonus: the song name starts with the query text
+            if name.startswith(query_lower):
+                score += 5
+
+            # Bonus: all query words found in the song name
+            name_words = _to_words(name)
+            if q_words and q_words <= name_words:
                 score += 3
+
+        # ── Small position bonus (trust API ordering as tiebreaker) ──
+        score += max(0, (len(results) - idx)) * 0.1
 
         if score > best_score:
             best_score = score

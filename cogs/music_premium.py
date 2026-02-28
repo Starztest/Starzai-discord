@@ -506,20 +506,32 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
         first_played = False
 
         for song in songs:
-            # Build search query from stored song data
-            query = f"{song.get('artist', '')} {song.get('name', '')}".strip()
-            if not query:
-                failed_count += 1
-                continue
-
             try:
-                results = await music_cog.music_api.search(query, limit=5)
-                if not results:
-                    failed_count += 1
-                    continue
-
                 from utils.music_api import _pick_best_url, pick_best_match
-                resolved = await music_cog.music_api.ensure_download_urls(pick_best_match(results, query))
+
+                resolved = None
+
+                # ── Fast path: fetch by stored ID (no search needed) ──
+                song_id = song.get("id", "")
+                if song_id:
+                    resolved = await music_cog.music_api.get_song_by_id(song_id)
+
+                # ── Fallback: search by name + artist ─────────────────
+                if not resolved or not resolved.get("download_urls"):
+                    query = f"{song.get('artist', '')} {song.get('name', '')}".strip()
+                    if not query:
+                        failed_count += 1
+                        continue
+
+                    results = await music_cog.music_api.search(query, limit=5)
+                    if not results:
+                        failed_count += 1
+                        continue
+
+                    resolved = await music_cog.music_api.ensure_download_urls(
+                        pick_best_match(results, query)
+                    )
+
                 stream_url = _pick_best_url(resolved.get("download_urls", []), "320kbps")
                 if not stream_url:
                     failed_count += 1
@@ -573,7 +585,7 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
                 resolved_count += 1
 
             except Exception as exc:
-                logger.warning("Failed to resolve song '%s': %s", query, exc)
+                logger.warning("Failed to resolve song '%s': %s", song.get("name", "?"), exc)
                 failed_count += 1
                 continue
 
