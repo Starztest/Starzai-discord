@@ -437,13 +437,12 @@ def pick_best_match(
 
         # ── Text similarity scoring ──────────────────────────────
         if q_words:
-            # -- Sequence similarity (captures ordering + substrings) --
-            seq_sim = _seq_similarity(query_clean, full_clean)
-            score += seq_sim * 25  # 0–25 pts
-
-            # Also check name-only similarity (often more precise)
+            # -- Sequence similarity on song NAME only --
+            # Using name-only avoids bias toward shorter artist names
+            # (e.g. "Rocé" scoring higher than "BABYMETAL" when both
+            # have the exact same song title).
             name_seq_sim = _seq_similarity(query_clean, name_clean)
-            score += name_seq_sim * 10  # 0–10 pts
+            score += name_seq_sim * 25  # 0–25 pts
 
             # -- Word overlap (content words, stop-words removed) --
             if q_content:
@@ -451,14 +450,20 @@ def pick_best_match(
                 score += query_in_result * 15  # 0–15 pts
 
                 # Penalise results with lots of extra unrelated words
-                result_in_query = _word_overlap_ratio(full_content, q_content)
-                score += result_in_query * 10  # 0–10 pts
+                # Only compare name words (not artist) to avoid penalising
+                # results that have longer artist names
+                name_content = _to_content_words(name)
+                if name_content:
+                    result_in_query = _word_overlap_ratio(name_content, q_content)
+                    score += result_in_query * 8  # 0–8 pts
             else:
                 # All query words are stop words, fall back to full set
                 query_in_result = _word_overlap_ratio(q_words, full_words)
                 score += query_in_result * 15
-                result_in_query = _word_overlap_ratio(full_words, q_words)
-                score += result_in_query * 10
+                name_words_only = _to_words(name)
+                if name_words_only:
+                    result_in_query = _word_overlap_ratio(name_words_only, q_words)
+                    score += result_in_query * 8
 
             # -- Exact name match bonus --
             if name_clean == query_clean:
@@ -483,12 +488,16 @@ def pick_best_match(
                 score += 5
 
             # Bonus: all query content words found in the song name
-            name_content = _to_content_words(name)
-            if q_content and q_content <= name_content:
+            name_cw = _to_content_words(name)
+            if q_content and q_content <= name_cw:
                 score += 5
 
-        # ── Small position bonus (trust API ordering as tiebreaker) ──
-        score += max(0, (len(results) - idx)) * 0.3
+        # ── Position bonus (trust API relevance ordering) ────────
+        # The search API's own ranking is a strong relevance signal.
+        # This bonus ensures we don't override the API's top result
+        # unless there's a clear quality reason (edit/ripoff penalty,
+        # major text mismatch, etc.).
+        score += max(0, (len(results) - idx)) * 2
 
         if score > best_score:
             best_score = score
