@@ -1606,7 +1606,11 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
                 results = await music_cog.music_api.search(query, limit=5)
                 if results:
                     from utils.music_api import pick_best_match
-                    key = _song_key(pick_best_match(results, query))
+                    key = _song_key(pick_best_match(
+                        results, query,
+                        expected_name=track.get("name", ""),
+                        expected_artist=track.get("artist", ""),
+                    ))
 
                     # Skip songs that already exist in the playlist
                     if is_update and key in existing_keys:

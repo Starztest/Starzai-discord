@@ -17,6 +17,7 @@ from utils.music_api import (
     _has_edit_markers,
     _pick_best_url,
     _safe_unescape,
+    _text_similarity,
     normalize_song,
     normalize_songs,
     pick_best_match,
@@ -445,6 +446,91 @@ class TestPickBestMatch(unittest.TestCase):
         ]
         best = pick_best_match(results, "BbyGirl ✻H+3+ЯД✻7luCJIo0T6...")
         self.assertEqual(best["name"], "✻H+3+ЯД✻7luCJIo0T6...")
+
+
+class TestTextSimilarity(unittest.TestCase):
+    def test_identical_strings(self):
+        self.assertAlmostEqual(_text_similarity("Beach House", "Beach House"), 1.0)
+
+    def test_case_insensitive(self):
+        self.assertAlmostEqual(_text_similarity("beach house", "Beach House"), 1.0)
+
+    def test_completely_different(self):
+        sim = _text_similarity("Beach House", "AP Dhillon")
+        self.assertLess(sim, 0.4)
+
+    def test_empty_string_returns_zero(self):
+        self.assertEqual(_text_similarity("", "anything"), 0.0)
+        self.assertEqual(_text_similarity("anything", ""), 0.0)
+
+    def test_similar_names(self):
+        sim = _text_similarity("Space Song", "Space Song")
+        self.assertAlmostEqual(sim, 1.0)
+
+    def test_dissimilar_names(self):
+        sim = _text_similarity("Space Song", "SPACESHIP")
+        self.assertLess(sim, 0.7)
+
+
+class TestPickBestMatchWithExpected(unittest.TestCase):
+    """Test pick_best_match when expected_name / expected_artist are provided."""
+
+    def _song(self, name: str, artist: str = "Artist") -> dict:
+        return {"name": name, "artist": artist, "id": name}
+
+    def test_space_song_vs_spaceship(self):
+        """Reproduces the reported playlist import bug: 'Space Song' by Beach House
+        was incorrectly matched to 'SPACESHIP' by AP Dhillon."""
+        results = [
+            self._song("SPACESHIP", artist="AP Dhillon, Shinda Kahlon, Gminxr"),
+            self._song("Space Song", artist="Beach House"),
+            self._song("Space Oddity", artist="David Bowie"),
+        ]
+        best = pick_best_match(
+            results,
+            "Beach House Space Song",
+            expected_name="Space Song",
+            expected_artist="Beach House",
+        )
+        self.assertEqual(best["name"], "Space Song")
+        self.assertEqual(best["artist"], "Beach House")
+
+    def test_artist_mismatch_penalised(self):
+        """A completely wrong artist should lose to a correct artist match."""
+        results = [
+            self._song("My Song", artist="Wrong Artist"),
+            self._song("My Song", artist="Correct Artist"),
+        ]
+        best = pick_best_match(
+            results,
+            "Correct Artist My Song",
+            expected_name="My Song",
+            expected_artist="Correct Artist",
+        )
+        self.assertEqual(best["artist"], "Correct Artist")
+
+    def test_name_similarity_matters(self):
+        """When artists match, prefer the closer song name."""
+        results = [
+            self._song("Something Else Entirely", artist="Beach House"),
+            self._song("Space Song", artist="Beach House"),
+        ]
+        best = pick_best_match(
+            results,
+            "Beach House Space Song",
+            expected_name="Space Song",
+            expected_artist="Beach House",
+        )
+        self.assertEqual(best["name"], "Space Song")
+
+    def test_backward_compatible_without_expected(self):
+        """Without expected_name/artist, behaves like before (no regression)."""
+        results = [
+            self._song("My Song (slowed + reverb)"),
+            self._song("My Song"),
+        ]
+        best = pick_best_match(results, "My Song")
+        self.assertEqual(best["name"], "My Song")
 
 
 if __name__ == "__main__":

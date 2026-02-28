@@ -17,6 +17,7 @@ import asyncio
 import html
 import logging
 import re
+from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -269,15 +270,36 @@ def _edit_marker_count(text: str, *, ignore_markers_in: str = "") -> int:
     return count
 
 
+def _text_similarity(a: str, b: str) -> float:
+    """Return a 0.0–1.0 similarity ratio between two strings.
+
+    Uses ``SequenceMatcher`` on lowercased, stripped inputs.
+    Returns 0.0 when either string is empty.
+    """
+    a_clean = a.lower().strip()
+    b_clean = b.lower().strip()
+    if not a_clean or not b_clean:
+        return 0.0
+    return SequenceMatcher(None, a_clean, b_clean).ratio()
+
+
 def pick_best_match(
     results: List[Dict[str, Any]],
     query: str = "",
+    *,
+    expected_name: str = "",
+    expected_artist: str = "",
 ) -> Dict[str, Any]:
     """Pick the best 'official' song from a list of search results.
 
     Strongly penalises fan-made edits (slowed, reverb, nightcore, etc.)
     unless the *query* itself contains those words — in which case the
     user explicitly wants them.
+
+    When *expected_name* and/or *expected_artist* are provided (e.g. from
+    a playlist import where the track metadata is known), they are used
+    for precise similarity scoring so that "Space Song" by "Beach House"
+    is never confused with "SPACESHIP" by "AP Dhillon".
 
     Falls back to ``results[0]`` when all scores are equal.
     """
@@ -287,6 +309,8 @@ def pick_best_match(
         return results[0]
 
     query_lower = query.lower().strip()
+    exp_name = expected_name.strip()
+    exp_artist = expected_artist.strip()
 
     best_song = results[0]
     best_score = float("-inf")
@@ -305,6 +329,24 @@ def pick_best_match(
         #    lots of parenthetical noise) ─────────────────────────
         if len(name) > 80:
             score -= 3
+
+        # ── Artist similarity (high weight) ──────────────────────
+        # When the caller knows the expected artist, strongly reward
+        # results whose artist actually matches.
+        if exp_artist:
+            artist_sim = _text_similarity(exp_artist, artist)
+            score += artist_sim * 25  # 0–25 points
+            # Heavy penalty when the artist is completely wrong
+            if artist_sim < 0.3:
+                score -= 15
+
+        # ── Name similarity (medium weight) ──────────────────────
+        if exp_name:
+            name_sim = _text_similarity(exp_name, name)
+            score += name_sim * 15  # 0–15 points
+            # Penalty when the name is very different
+            if name_sim < 0.3:
+                score -= 8
 
         # ── Bonus: the song name starts with the query text ──────
         if query_lower and name.startswith(query_lower):
