@@ -1554,27 +1554,41 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
             )
             return
 
-        # Create the playlist
+        # ── Smart duplicate recognition ─────────────────────────────
+        # If a playlist with the same name already exists, detect the
+        # difference and update it (add new songs, report changes)
+        # instead of failing or creating a duplicate.
         db = self.bot.database
         uid = str(interaction.user.id)
         name = playlist_name or auto_name
 
-        pl_id = await db.create_playlist(uid, name)
-        if pl_id is None:
-            # Try with a unique suffix
-            import datetime
-            suffix = datetime.datetime.now().strftime("%m%d-%H%M")
-            name = f"{name} ({suffix})"
+        existing_playlist = await db.get_playlist_by_name(uid, name)
+        is_update = False
+        existing_keys: set = set()
+
+        if existing_playlist:
+            # Smart recognition: update the existing playlist
+            pl_id = existing_playlist["id"]
+            is_update = True
+            existing_keys = await db.get_playlist_song_keys(pl_id)
+            existing_count = existing_playlist["song_count"]
+        else:
             pl_id = await db.create_playlist(uid, name)
             if pl_id is None:
-                await interaction.followup.send(
-                    embed=Embedder.error(
-                        "Failed",
-                        "\u274c Could not create the playlist. Try a different name.",
-                    ),
-                    ephemeral=True,
-                )
-                return
+                # Try with a unique suffix
+                import datetime
+                suffix = datetime.datetime.now().strftime("%m%d-%H%M")
+                name = f"{name} ({suffix})"
+                pl_id = await db.create_playlist(uid, name)
+                if pl_id is None:
+                    await interaction.followup.send(
+                        embed=Embedder.error(
+                            "Failed",
+                            "\u274c Could not create the playlist. Try a different name.",
+                        ),
+                        ephemeral=True,
+                    )
+                    return
 
         # Now resolve each track through the music API and save
         music_cog = self._get_music_cog()
@@ -1585,16 +1599,19 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
             )
             return
 
+        action_word = "Updating" if is_update else "Importing"
         status_msg = await interaction.followup.send(
             embed=Embedder.standard(
-                "\U0001f4e5 Importing Playlist",
+                f"\U0001f4e5 {action_word} Playlist",
                 f"\u23f3 Resolving **{len(tracks)}** tracks from **{auto_name}**...\n"
-                "This may take a moment.",
+                + (f"Existing playlist found with **{existing_count}** songs \u2014 adding new tracks only."
+                   if is_update else "This may take a moment."),
                 footer=BRAND,
             )
         )
 
         saved_count = 0
+        skipped_count = 0
         failed_count = 0
 
         for track in tracks[:MAX_SONGS_PER_PLAYLIST]:
@@ -1608,8 +1625,15 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
                 if results:
                     from utils.music_api import pick_best_match
                     key = _song_key(pick_best_match(results, query))
+
+                    # Skip songs that already exist in the playlist
+                    if is_update and key in existing_keys:
+                        skipped_count += 1
+                        continue
+
                     if await db.add_song_to_playlist(pl_id, key):
                         saved_count += 1
+                        existing_keys.add(key)  # track newly added
                     else:
                         failed_count += 1
                 else:
@@ -1620,18 +1644,34 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
             # Small delay to avoid rate limits
             await asyncio.sleep(0.3)
 
+        # Touch the timestamp so it sorts to the top
+        if is_update:
+            await db.update_playlist_timestamp(pl_id)
+
         # Final report
-        lines = [
-            f"\u2705 Saved **{saved_count}** of **{len(tracks)}** tracks to **{name}**",
-        ]
-        if failed_count > 0:
-            lines.append(f"\u26a0\ufe0f {failed_count} track{'s' if failed_count != 1 else ''} could not be resolved")
+        if is_update:
+            lines = [
+                f"\U0001f504 Updated **{name}**",
+                f"\u2795 **{saved_count}** new track{'s' if saved_count != 1 else ''} added",
+            ]
+            if skipped_count > 0:
+                lines.append(f"\u2714\ufe0f {skipped_count} track{'s' if skipped_count != 1 else ''} already existed (skipped)")
+            if failed_count > 0:
+                lines.append(f"\u26a0\ufe0f {failed_count} track{'s' if failed_count != 1 else ''} could not be resolved")
+            total_now = (existing_count or 0) + saved_count
+            lines.append(f"\n**{total_now}** total songs in playlist")
+        else:
+            lines = [
+                f"\u2705 Saved **{saved_count}** of **{len(tracks)}** tracks to **{name}**",
+            ]
+            if failed_count > 0:
+                lines.append(f"\u26a0\ufe0f {failed_count} track{'s' if failed_count != 1 else ''} could not be resolved")
         lines.append(f"\nUse `/playlist play {name}` to start listening!")
 
         try:
             await status_msg.edit(
                 embed=Embedder.success(
-                    "Import Complete",
+                    "Update Complete" if is_update else "Import Complete",
                     "\n".join(lines),
                 )
             )

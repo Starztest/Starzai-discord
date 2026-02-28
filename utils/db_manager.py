@@ -934,6 +934,23 @@ class DatabaseManager:
         await self.db.commit()
         return cur.rowcount or 0
 
+    async def get_playlist_song_keys(self, playlist_id: int) -> set:
+        """Return a set of song_data JSON strings already in a playlist."""
+        async with self.db.execute(
+            "SELECT song_data FROM playlist_songs WHERE playlist_id = ?",
+            (playlist_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+            return {row["song_data"] for row in rows}
+
+    async def update_playlist_timestamp(self, playlist_id: int) -> None:
+        """Touch a playlist's updated_at without changing its contents."""
+        await self.db.execute(
+            "UPDATE user_playlists SET updated_at = datetime('now') WHERE id = ?",
+            (playlist_id,),
+        )
+        await self.db.commit()
+
     # ══════════════════════════════════════════════════════════════════
     #  Music Premium — Listening Profiles & History
     # ══════════════════════════════════════════════════════════════════
