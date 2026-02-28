@@ -329,24 +329,64 @@ class AdminCog(commands.Cog, name="Admin"):
         )
         
         embed.add_field(
-            name="\U0001f3b5 Music & VC",
+            name="\U0001f3b5 Music Dashboard",
+            value=(
+                "`/dashboard` - **All-in-one music control panel** with buttons\n"
+                "> _Play, queue, volume, filters, playlists, favorites & more — no commands needed!_"
+            ),
+            inline=False,
+        )
+        
+        embed.add_field(
+            name="\U0001f3b6 Music Commands",
             value=(
                 "`/music` - Search and download a song (MP3)\n"
                 "`/play` - Play a song in your voice channel\n"
-                "`/playnext` - Add a song to the front of the queue\n"
                 "`/queue` - View the music queue (paginated)\n"
                 "`/nowplaying` - Show current song with progress bar\n"
-                "`/skip` - Skip the current song\n"
+                "`/skip` / `/voteskip` - Skip or vote-skip the current song\n"
                 "`/pause` / `/resume` - Pause or resume playback\n"
                 "`/shuffle` - Shuffle the queue\n"
                 "`/loop` - Set loop mode (off / track / queue)\n"
                 "`/seek` - Jump to a position in the song\n"
-                "`/remove` - Remove a song from queue by position\n"
-                "`/clear` - Clear the entire queue\n"
                 "`/volume` - Set playback volume (0-100)\n"
                 "`/lyrics` - Search for song lyrics\n"
-                "`/djrole` - Set a DJ role for queue management\n"
                 "`/music-stop` - Stop playback and leave VC"
+            ),
+            inline=False,
+        )
+        
+        embed.add_field(
+            name="\U0001f3bc Advanced Music",
+            value=(
+                "`/skipto` - Skip to a specific queue position\n"
+                "`/move` - Move a song to a different position\n"
+                "`/swap` - Swap two songs in the queue\n"
+                "`/remove` / `/clear` - Remove songs or clear the queue\n"
+                "`/duplicates` - Remove duplicate songs\n"
+                "`/replay` / `/previous` - Restart or go back a song\n"
+                "`/grab` - Save current song info to your DMs\n"
+                "`/history` - Show recently played songs\n"
+                "`/filter` - Apply audio filters (bass, nightcore, etc.)\n"
+                "`/autoplay` - Auto-queue similar songs when queue ends\n"
+                "`/247` - Stay in VC even when idle\n"
+                "`/djrole` - Set a DJ role for queue management"
+            ),
+            inline=False,
+        )
+        
+        embed.add_field(
+            name="\U0001f4bf Playlists & Favorites",
+            value=(
+                "`/playlist create` / `delete` / `rename` - Manage playlists\n"
+                "`/playlist add` / `remove` - Add or remove songs\n"
+                "`/playlist list` / `view` - Browse your playlists\n"
+                "`/playlist play` - Load a playlist into the queue\n"
+                "`/playlist save-queue` - Save current queue as a playlist\n"
+                "`/favorite` - Toggle favorite on current song\n"
+                "`/favorites` - View all your favorite songs\n"
+                "`/musicprofile` - View your or another user's music profile\n"
+                "`/sleeptimer` - Auto-disconnect after a set time"
             ),
             inline=False,
         )
@@ -384,9 +424,12 @@ class AdminCog(commands.Cog, name="Admin"):
             name="💡 Features",
             value=(
                 "✅ **Multi-turn Conversations** - Context-aware AI chat\n"
+                "✅ **Music Dashboard** - Full button-driven control panel (`/dashboard`)\n"
                 "✅ **Music Player** - VC playback with progress bar, loop, shuffle, seek\n"
+                "✅ **Playlists & Favorites** - Save, organize, and replay your music\n"
                 "✅ **MP3 Downloads** - High-quality single-file downloads\n"
                 "✅ **7 Music Platforms** - Spotify, YouTube, SoundCloud, Tidal & more\n"
+                "✅ **Audio Filters** - Bass boost, nightcore, vaporwave & more\n"
                 "✅ **DJ Role System** - Control who manages the queue\n"
                 "✅ **Auto-Resume** - Resumes playback on reconnect\n"
                 "✅ **Personalization** - Remembers your preferences\n"
