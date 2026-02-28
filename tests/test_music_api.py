@@ -446,6 +446,159 @@ class TestPickBestMatch(unittest.TestCase):
         best = pick_best_match(results, "BbyGirl ✻H+3+ЯД✻7luCJIo0T6...")
         self.assertEqual(best["name"], "✻H+3+ЯД✻7luCJIo0T6...")
 
+    # ── Ripoff / cover detection ─────────────────────────────────────
+
+    def test_prefers_original_over_cover(self):
+        """Cover versions should be penalised."""
+        results = [
+            self._song("Tum Hi Ho (Cover)", artist="Random Singer"),
+            self._song("Tum Hi Ho", artist="Arijit Singh"),
+        ]
+        best = pick_best_match(results, "Arijit Singh Tum Hi Ho")
+        self.assertEqual(best["name"], "Tum Hi Ho")
+        self.assertEqual(best["artist"], "Arijit Singh")
+
+    def test_prefers_original_over_karaoke(self):
+        results = [
+            self._song("Shape of You (Karaoke Version)", artist="Karaoke Hits"),
+            self._song("Shape of You", artist="Ed Sheeran"),
+        ]
+        best = pick_best_match(results, "Shape of You Ed Sheeran")
+        self.assertEqual(best["name"], "Shape of You")
+
+    def test_prefers_original_over_tribute(self):
+        results = [
+            self._song("Bohemian Rhapsody (Tribute to Queen)", artist="Tribute Band"),
+            self._song("Bohemian Rhapsody", artist="Queen"),
+        ]
+        best = pick_best_match(results, "Bohemian Rhapsody Queen")
+        self.assertEqual(best["artist"], "Queen")
+
+    def test_prefers_original_over_instrumental(self):
+        results = [
+            self._song("Let It Be (Instrumental)", artist="Piano Covers"),
+            self._song("Let It Be", artist="The Beatles"),
+        ]
+        best = pick_best_match(results, "Let It Be The Beatles")
+        self.assertEqual(best["artist"], "The Beatles")
+
+    def test_prefers_original_over_remix(self):
+        results = [
+            self._song("Blinding Lights (Remix)", artist="DJ Whatever"),
+            self._song("Blinding Lights", artist="The Weeknd"),
+        ]
+        best = pick_best_match(results, "Blinding Lights The Weeknd")
+        self.assertEqual(best["artist"], "The Weeknd")
+
+    def test_respects_intentional_remix_query(self):
+        """When the query asks for a remix, prefer the remix."""
+        results = [
+            self._song("Blinding Lights (Remix)", artist="DJ Whatever"),
+            self._song("Blinding Lights", artist="The Weeknd"),
+        ]
+        best = pick_best_match(results, "Blinding Lights Remix")
+        self.assertEqual(best["name"], "Blinding Lights (Remix)")
+
+    def test_respects_intentional_karaoke_query(self):
+        results = [
+            self._song("Shape of You (Karaoke)", artist="Karaoke Hits"),
+            self._song("Shape of You", artist="Ed Sheeran"),
+        ]
+        best = pick_best_match(results, "Shape of You karaoke")
+        self.assertEqual(best["name"], "Shape of You (Karaoke)")
+
+    # ── Exact / similar name matching ────────────────────────────────
+
+    def test_exact_name_match_wins_over_similar(self):
+        """Exact name match should strongly beat partial matches."""
+        results = [
+            self._song("Tum Hi Ho Bandhu", artist="Neeraj Shridhar"),
+            self._song("Tum Hi Ho", artist="Arijit Singh"),
+            self._song("Tum Hi Ho Meri Aashiqui", artist="Some Artist"),
+        ]
+        best = pick_best_match(results, "Tum Hi Ho")
+        self.assertEqual(best["name"], "Tum Hi Ho")
+
+    def test_correct_song_picked_when_third_in_results(self):
+        """The correct song should be picked even when it's not first."""
+        results = [
+            self._song("Somebody That I Used to Know (Remix)", artist="DJ Mix"),
+            self._song("Somebody Else", artist="The 1975"),
+            self._song("Somebody That I Used to Know", artist="Gotye"),
+        ]
+        best = pick_best_match(results, "Somebody That I Used to Know Gotye")
+        self.assertEqual(best["name"], "Somebody That I Used to Know")
+        self.assertEqual(best["artist"], "Gotye")
+
+    def test_artist_matching_helps_disambiguation(self):
+        """When song names are similar, artist match should help pick the right one."""
+        results = [
+            self._song("Love Story", artist="Taylor Swift"),
+            self._song("Love Story", artist="Indila"),
+            self._song("Love Story (Cover)", artist="Unknown Artist"),
+        ]
+        best = pick_best_match(results, "Love Story Taylor Swift")
+        self.assertEqual(best["artist"], "Taylor Swift")
+
+    def test_wrong_artist_not_picked(self):
+        """A song by the wrong artist shouldn't be preferred."""
+        results = [
+            self._song("Tum Hi Ho", artist="Some Cover Artist"),
+            self._song("Tum Hi Ho", artist="Arijit Singh"),
+        ]
+        best = pick_best_match(results, "Arijit Singh Tum Hi Ho")
+        self.assertEqual(best["artist"], "Arijit Singh")
+
+    def test_different_song_same_words_not_preferred(self):
+        """A song that shares words but is a different song should not win."""
+        results = [
+            self._song("Tum Hi Ho Bandhu Sakha Tumhi", artist="Neeraj Shridhar"),
+            self._song("Tum Hi Ho", artist="Arijit Singh"),
+        ]
+        best = pick_best_match(results, "Arijit Singh Tum Hi Ho")
+        self.assertEqual(best["name"], "Tum Hi Ho")
+
+    def test_mashup_penalised(self):
+        results = [
+            self._song("Love Mashup 2024", artist="DJ Mix"),
+            self._song("Love Me Like You Do", artist="Ellie Goulding"),
+        ]
+        best = pick_best_match(results, "Love Me Like You Do")
+        self.assertEqual(best["artist"], "Ellie Goulding")
+
+
+class TestRipoffMarkerCount(unittest.TestCase):
+    def test_cover_detected(self):
+        from utils.music_api import _ripoff_marker_count
+        self.assertGreater(_ripoff_marker_count("Song (Cover)"), 0)
+
+    def test_karaoke_detected(self):
+        from utils.music_api import _ripoff_marker_count
+        self.assertGreater(_ripoff_marker_count("Song (Karaoke Version)"), 0)
+
+    def test_tribute_detected(self):
+        from utils.music_api import _ripoff_marker_count
+        self.assertGreater(_ripoff_marker_count("Tribute to Artist - Song"), 0)
+
+    def test_remix_detected(self):
+        from utils.music_api import _ripoff_marker_count
+        self.assertGreater(_ripoff_marker_count("Song (Remix)"), 0)
+
+    def test_clean_title_not_detected(self):
+        from utils.music_api import _ripoff_marker_count
+        self.assertEqual(_ripoff_marker_count("My Beautiful Song"), 0)
+
+    def test_ignore_markers_in_query(self):
+        from utils.music_api import _ripoff_marker_count
+        self.assertEqual(
+            _ripoff_marker_count("Song (Remix)", ignore_markers_in="Song Remix"),
+            0,
+        )
+
+    def test_instrumental_detected(self):
+        from utils.music_api import _ripoff_marker_count
+        self.assertGreater(_ripoff_marker_count("Song (Instrumental)"), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ provider-agnostic.
 from __future__ import annotations
 
 import asyncio
+from difflib import SequenceMatcher
 import html
 import logging
 import re
@@ -229,10 +230,41 @@ _EDIT_MARKERS: List[str] = [
     r"deep\s*voice",
 ]
 
+# Phrases that indicate a cover, ripoff, or derivative version rather
+# than the original song.  Penalised similarly to edit markers but
+# tracked separately so intentional searches (e.g. "karaoke version")
+# can still find them.
+_RIPOFF_MARKERS: List[str] = [
+    r"cover",
+    r"tribute",
+    r"karaoke",
+    r"instrumental",
+    r"rendition",
+    r"remix",
+    r"mashup",
+    r"mash\s*up",
+    r"reprise",
+    r"unplugged",
+    r"acoustic\s*version",
+    r"female\s*version",
+    r"male\s*version",
+    r"version\s*by",
+    r"sung\s*by",
+    r"made\s*famous",
+    r"in\s*the\s*style\s*of",
+    r"originally\s*performed",
+]
+
 # Pre-compiled as one big alternation for speed
 _EDIT_RE = re.compile(
     r"(?i)(?:"
     + "|".join(_EDIT_MARKERS)
+    + r")",
+)
+
+_RIPOFF_RE = re.compile(
+    r"(?i)(?:"
+    + "|".join(_RIPOFF_MARKERS)
     + r")",
 )
 
@@ -269,12 +301,44 @@ def _edit_marker_count(text: str, *, ignore_markers_in: str = "") -> int:
     return count
 
 
+def _ripoff_marker_count(text: str, *, ignore_markers_in: str = "") -> int:
+    """Count how many ripoff/cover markers appear in *text*.
+
+    Markers also present in *ignore_markers_in* are not counted.
+    """
+    text_lower = text.lower()
+    ignore_lower = ignore_markers_in.lower()
+    count = 0
+    for marker in _RIPOFF_MARKERS:
+        pat = re.compile(r"(?i)" + marker)
+        if pat.search(text_lower) and not pat.search(ignore_lower):
+            count += 1
+    return count
+
+
 _WORD_CLEAN_RE = re.compile(r"[^\w\s]", re.UNICODE)
+
+# Common stop words that shouldn't dominate similarity scoring
+_STOP_WORDS = frozenset({
+    "the", "a", "an", "of", "in", "on", "at", "to", "for", "is",
+    "it", "and", "or", "my", "me", "i", "you", "we", "he", "she",
+    "from", "with", "by", "ft", "feat", "featuring",
+})
 
 
 def _to_words(text: str) -> set:
     """Lowercase, strip punctuation, and split into a set of words."""
     return set(_WORD_CLEAN_RE.sub(" ", text.lower()).split())
+
+
+def _to_content_words(text: str) -> set:
+    """Like _to_words but filters out common stop words."""
+    return _to_words(text) - _STOP_WORDS
+
+
+def _clean_for_compare(text: str) -> str:
+    """Lowercase, strip punctuation and collapse whitespace for comparison."""
+    return " ".join(_WORD_CLEAN_RE.sub(" ", text.lower()).split())
 
 
 def _word_overlap_ratio(words_a: set, words_b: set) -> float:
@@ -284,6 +348,17 @@ def _word_overlap_ratio(words_a: set, words_b: set) -> float:
     return len(words_a & words_b) / len(words_a)
 
 
+def _seq_similarity(a: str, b: str) -> float:
+    """Return a 0.0–1.0 similarity ratio using SequenceMatcher.
+
+    This catches ordering, substring containment, and partial matches
+    that pure word-set overlap misses.
+    """
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
 def pick_best_match(
     results: List[Dict[str, Any]],
     query: str = "",
@@ -291,14 +366,19 @@ def pick_best_match(
     """Pick the best 'official' song from a list of search results.
 
     Scoring (higher is better):
-        • **Text similarity** – how many query words appear in the song
-          name + artist (and vice-versa).  This is the primary signal
-          and ensures we pick the result that actually matches the query.
+        • **Sequence similarity** – SequenceMatcher ratio between the
+          query and the song name+artist.  Captures ordering, substring
+          containment, and partial matches that word-set overlap misses.
+        • **Word overlap** – how many query words appear in the result
+          (and vice-versa).  Uses content words (stop words removed).
+        • **Exact / substring match bonuses** – huge bonus for exact
+          name match; significant bonus for substring containment.
+        • **Artist match bonus** – extra credit when the result artist
+          appears in the query (or vice-versa).
         • **Edit-marker penalty** – slowed, reverb, nightcore, etc.
           are penalised unless the query itself asks for them.
-        • **Edit-marker bonus** – if the query intentionally requests an
-          edit style (e.g. "song slowed reverb"), results containing those
-          markers receive a bonus.
+        • **Ripoff penalty** – cover, tribute, karaoke, remix, etc.
+          are penalised unless the query itself asks for them.
         • **Position bonus** – a small tie-breaker that trusts the API's
           relevance ordering (first result gets a tiny bonus).
 
@@ -310,10 +390,13 @@ def pick_best_match(
         return results[0]
 
     query_lower = query.lower().strip()
+    query_clean = _clean_for_compare(query)
     q_words = _to_words(query) if query_lower else set()
+    q_content = _to_content_words(query) if query_lower else set()
 
-    # Detect whether the query itself asks for edit markers
+    # Detect whether the query itself asks for edit/ripoff markers
     query_has_edits = _has_edit_markers(query_lower) if query_lower else False
+    query_has_ripoff = bool(_RIPOFF_RE.search(query_lower)) if query_lower else False
 
     best_song = results[0]
     best_score = float("-inf")
@@ -323,46 +406,98 @@ def pick_best_match(
         name = (song.get("name") or "").lower()
         artist = (song.get("artist") or "").lower()
         full_text = f"{name} {artist}"
+        name_clean = _clean_for_compare(name)
+        artist_clean = _clean_for_compare(artist)
+        full_clean = _clean_for_compare(full_text)
         full_words = _to_words(full_text)
+        full_content = _to_content_words(full_text)
 
         # ── Heavy penalty for edit markers ────────────────────────
         marker_count = _edit_marker_count(full_text, ignore_markers_in=query)
         score -= marker_count * 15
 
+        # ── Heavy penalty for ripoff/cover markers ────────────────
+        ripoff_count = _ripoff_marker_count(full_text, ignore_markers_in=query)
+        score -= ripoff_count * 12
+
         # ── Bonus when query intentionally asks for edits ─────────
-        # If the user searched "song slowed reverb", results that
-        # contain those markers should be rewarded, not just neutral.
         if query_has_edits:
             intended_count = _edit_marker_count(full_text) - marker_count
             score += intended_count * 10
 
-        # ── Mild penalty for very long names (edits often append
-        #    lots of parenthetical noise) ─────────────────────────
+        # ── Bonus when query intentionally asks for ripoff style ──
+        if query_has_ripoff:
+            intended_ripoff = _ripoff_marker_count(full_text) - ripoff_count
+            score += intended_ripoff * 10
+
+        # ── Mild penalty for very long names (edits/ripoffs often
+        #    append lots of parenthetical noise) ──────────────────
         if len(name) > 80:
-            score -= 3
+            score -= 5
 
         # ── Text similarity scoring ──────────────────────────────
         if q_words:
-            # How much of the query is covered by this result?
-            query_in_result = _word_overlap_ratio(q_words, full_words)
-            score += query_in_result * 20  # 0–20 pts
+            # -- Sequence similarity on song NAME only --
+            # Using name-only avoids bias toward shorter artist names
+            # (e.g. "Rocé" scoring higher than "BABYMETAL" when both
+            # have the exact same song title).
+            name_seq_sim = _seq_similarity(query_clean, name_clean)
+            score += name_seq_sim * 25  # 0–25 pts
 
-            # How much of the result is relevant to the query?
-            # (penalises results with lots of extra unrelated words)
-            result_in_query = _word_overlap_ratio(full_words, q_words)
-            score += result_in_query * 5  # 0–5 pts
+            # -- Word overlap (content words, stop-words removed) --
+            if q_content:
+                query_in_result = _word_overlap_ratio(q_content, full_content)
+                score += query_in_result * 15  # 0–15 pts
+
+                # Penalise results with lots of extra unrelated words
+                # Only compare name words (not artist) to avoid penalising
+                # results that have longer artist names
+                name_content = _to_content_words(name)
+                if name_content:
+                    result_in_query = _word_overlap_ratio(name_content, q_content)
+                    score += result_in_query * 8  # 0–8 pts
+            else:
+                # All query words are stop words, fall back to full set
+                query_in_result = _word_overlap_ratio(q_words, full_words)
+                score += query_in_result * 15
+                name_words_only = _to_words(name)
+                if name_words_only:
+                    result_in_query = _word_overlap_ratio(name_words_only, q_words)
+                    score += result_in_query * 8
+
+            # -- Exact name match bonus --
+            if name_clean == query_clean:
+                score += 30
+            elif name_clean and query_clean and (
+                name_clean in query_clean or query_clean in name_clean
+            ):
+                # Substring containment: "Tum Hi Ho" in "Arijit Singh Tum Hi Ho"
+                score += 15
+
+            # -- Artist match bonus --
+            if artist_clean and query_clean:
+                artist_words = _to_content_words(artist)
+                if artist_words and artist_words <= q_content:
+                    # All artist words appear in the query
+                    score += 8
+                elif artist_clean in query_clean or query_clean in artist_clean:
+                    score += 5
 
             # Bonus: the song name starts with the query text
             if name.startswith(query_lower):
                 score += 5
 
-            # Bonus: all query words found in the song name
-            name_words = _to_words(name)
-            if q_words and q_words <= name_words:
-                score += 3
+            # Bonus: all query content words found in the song name
+            name_cw = _to_content_words(name)
+            if q_content and q_content <= name_cw:
+                score += 5
 
-        # ── Small position bonus (trust API ordering as tiebreaker) ──
-        score += max(0, (len(results) - idx)) * 0.1
+        # ── Position bonus (trust API relevance ordering) ────────
+        # The search API's own ranking is a strong relevance signal.
+        # This bonus ensures we don't override the API's top result
+        # unless there's a clear quality reason (edit/ripoff penalty,
+        # major text mismatch, etc.).
+        score += max(0, (len(results) - idx)) * 2
 
         if score > best_score:
             best_score = score
@@ -644,6 +779,7 @@ __all__ = [
     "normalize_songs",
     "pick_best_match",
     "_has_edit_markers",
+    "_ripoff_marker_count",
     "_pick_best_url",
     "_get_url_for_quality",
     "_format_duration",
