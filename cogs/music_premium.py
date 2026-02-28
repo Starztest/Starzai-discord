@@ -15,7 +15,7 @@ Commands:
     /musicprofile         — View your (or another user's) music profile
     /requestchannel       — Set up a song request channel
     /sleeptimer           — Set a sleep timer to auto-disconnect
-    /import               — Import a Spotify/Apple Music/YouTube Music/Tidal playlist
+    /import               — Import a Spotify/Apple Music/YouTube Music/Tidal playlist/mix
 
 Features:
     • Full interactive UI with buttons for playlists & favorites
@@ -1439,7 +1439,7 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
 
     @app_commands.command(
         name="import",
-        description="Import a Spotify, Apple Music, YouTube Music, or Tidal playlist into a saved playlist",
+        description="Import a Spotify, Apple Music, YouTube Music, or Tidal playlist/mix into a saved playlist",
     )
     @app_commands.describe(
         url="Spotify, Apple Music, YouTube Music, or Tidal playlist/album URL",
@@ -1473,12 +1473,15 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
         yt_album_match = re.search(
             r"(?:https?://)?music\.youtube\.com/browse/(MPREb_[a-zA-Z0-9_-]+)", url
         )
-        # Tidal playlist and album patterns
+        # Tidal playlist, album, and mix patterns
         tidal_playlist_match = re.search(
             r"(?:https?://)?(?:listen\.)?tidal\.com/(?:browse/)?playlist/([a-f0-9-]+)", url
         )
         tidal_album_match = re.search(
             r"(?:https?://)?(?:listen\.)?tidal\.com/(?:browse/)?album/(\d+)", url
+        )
+        tidal_mix_match = re.search(
+            r"(?:https?://)?(?:listen\.)?tidal\.com/(?:browse/)?mix/([a-zA-Z0-9]+)", url
         )
 
         session = getattr(self._get_music_cog(), "_session", None)
@@ -1502,13 +1505,16 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
                 playlist_id=yt_playlist_match.group(1) if yt_playlist_match else None,
                 browse_id=yt_album_match.group(1) if yt_album_match else None,
             )
-        elif tidal_playlist_match or tidal_album_match:
-            item_type = "playlist" if tidal_playlist_match else "album"
-            item_id = (
-                tidal_playlist_match.group(1)
-                if tidal_playlist_match
-                else tidal_album_match.group(1)
-            )
+        elif tidal_playlist_match or tidal_album_match or tidal_mix_match:
+            if tidal_playlist_match:
+                item_type = "playlist"
+                item_id = tidal_playlist_match.group(1)
+            elif tidal_album_match:
+                item_type = "album"
+                item_id = tidal_album_match.group(1)
+            else:
+                item_type = "mix"
+                item_id = tidal_mix_match.group(1)
             tracks, auto_name = await self._import_tidal(
                 session, item_type=item_type, item_id=item_id,
             )
@@ -1528,7 +1534,8 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
                     "\u2022 `https://tidal.com/browse/playlist/...`\n"
                     "\u2022 `https://tidal.com/browse/album/...`\n"
                     "\u2022 `https://listen.tidal.com/playlist/...`\n"
-                    "\u2022 `https://listen.tidal.com/album/...`",
+                    "\u2022 `https://listen.tidal.com/album/...`\n"
+                    "\u2022 `https://tidal.com/mix/...`",
                 ),
                 ephemeral=True,
             )
@@ -2070,7 +2077,7 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
         item_type: str,
         item_id: str,
     ) -> tuple:
-        """Extract track names from a Tidal playlist or album.
+        """Extract track names from a Tidal playlist, album, or mix.
 
         Strategy:
           1. Use Tidal's oEmbed endpoint to retrieve the playlist/album title.
@@ -2091,7 +2098,11 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
             "Accept-Language": "en-US,en;q=0.9",
         }
 
-        canonical_url = f"https://tidal.com/browse/{item_type}/{item_id}"
+        # Mixes use /mix/ in the URL path (no /browse/ prefix typically)
+        if item_type == "mix":
+            canonical_url = f"https://tidal.com/mix/{item_id}"
+        else:
+            canonical_url = f"https://tidal.com/browse/{item_type}/{item_id}"
 
         try:
             # ── Step 1: Get the title via oEmbed ──────────────────
@@ -2110,7 +2121,12 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
                 pass  # title is a nice-to-have; continue even if this fails
 
             # ── Step 2: Fetch the embed page ──────────────────────
-            embed_url = f"https://embed.tidal.com/{item_type}s/{item_id}"
+            # Playlists/albums use plural path (playlists/, albums/)
+            # Mixes are not pluralised on the embed domain
+            if item_type == "mix":
+                embed_url = f"https://embed.tidal.com/mix/{item_id}"
+            else:
+                embed_url = f"https://embed.tidal.com/{item_type}s/{item_id}"
             async with session.get(
                 embed_url,
                 timeout=aiohttp.ClientTimeout(total=20),
