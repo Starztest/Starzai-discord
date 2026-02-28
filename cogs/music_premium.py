@@ -32,6 +32,7 @@ import json
 import logging
 import re
 import time
+from html import unescape
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import aiohttp
@@ -2174,6 +2175,23 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
                             if track_name and artist_name:
                                 tracks.append({"name": track_name, "artist": artist_name})
 
+                    # Fallback: parse <list-item> custom HTML elements used
+                    # by the Tidal embed player for mixes, playlists & albums.
+                    if not tracks:
+                        tracks = self._extract_tidal_tracks_from_html(html)
+
+                    # Try to extract the collection title from the embed page
+                    if name == "Tidal Import":
+                        title_h1 = re.search(
+                            r'<h1[^>]*class="media-album"[^>]*>'
+                            r'\s*(?:<a[^>]*>)?\s*([^<]+)',
+                            html,
+                        )
+                        if title_h1:
+                            extracted = unescape(title_h1.group(1).strip())
+                            if extracted:
+                                name = extracted
+
             # ── Step 3: Fallback — scrape the main page ───────────
             if not tracks:
                 async with session.get(
@@ -2309,6 +2327,63 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
                     _walk(item)
 
         _walk(data)
+        return tracks
+
+    @staticmethod
+    def _extract_tidal_tracks_from_html(html: str) -> List[Dict[str, str]]:
+        """Parse ``<list-item>`` custom elements from the Tidal embed player.
+
+        The Tidal embed page renders tracks as custom HTML elements::
+
+            <list-item product-type="track" ...>
+              <span slot="title">Song Title</span>
+              <span slot="artist"><a ...>Artist 1</a><a ...>Artist 2</a></span>
+            </list-item>
+
+        This helper extracts every track-typed ``<list-item>`` block and
+        returns a list of ``{"name": ..., "artist": ...}`` dicts.
+        """
+        _STRIP_TAGS = re.compile(r"<[^>]+>")
+        tracks: List[Dict[str, str]] = []
+
+        for item_match in re.finditer(
+            r"<list-item\b[^>]*?product-type=\"track\"[^>]*>(.*?)</list-item>",
+            html,
+            re.DOTALL,
+        ):
+            block = item_match.group(1)
+
+            title_m = re.search(
+                r'<span\s+slot="title">(.*?)</span>', block, re.DOTALL
+            )
+            artist_m = re.search(
+                r'<span\s+slot="artist">(.*?)</span>', block, re.DOTALL
+            )
+
+            if not title_m:
+                continue
+
+            track_title = unescape(_STRIP_TAGS.sub("", title_m.group(1)).strip())
+            if not track_title:
+                continue
+
+            artist_name = ""
+            if artist_m:
+                # Artists may be wrapped in individual <a> tags; strip them
+                # and collapse multiple names with ", ".
+                raw = artist_m.group(1)
+                # Each <a>...</a> is one artist — grab inner text of each
+                artist_parts = re.findall(r"<a[^>]*>([^<]+)</a>", raw)
+                if artist_parts:
+                    artist_name = ", ".join(
+                        unescape(a.strip()) for a in artist_parts if a.strip()
+                    )
+                else:
+                    # No <a> tags — plain text artist
+                    artist_name = unescape(_STRIP_TAGS.sub("", raw).strip())
+
+            tracks.append({"name": track_title, "artist": artist_name})
+
         return tracks
 
     @staticmethod
