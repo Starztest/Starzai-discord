@@ -40,26 +40,44 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config.constants import (
-    BOT_COLOR,
-    BRAND,
-    MAX_FAVORITES,
-    MAX_PLAYLISTS_PER_USER,
-    MAX_SONGS_PER_PLAYLIST,
-    PREMIUM_VIEW_TIMEOUT,
-)
+from config.constants import BOT_COLOR
 from utils.embedder import Embedder
 from utils.platform_resolver import is_music_url, resolve_url
-from utils.song_helpers import song_key as _song_key
 
 if TYPE_CHECKING:
     from bot import StarzaiBot
 
 logger = logging.getLogger(__name__)
 
-# ── Local aliases ──────────────────────────────────────────────────
+# ── Branding ────────────────────────────────────────────────────────
+BRAND = "Powered by StarzAI \u26a1"
 MAX_EMBED_DESC = 4096
-VIEW_TIMEOUT = PREMIUM_VIEW_TIMEOUT
+MAX_PLAYLISTS_PER_USER = 25
+MAX_SONGS_PER_PLAYLIST = 200
+MAX_FAVORITES = 500
+VIEW_TIMEOUT = 120  # seconds
+
+
+# =====================================================================
+#  Helpers
+# =====================================================================
+
+def _song_key(song: Dict[str, Any]) -> str:
+    """Stable JSON key for database storage (mirrors music.py's version)."""
+    return json.dumps(
+        {
+            "id": song.get("id", ""),
+            "name": song.get("name", ""),
+            "artist": song.get("artist", ""),
+            "album": song.get("album", ""),
+            "year": song.get("year", ""),
+            "duration": song.get("duration", 0),
+            "duration_formatted": song.get("duration_formatted", "0:00"),
+            "image": song.get("image", ""),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 
 def _fmt_duration(seconds: float) -> str:

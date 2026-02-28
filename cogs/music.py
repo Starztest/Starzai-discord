@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
 import random
@@ -50,20 +51,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config.constants import (
-    BOT_COLOR,
-    BRAND,
-    DISCORD_UPLOAD_FALLBACK,
-    MAX_DOWNLOAD_SIZE,
-    MAX_ENCODER_BITRATE,
-    MAX_FILENAME_LEN,
-    MAX_HISTORY,
-    MAX_SELECT_OPTIONS,
-    MIN_BITRATE_KBPS,
-    MUSIC_VIEW_TIMEOUT,
-    NP_UPDATE_INTERVAL,
-    VC_IDLE_TIMEOUT,
-)
+from config.constants import BOT_COLOR
 from utils.embedder import Embedder
 from utils.music_api import (
     DOWNLOAD_QUALITIES,
@@ -75,7 +63,28 @@ from utils.music_api import (
 )
 from utils.lyrics import LyricsFetcher
 from utils.platform_resolver import is_music_url, resolve_url
-from utils.song_helpers import song_key as _song_key, temp_audio_file
+
+
+def _song_key(song: Dict[str, Any]) -> str:
+    """Create a stable JSON key for storing a song in the database.
+
+    Stores only the fields needed for retrieval/display so that
+    different API responses for the same song produce the same key.
+    """
+    return json.dumps(
+        {
+            "id": song.get("id", ""),
+            "name": song.get("name", ""),
+            "artist": song.get("artist", ""),
+            "album": song.get("album", ""),
+            "year": song.get("year", ""),
+            "duration": song.get("duration", 0),
+            "duration_formatted": song.get("duration_formatted", "0:00"),
+            "image": song.get("image", ""),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 if TYPE_CHECKING:
     from bot import StarzaiBot
@@ -105,9 +114,18 @@ class _OwnerDMView(discord.ui.View):
                 )
             )
 
-# ── Local constants (not worth centralising) ─────────────────────────
+# ── Discord limits ───────────────────────────────────────────────────
+DISCORD_UPLOAD_FALLBACK = 25 * 1024 * 1024  # 25 MB fallback (no guild / DM)
+MAX_DOWNLOAD_SIZE = 200 * 1024 * 1024       # 200 MB max download buffer
+MIN_BITRATE_KBPS = 64  # floor — below this quality is unacceptable
 MAX_EMBED_DESC = 4096
-VIEW_TIMEOUT = MUSIC_VIEW_TIMEOUT  # alias for brevity in this file
+MAX_SELECT_OPTIONS = 25
+MAX_FILENAME_LEN = 100  # max chars for sanitised filenames
+
+# ── Timeouts ─────────────────────────────────────────────────────────
+VIEW_TIMEOUT = 60  # seconds for interactive views
+VC_IDLE_TIMEOUT = 300  # 5 minutes idle before auto-disconnect
+NP_UPDATE_INTERVAL = 2  # seconds between live progress-bar edits
 
 # ── FFmpeg / voice quality ──────────────────────────────────────────
 # NOTE: FFmpeg must be installed on the host system for VC playback.
@@ -115,6 +133,9 @@ FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
 }
+# Max Opus encoder bitrate (bps).  512 kbps is the ceiling supported by
+# discord.py's Opus wrapper — anything higher is ignored by the codec.
+MAX_ENCODER_BITRATE = 512_000  # 512 kbps
 
 # ── Audio Filters (FFmpeg -af chains) ────────────────────────────────
 AUDIO_FILTERS: Dict[str, str] = {
@@ -132,6 +153,11 @@ AUDIO_FILTERS: Dict[str, str] = {
     "loud":       "volume=2.0,dynaudnorm=f=150",
 }
 AUDIO_FILTER_NAMES = list(AUDIO_FILTERS.keys())
+
+MAX_HISTORY = 50  # cap on how many recently-played songs we remember
+
+# ── Branding (user-facing) ───────────────────────────────────────────
+BRAND = "Powered by StarzAI \u26a1"
 
 
 # =====================================================================
@@ -979,12 +1005,7 @@ class MusicCog(commands.Cog, name="Music"):
     async def cog_load(self) -> None:
         """Create a shared aiohttp session when the cog is loaded."""
         self._session = aiohttp.ClientSession()
-        settings = self.bot.settings
-        self.music_api = MusicAPI(
-            self._session,
-            api_urls=getattr(settings, "music_api_urls", None),
-            api_timeout=getattr(settings, "music_api_timeout", 30),
-        )
+        self.music_api = MusicAPI(self._session)
         self.lyrics_fetcher = LyricsFetcher(self._session)
         logger.info("Music cog loaded — session created")
 
@@ -4997,14 +5018,14 @@ class DashboardMoreView(discord.ui.View):
             await interaction.response.send_message("Database unavailable.", ephemeral=True)
             return
         uid = str(interaction.user.id)
-        from cogs.music_premium import MAX_SONGS_PER_PLAYLIST
+        from cogs.music_premium import _song_key as _pk, MAX_SONGS_PER_PLAYLIST
         pl_id = await db.create_playlist(uid, name)
         if pl_id is None:
             await interaction.response.send_message("Could not create playlist.", ephemeral=True)
             return
         count = 0
         for song in all_songs[:MAX_SONGS_PER_PLAYLIST]:
-            key = _song_key(song)
+            key = _pk(song)
             if await db.add_song_to_playlist(pl_id, key):
                 count += 1
         await interaction.response.send_message(
