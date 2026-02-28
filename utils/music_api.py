@@ -20,18 +20,19 @@ import re
 from typing import Any, Dict, List, Optional
 
 import aiohttp
+from cachetools import TTLCache
 
 logger = logging.getLogger(__name__)
 
-# ── Internal API endpoints (NEVER expose to users) ──────────────────
-MUSIC_APIS: List[str] = [
+# ── Default API endpoints (overridable via MUSIC_API_URLS env var) ────
+_DEFAULT_MUSIC_APIS: List[str] = [
     "https://jiosaavn-api2.vercel.app",
     "https://jiosaavn-api-privatecvc2.vercel.app",
     "https://saavn.dev/api",
     "https://jiosaavn-api.vercel.app",
 ]
 
-API_TIMEOUT = 30  # seconds per endpoint
+_DEFAULT_API_TIMEOUT = 30  # seconds per endpoint
 
 QUALITY_TIERS: List[str] = ["12kbps", "48kbps", "96kbps", "160kbps", "320kbps"]
 
@@ -332,8 +333,23 @@ class MusicAPI:
         3. SoundCloud (via yt-dlp)
     """
 
-    def __init__(self, session: aiohttp.ClientSession) -> None:
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        api_urls: Optional[List[str]] = None,
+        api_timeout: int = _DEFAULT_API_TIMEOUT,
+        cache_maxsize: int = 256,
+        cache_ttl: int = 300,
+    ) -> None:
         self._session = session
+        self._api_urls = api_urls or _DEFAULT_MUSIC_APIS
+        self._api_timeout = api_timeout
+        # TTL cache: avoids redundant API calls for repeated searches
+        # (e.g. user retries a search, or autoplay re-searches the same artist)
+        self._cache: TTLCache[str, Optional[List[Dict[str, Any]]]] = TTLCache(
+            maxsize=cache_maxsize, ttl=cache_ttl,
+        )
 
     # ── Search ────────────────────────────────────────────────────────
 
@@ -345,13 +361,13 @@ class MusicAPI:
         """
         any_endpoint_succeeded = False
 
-        for api_base in MUSIC_APIS:
+        for api_base in self._api_urls:
             try:
                 url = f"{api_base}/search/songs"
                 async with self._session.get(
                     url,
                     params={"query": query, "limit": limit},
-                    timeout=aiohttp.ClientTimeout(total=API_TIMEOUT),
+                    timeout=aiohttp.ClientTimeout(total=self._api_timeout),
                 ) as resp:
                     if resp.status != 200:
                         logger.warning("Music API %s returned status %d", api_base, resp.status)
@@ -413,7 +429,24 @@ class MusicAPI:
         provider responded but had no matches, or ``None`` only if
         the primary provider's mirrors all had network failures AND
         the fallback providers also failed.
+
+        Results are cached for a short TTL so that identical queries
+        (e.g. autoplay re-searches) avoid redundant API round-trips.
         """
+        cache_key = f"{query}:{limit}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            logger.debug("Cache hit for search '%s'", query)
+            return cached
+
+        result = await self._search_uncached(query, limit=limit)
+        # Only cache successful responses (non-None)
+        if result is not None:
+            self._cache[cache_key] = result
+        return result
+
+    async def _search_uncached(self, query: str, limit: int = 7) -> Optional[List[Dict[str, Any]]]:
+        """Internal search without cache — called by :meth:`search`."""
         # 1) JioSaavn (primary)
         results = await self._search_jiosaavn(query, limit=limit)
         if results:  # non-empty list
@@ -459,12 +492,12 @@ class MusicAPI:
 
         Returns a normalised song dict, or None if every endpoint fails.
         """
-        for api_base in MUSIC_APIS:
+        for api_base in self._api_urls:
             try:
                 url = f"{api_base}/songs/{song_id}"
                 async with self._session.get(
                     url,
-                    timeout=aiohttp.ClientTimeout(total=API_TIMEOUT),
+                    timeout=aiohttp.ClientTimeout(total=self._api_timeout),
                 ) as resp:
                     if resp.status != 200:
                         continue
@@ -557,7 +590,7 @@ class MusicAPI:
 
 __all__ = [
     "MusicAPI",
-    "MUSIC_APIS",
+    "_DEFAULT_MUSIC_APIS",
     "QUALITY_TIERS",
     "DOWNLOAD_QUALITIES",
     "normalize_song",

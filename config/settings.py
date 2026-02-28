@@ -110,6 +110,22 @@ class Settings:
         )
     )
 
+    # Music API mirrors (comma-separated JioSaavn mirrors)
+    music_api_urls: List[str] = field(
+        default_factory=lambda: _parse_list(
+            os.getenv(
+                "MUSIC_API_URLS",
+                "https://jiosaavn-api2.vercel.app,"
+                "https://jiosaavn-api-privatecvc2.vercel.app,"
+                "https://saavn.dev/api,"
+                "https://jiosaavn-api.vercel.app",
+            )
+        )
+    )
+    music_api_timeout: int = field(
+        default_factory=lambda: int(os.getenv("MUSIC_API_TIMEOUT", "30"))
+    )
+
     # Railway
     port: int = field(default_factory=lambda: int(os.getenv("PORT", "8080")))
 

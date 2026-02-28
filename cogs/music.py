@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import asyncio
 import io
-import json
 import logging
 import os
 import random
@@ -51,7 +50,20 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config.constants import BOT_COLOR
+from config.constants import (
+    BOT_COLOR,
+    BRAND,
+    DISCORD_UPLOAD_FALLBACK,
+    MAX_DOWNLOAD_SIZE,
+    MAX_ENCODER_BITRATE,
+    MAX_FILENAME_LEN,
+    MAX_HISTORY,
+    MAX_SELECT_OPTIONS,
+    MIN_BITRATE_KBPS,
+    MUSIC_VIEW_TIMEOUT,
+    NP_UPDATE_INTERVAL,
+    VC_IDLE_TIMEOUT,
+)
 from utils.embedder import Embedder
 from utils.music_api import (
     DOWNLOAD_QUALITIES,
@@ -63,28 +75,7 @@ from utils.music_api import (
 )
 from utils.lyrics import LyricsFetcher
 from utils.platform_resolver import is_music_url, resolve_url
-
-
-def _song_key(song: Dict[str, Any]) -> str:
-    """Create a stable JSON key for storing a song in the database.
-
-    Stores only the fields needed for retrieval/display so that
-    different API responses for the same song produce the same key.
-    """
-    return json.dumps(
-        {
-            "id": song.get("id", ""),
-            "name": song.get("name", ""),
-            "artist": song.get("artist", ""),
-            "album": song.get("album", ""),
-            "year": song.get("year", ""),
-            "duration": song.get("duration", 0),
-            "duration_formatted": song.get("duration_formatted", "0:00"),
-            "image": song.get("image", ""),
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-    )
+from utils.song_helpers import song_key as _song_key, temp_audio_file
 
 if TYPE_CHECKING:
     from bot import StarzaiBot
@@ -114,18 +105,9 @@ class _OwnerDMView(discord.ui.View):
                 )
             )
 
-# ── Discord limits ───────────────────────────────────────────────────
-DISCORD_UPLOAD_FALLBACK = 25 * 1024 * 1024  # 25 MB fallback (no guild / DM)
-MAX_DOWNLOAD_SIZE = 200 * 1024 * 1024       # 200 MB max download buffer
-MIN_BITRATE_KBPS = 64  # floor — below this quality is unacceptable
+# ── Local constants (not worth centralising) ─────────────────────────
 MAX_EMBED_DESC = 4096
-MAX_SELECT_OPTIONS = 25
-MAX_FILENAME_LEN = 100  # max chars for sanitised filenames
-
-# ── Timeouts ─────────────────────────────────────────────────────────
-VIEW_TIMEOUT = 60  # seconds for interactive views
-VC_IDLE_TIMEOUT = 300  # 5 minutes idle before auto-disconnect
-NP_UPDATE_INTERVAL = 2  # seconds between live progress-bar edits
+VIEW_TIMEOUT = MUSIC_VIEW_TIMEOUT  # alias for brevity in this file
 
 # ── FFmpeg / voice quality ──────────────────────────────────────────
 # NOTE: FFmpeg must be installed on the host system for VC playback.
@@ -133,9 +115,6 @@ FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
 }
-# Max Opus encoder bitrate (bps).  512 kbps is the ceiling supported by
-# discord.py's Opus wrapper — anything higher is ignored by the codec.
-MAX_ENCODER_BITRATE = 512_000  # 512 kbps
 
 # ── Audio Filters (FFmpeg -af chains) ────────────────────────────────
 AUDIO_FILTERS: Dict[str, str] = {
@@ -153,11 +132,6 @@ AUDIO_FILTERS: Dict[str, str] = {
     "loud":       "volume=2.0,dynaudnorm=f=150",
 }
 AUDIO_FILTER_NAMES = list(AUDIO_FILTERS.keys())
-
-MAX_HISTORY = 50  # cap on how many recently-played songs we remember
-
-# ── Branding (user-facing) ───────────────────────────────────────────
-BRAND = "Powered by StarzAI \u26a1"
 
 
 # =====================================================================
@@ -1005,7 +979,12 @@ class MusicCog(commands.Cog, name="Music"):
     async def cog_load(self) -> None:
         """Create a shared aiohttp session when the cog is loaded."""
         self._session = aiohttp.ClientSession()
-        self.music_api = MusicAPI(self._session)
+        settings = self.bot.settings
+        self.music_api = MusicAPI(
+            self._session,
+            api_urls=getattr(settings, "music_api_urls", None),
+            api_timeout=getattr(settings, "music_api_timeout", 30),
+        )
         self.lyrics_fetcher = LyricsFetcher(self._session)
         logger.info("Music cog loaded — session created")
 
@@ -1815,7 +1794,7 @@ class MusicCog(commands.Cog, name="Music"):
 
     # ── /grab ────────────────────────────────────────────────────────
 
-    @app_commands.command(name="grab", description="Save the current song info to your DMs")
+    @app_commands.command(name="grab", description="Save the current song as an MP3 to your DMs")
     async def grab_cmd(self, interaction: discord.Interaction) -> None:
         if not await _check_rate_limit(self.bot, interaction):
             return
@@ -1830,31 +1809,175 @@ class MusicCog(commands.Cog, name="Music"):
             )
             return
 
-        song = state.current
-        desc = (
-            f"**{song['name']}**\n"
-            f"\U0001f3a4 {song['artist']}\n"
-            f"\U0001f4bf {song['album']} \u2022 {song['year']}\n"
-            f"\u23f1 {song['duration_formatted']}"
-        )
-        embed = Embedder.standard(
-            "\U0001f4be Saved Song",
-            desc,
-            footer=f"Saved from #{interaction.channel.name if interaction.channel else 'vc'} \u2022 {BRAND}",
-            thumbnail=song.get("image"),
-        )
+        await interaction.response.defer(ephemeral=True)
+        await self._grab_song(interaction, state.current)
+
+    async def _grab_song(
+        self,
+        interaction: discord.Interaction,
+        song: Dict[str, Any],
+    ) -> None:
+        """Download the song, build an info embed, and DM both the
+        embed and the .mp3 file to the user.
+
+        Uses the highest quality that fits within Discord's upload
+        limit (25 MB for DMs).  If the file is too large, re-encodes
+        with FFmpeg exactly like ``_download_song`` does.
+        """
+        start = time.monotonic()
+
+        if not self._services_ready():
+            await interaction.followup.send(
+                embed=Embedder.error("Service Unavailable", "\u274c Music services are not available right now."),
+                ephemeral=True,
+            )
+            return
+
+        # Ensure download URLs are resolved
+        song = await self.music_api.ensure_download_urls(song)
+        download_url = _get_url_for_quality(song.get("download_urls", []), "320kbps")
+        if not download_url:
+            await interaction.followup.send(
+                embed=Embedder.error("Grab Failed", "\u274c No download URL available for this song."),
+                ephemeral=True,
+            )
+            return
+
+        # DM upload limit (always 25 MB for non-guild context)
+        upload_limit = DISCORD_UPLOAD_FALLBACK
+        tmp_original: Optional[str] = None
+        tmp_reencoded: Optional[str] = None
 
         try:
-            await interaction.user.send(embed=embed)
-            await interaction.response.send_message(
-                embed=Embedder.success("Saved", "\U0001f4be Sent the song info to your DMs!"),
+            # ── 1. Download the file ──────────────────────────────────
+            tmp_fd, tmp_original = tempfile.mkstemp(suffix=".mp3")
+            os.close(tmp_fd)
+
+            async with self._session.get(
+                download_url,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                if resp.status != 200:
+                    await interaction.followup.send(
+                        embed=Embedder.error("Grab Failed", "\u274c Could not download the song file."),
+                        ephemeral=True,
+                    )
+                    return
+
+                downloaded = 0
+                with open(tmp_original, "wb") as fp:
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        if not chunk:
+                            continue
+                        downloaded += len(chunk)
+                        if downloaded > MAX_DOWNLOAD_SIZE:
+                            await interaction.followup.send(
+                                embed=Embedder.warning("File Too Large", "\u26a0\ufe0f Song file is too large to grab."),
+                                ephemeral=True,
+                            )
+                            return
+                        fp.write(chunk)
+
+            original_size = os.path.getsize(tmp_original)
+            filename = _sanitise_filename(song["artist"], song["name"])
+
+            # ── 2. Re-encode if needed ────────────────────────────────
+            send_path = tmp_original
+            quality_label = "320kbps"
+
+            if original_size > upload_limit:
+                duration = song.get("duration", 0) or 0
+                if duration <= 0:
+                    duration = max((original_size * 8) / (320 * 1000), 30)
+
+                target_bytes = int(upload_limit * 0.95)
+                target_kbps = int((target_bytes * 8) / (duration * 1000))
+                target_kbps = max(target_kbps, MIN_BITRATE_KBPS)
+
+                if target_kbps < MIN_BITRATE_KBPS:
+                    await interaction.followup.send(
+                        embed=Embedder.warning(
+                            "Song Too Long",
+                            "\u26a0\ufe0f This song is too long to fit in a DM upload. "
+                            "Use `/music` to download it to the channel instead.",
+                        ),
+                        ephemeral=True,
+                    )
+                    return
+
+                tmp_fd2, tmp_reencoded = tempfile.mkstemp(suffix=".mp3")
+                os.close(tmp_fd2)
+
+                ok = await self._ffmpeg_reencode(tmp_original, tmp_reencoded, target_kbps)
+                if not ok or not os.path.exists(tmp_reencoded) or os.path.getsize(tmp_reencoded) == 0:
+                    await interaction.followup.send(
+                        embed=Embedder.error("Grab Failed", "\u274c Could not compress the song for DM."),
+                        ephemeral=True,
+                    )
+                    return
+
+                send_path = tmp_reencoded
+                quality_label = f"~{target_kbps}kbps"
+
+            # ── 3. Build embed + send to DMs ─────────────────────────
+            final_size = os.path.getsize(send_path)
+            final_mb = final_size / (1024 * 1024)
+
+            desc = (
+                f"**{song['name']}**\n"
+                f"\U0001f3a4 {song['artist']}\n"
+                f"\U0001f4bf {song['album']} \u2022 {song['year']}\n"
+                f"\u23f1 {song['duration_formatted']}\n"
+                f"\U0001f4be {quality_label} \u2022 {final_mb:.1f} MB"
+            )
+            embed = Embedder.standard(
+                "\U0001f4be Grabbed Song",
+                desc,
+                footer=f"Saved from #{interaction.channel.name if interaction.channel else 'vc'} \u2022 {BRAND}",
+                thumbnail=song.get("image"),
+            )
+
+            with open(send_path, "rb") as fp:
+                file = discord.File(fp, filename=filename)
+                try:
+                    await interaction.user.send(embed=embed, file=file)
+                    await interaction.followup.send(
+                        embed=Embedder.success(
+                            "Grabbed",
+                            f"\U0001f4be Sent **{song['name']}** ({final_mb:.1f} MB) to your DMs!",
+                        ),
+                        ephemeral=True,
+                    )
+                except discord.Forbidden:
+                    await interaction.followup.send(
+                        embed=Embedder.error(
+                            "DMs Closed",
+                            "I can't send you a DM. Please enable DMs from server members.",
+                        ),
+                        ephemeral=True,
+                    )
+
+            latency_ms = (time.monotonic() - start) * 1000
+            await self._log_usage(interaction, "music-grab", latency_ms=latency_ms)
+
+        except asyncio.TimeoutError:
+            await interaction.followup.send(
+                embed=Embedder.error("Timeout", "\u274c Download timed out. Please try again."),
                 ephemeral=True,
             )
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                embed=Embedder.error("DMs Closed", "I can't send you a DM. Please enable DMs from server members."),
+        except Exception as exc:
+            logger.error("Grab error: %s", exc, exc_info=True)
+            await interaction.followup.send(
+                embed=Embedder.error("Grab Failed", "\u274c An error occurred while grabbing the song."),
                 ephemeral=True,
             )
+        finally:
+            for path in (tmp_original, tmp_reencoded):
+                if path:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
 
     # ── /history ─────────────────────────────────────────────────────
 
@@ -2652,12 +2775,51 @@ class MusicCog(commands.Cog, name="Music"):
 
                 state.queue.append(song)
                 pos = len(state.queue)
+
+                # ── Build rich "Added to Queue" embed with live queue ──
+                lines: List[str] = []
+                if state.current:
+                    cur_pos = state.current_position
+                    cur_dur = state.current.get("duration", 0) or 0
+                    bar = _progress_bar(cur_pos, cur_dur, width=10)
+                    lines.append(
+                        f"\U0001f3b5 **Now Playing:** {state.current['name']} "
+                        f"\u2014 {state.current['artist']}\n{bar}"
+                    )
+                    lines.append("")
+
+                lines.append(
+                    f"\u2795 **Added:** {song['name']} \u2014 {song['artist']}  "
+                    f"`{song.get('duration_formatted', '?:??')}`\n"
+                    f"Position in queue: **#{pos}**"
+                )
+
+                # Show upcoming queue (up to 3 entries)
+                if state.queue:
+                    lines.append("")
+                    lines.append("**Up Next:**")
+                    for i, s in enumerate(state.queue[:3], 1):
+                        dur = s.get("duration_formatted", "?:??")
+                        lines.append(f"`{i}.` {s['name']} \u2014 {s['artist']}  `{dur}`")
+                    remaining = len(state.queue) - 3
+                    if remaining > 0:
+                        lines.append(f"*\u2026and {remaining} more*")
+
+                total_songs = len(state.queue) + 1  # queue + now playing
+                total_dur = sum(s.get("duration", 0) for s in state.queue)
+                if state.current:
+                    total_dur += max(0, (state.current.get("duration", 0) or 0) - int(state.current_position))
+                dur_m, dur_s = divmod(int(total_dur), 60)
+                dur_h, dur_m = divmod(dur_m, 60)
+                dur_str = f"{dur_h}h {dur_m}m" if dur_h else f"{dur_m}m {dur_s}s"
+
                 await self._send(
                     interaction,
                     embed=Embedder.standard(
                         "\U0001f3b5 Added to Queue",
-                        f"**{song['name']}** \u2014 {song['artist']}\nPosition: #{pos}",
-                        footer=BRAND,
+                        "\n".join(lines)[:MAX_EMBED_DESC],
+                        footer=f"{total_songs} songs \u2022 {dur_str} remaining \u2022 {BRAND}",
+                        thumbnail=song.get("image"),
                     ),
                     followup=followup,
                 )
@@ -3934,7 +4096,7 @@ class DashboardPlaylistSongsView(discord.ui.View):
     def _build(self) -> None:
         self.clear_items()
 
-        # Song select dropdown (current page songs)
+        # Song select dropdown (current page songs) — select to play or manage
         if self.songs:
             start = self.page * DASH_PL_SONGS_PAGE
             end = start + DASH_PL_SONGS_PAGE
@@ -3948,7 +4110,7 @@ class DashboardPlaylistSongsView(discord.ui.View):
 
             if options:
                 select = discord.ui.Select(
-                    placeholder="Select a song to remove\u2026",
+                    placeholder="Tap a song to play it \u266a",
                     options=options,
                     custom_id="dpl_song_select",
                     row=0,
@@ -3956,7 +4118,7 @@ class DashboardPlaylistSongsView(discord.ui.View):
                 select.callback = self._on_song_select
                 self.add_item(select)
 
-        # Row 1: Navigation + Remove
+        # Row 1: Navigation + Play selected + Remove
         prev_btn = discord.ui.Button(label="\u25c0", style=discord.ButtonStyle.secondary, custom_id="dplsong_prev", row=1, disabled=self.page <= 0)
         prev_btn.callback = self._prev_page
         self.add_item(prev_btn)
@@ -3964,6 +4126,10 @@ class DashboardPlaylistSongsView(discord.ui.View):
         next_btn = discord.ui.Button(label="\u25b6", style=discord.ButtonStyle.secondary, custom_id="dplsong_next", row=1, disabled=self.page >= self.total_pages - 1)
         next_btn.callback = self._next_page
         self.add_item(next_btn)
+
+        play_selected_btn = discord.ui.Button(label="\u25b6 Play", style=discord.ButtonStyle.success, custom_id="dplsong_play_sel", row=1, disabled=self._selected_position is None)
+        play_selected_btn.callback = self._play_selected
+        self.add_item(play_selected_btn)
 
         remove_btn = discord.ui.Button(label="\U0001f5d1 Remove", style=discord.ButtonStyle.danger, custom_id="dplsong_remove", row=1, disabled=self._selected_position is None)
         remove_btn.callback = self._remove_selected
@@ -4023,9 +4189,39 @@ class DashboardPlaylistSongsView(discord.ui.View):
         )
 
     async def _on_song_select(self, interaction: discord.Interaction) -> None:
-        self._selected_position = int(interaction.data["values"][0])
-        self._build()
-        await interaction.response.edit_message(embed=self._build_embed(), view=self)
+        pos = int(interaction.data["values"][0])
+        self._selected_position = pos
+
+        # Auto-play the selected song immediately
+        if pos < len(self.songs):
+            song = self.songs[pos]
+            await interaction.response.defer()
+            try:
+                await self.cog._play_song_in_vc(interaction, song, followup=True)
+            except Exception:
+                pass
+            # Refresh the view after queueing
+            self._build()
+            try:
+                if self.parent._message:
+                    await self.parent._message.edit(embed=self._build_embed(), view=self)
+            except Exception:
+                pass
+        else:
+            self._build()
+            await interaction.response.edit_message(embed=self._build_embed(), view=self)
+
+    async def _play_selected(self, interaction: discord.Interaction) -> None:
+        """Play only the selected song from the playlist."""
+        if self._selected_position is None or self._selected_position >= len(self.songs):
+            await interaction.response.send_message("Select a song first.", ephemeral=True)
+            return
+        song = self.songs[self._selected_position]
+        await interaction.response.defer()
+        try:
+            await self.cog._play_song_in_vc(interaction, song, followup=True)
+        except Exception:
+            pass
 
     async def _prev_page(self, interaction: discord.Interaction) -> None:
         if self.page > 0:
@@ -4760,26 +4956,8 @@ class DashboardMoreView(discord.ui.View):
         if not state.current:
             await interaction.response.send_message("Nothing playing.", ephemeral=True)
             return
-        song = state.current
-        desc = (
-            f"**{song['name']}**\n"
-            f"\U0001f3a4 {song['artist']}\n"
-            f"\U0001f4bf {song['album']} \u2022 {song['year']}\n"
-            f"\u23f1 {song['duration_formatted']}"
-        )
-        embed = Embedder.standard(
-            "\U0001f4be Saved Song", desc, footer=BRAND, thumbnail=song.get("image"),
-        )
         await interaction.response.defer(ephemeral=True)
-        try:
-            await interaction.user.send(embed=embed)
-            await interaction.followup.send(
-                embed=Embedder.success("Saved", "\U0001f4be Sent to your DMs!"), ephemeral=True,
-            )
-        except discord.Forbidden:
-            await interaction.followup.send(
-                embed=Embedder.error("DMs Closed", "Enable DMs from server members."), ephemeral=True,
-            )
+        await self.cog._grab_song(interaction, state.current)
 
     @discord.ui.button(label="Dupes", style=discord.ButtonStyle.secondary, emoji="\U0001f9f9", row=0)
     async def dupes_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -4819,14 +4997,14 @@ class DashboardMoreView(discord.ui.View):
             await interaction.response.send_message("Database unavailable.", ephemeral=True)
             return
         uid = str(interaction.user.id)
-        from cogs.music_premium import _song_key as _pk, MAX_SONGS_PER_PLAYLIST
+        from cogs.music_premium import MAX_SONGS_PER_PLAYLIST
         pl_id = await db.create_playlist(uid, name)
         if pl_id is None:
             await interaction.response.send_message("Could not create playlist.", ephemeral=True)
             return
         count = 0
         for song in all_songs[:MAX_SONGS_PER_PLAYLIST]:
-            key = _pk(song)
+            key = _song_key(song)
             if await db.add_song_to_playlist(pl_id, key):
                 count += 1
         await interaction.response.send_message(
