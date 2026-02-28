@@ -123,7 +123,7 @@ MAX_FILENAME_LEN = 100  # max chars for sanitised filenames
 # ── Timeouts ─────────────────────────────────────────────────────────
 VIEW_TIMEOUT = 60  # seconds for interactive views
 VC_IDLE_TIMEOUT = 300  # 5 minutes idle before auto-disconnect
-NP_UPDATE_INTERVAL = 10  # seconds between live progress-bar edits
+NP_UPDATE_INTERVAL = 2  # seconds between live progress-bar edits
 
 # ── FFmpeg / voice quality ──────────────────────────────────────────
 # NOTE: FFmpeg must be installed on the host system for VC playback.
@@ -2042,6 +2042,8 @@ class MusicCog(commands.Cog, name="Music"):
                 )
             )
         else:
+            # Remove any auto-queued songs still waiting in the queue
+            state.queue = [s for s in state.queue if not s.get("_autoplay")]
             await interaction.response.send_message(
                 embed=Embedder.info(
                     "Autoplay Disabled",
@@ -2821,9 +2823,15 @@ class MusicCog(commands.Cog, name="Music"):
                             # Filter out the song that just played
                             current_id = state.current.get("id", "")
                             for s in suggestions:
+                                # Re-check autoplay each iteration — user may
+                                # toggle it off while we're resolving URLs.
+                                if not state.autoplay:
+                                    autoplay_triggered = False
+                                    break
                                 if s.get("id") != current_id:
                                     s = await self.music_api.ensure_download_urls(s)
                                     if _pick_best_url(s.get("download_urls", []), "320kbps"):
+                                        s["_autoplay"] = True
                                         state.queue.append(s)
                             logger.info(
                                 "Autoplay: queued %d songs by '%s' in guild %d",
@@ -5110,7 +5118,9 @@ class MusicDashboardView(discord.ui.View):
     async def autoplay_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         state = self.cog._get_state(self.guild_id)
         state.autoplay = not state.autoplay
-        status = "**ON**" if state.autoplay else "**OFF**"
+        if not state.autoplay:
+            # Remove any auto-queued songs still waiting in the queue
+            state.queue = [s for s in state.queue if not s.get("_autoplay")]
         # Refresh dashboard
         guild = self.cog.bot.get_guild(self.guild_id)
         embed = _dashboard_embed(state, self.cog, guild)
