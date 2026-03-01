@@ -45,11 +45,12 @@ SEARCH_SYSTEM_PROMPT = (
     "Your job is to synthesize a clear, accurate, and informative answer using "
     "ONLY the information from the search results provided. "
     "Rules:\n"
-    "- Be factual and cite information from the sources\n"
+    "- Be factual and cite sources using numbered brackets like [1], [2], etc.\n"
+    "- Place citations INLINE right after the claim, e.g. 'The event happened on Monday [1].\n'"
+    "- Every major claim or fact MUST have a citation\n"
     "- If the search results don't contain enough info, say so honestly\n"
     "- Use Discord markdown formatting: **bold**, *italic*, `code`\n"
     "- Keep the response concise but comprehensive (aim for 200-400 words)\n"
-    "- When mentioning specific claims, reference which source it came from\n"
     "- Include relevant dates, numbers, and specifics from the results\n"
     "- Do NOT make up information that isn't in the search results\n"
 )
@@ -61,7 +62,8 @@ NEWS_SYSTEM_PROMPT = (
     "ONLY the information from the search results provided. "
     "Rules:\n"
     "- Present the most important/recent developments first\n"
-    "- Be factual — cite which source reported what\n"
+    "- Cite sources using numbered brackets like [1], [2], etc. INLINE after each claim\n"
+    "- Every major fact or quote MUST have a citation, e.g. 'Officials confirmed the attack [3].\n'"
     "- Include dates, casualty numbers, and concrete details when available\n"
     "- Use Discord markdown: **bold** for key facts, headers for sections\n"
     "- Present multiple perspectives if the sources show different viewpoints\n"
@@ -78,7 +80,8 @@ AUTO_NEWS_SYSTEM_PROMPT = (
     "- Be concise — aim for 200-350 words\n"
     "- Use Discord markdown: **bold** for key facts, bullet points for clarity\n"
     "- Include specific dates, numbers, and names\n"
-    "- Cite sources inline (e.g., 'according to Reuters...')\n"
+    "- Cite sources using numbered brackets INLINE, e.g. 'The deal was signed today [2].\n'"
+    "- Every major claim MUST have a citation like [1], [2], etc.\n"
     "- End with a brief 1-sentence outlook if the sources suggest one\n"
     "- Do NOT repeat old news or speculate\n"
 )
@@ -241,7 +244,9 @@ class SearchCog(commands.Cog, name="Search"):
             resp = await self.bot.llm.chat(messages, model=resolved_model, max_tokens=2048)
             latency = (time.monotonic() - start) * 1000
 
-            # Build rich embed
+            # Build rich embed with inline citation hyperlinks
+            url_map = WebSearcher.build_url_map(search_response)
+            content = WebSearcher.hyperlink_citations(resp.content, url_map)
             sources = WebSearcher.format_sources_for_embed(search_response)
             image_url = search_response.best_image or ""
             video = search_response.best_video
@@ -249,7 +254,7 @@ class SearchCog(commands.Cog, name="Search"):
 
             await searching_msg.edit(
                 embed=Embedder.search_response(
-                    content=resp.content,
+                    content=content,
                     query=query,
                     sources=sources,
                     search_type="web",
@@ -354,6 +359,9 @@ class SearchCog(commands.Cog, name="Search"):
             resp = await self.bot.llm.chat(messages, model=resolved_model, max_tokens=2048)
             latency = (time.monotonic() - start) * 1000
 
+            # Hyperlink inline citations [1], [2], etc.
+            url_map = WebSearcher.build_url_map(news_response)
+            content = WebSearcher.hyperlink_citations(resp.content, url_map)
             sources = WebSearcher.format_sources_for_embed(news_response)
             image_url = news_response.best_image or ""
             video = news_response.best_video
@@ -361,7 +369,7 @@ class SearchCog(commands.Cog, name="Search"):
 
             await searching_msg.edit(
                 embed=Embedder.search_response(
-                    content=resp.content,
+                    content=content,
                     query=topic,
                     sources=sources,
                     search_type="news",
@@ -679,14 +687,16 @@ class SearchCog(commands.Cog, name="Search"):
             logger.error("Auto-news LLM failed for '%s': %s", topic, exc)
             return
 
-        # Build and send embed
-        sources = WebSearcher.format_sources_for_embed(news_response, max_sources=4)
+        # Hyperlink inline citations and build embed
+        url_map = WebSearcher.build_url_map(news_response)
+        content = WebSearcher.hyperlink_citations(resp.content, url_map)
+        sources = WebSearcher.format_sources_for_embed(news_response, max_sources=6)
         image_url = news_response.best_image or ""
         next_mins = config["interval_minutes"]
         next_time = (datetime.now(timezone.utc) + timedelta(minutes=next_mins)).strftime("%H:%M UTC")
 
         embed = Embedder.auto_news(
-            content=resp.content,
+            content=content,
             topic=topic,
             sources=sources,
             image_url=image_url,
