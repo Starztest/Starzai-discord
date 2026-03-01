@@ -26,7 +26,6 @@ from config.constants import (
     DODO_COOK_TIMES,
     DODO_DAILY_XP_CAP,
     DODO_MAX_ACTIVE,
-    DODO_MIN_SERVER_AGE_DAYS,
     DODO_PRIORITY_EMOJIS,
     DODO_RED_EXPIRE_PENALTY,
     DODO_RED_MAX_TIMER_HOURS,
@@ -240,7 +239,6 @@ class TaskThreadView(discord.ui.View):
                 "• Tasks have a minimum cook time before you can check them\n"
                 "• Trying to check too early = public callout + strike\n"
                 "• Daily cap of 10 tasks counting toward XP\n"
-                "• Must be in server 7+ days to use\n\n"
                 "**Streaks & MVP**\n"
                 "• Complete tasks daily to build your streak 🔥\n"
                 "• XP multiplier grows with streak (caps at 3x)\n"
@@ -534,9 +532,14 @@ class DodoCog(commands.Cog, name="Dodo"):
         await self._ensure_dodo_user(interaction.user.id, interaction.guild_id)
 
         # Get or create thread + embed
-        thread, message = await self._get_or_create_thread(interaction)
+        try:
+            thread, message = await self._get_or_create_thread(interaction)
+        except RuntimeError as exc:
+            await interaction.followup.send(
+                embed=Embedder.error("Channel Error", str(exc)), ephemeral=True,
+            )
+            return
         await self._update_thread_embed(interaction.user.id, interaction.guild_id, thread, message)
-
         await interaction.followup.send(
             embed=Embedder.success("Dashboard Ready! 🦤", f"Your task thread is ready: {thread.mention}"),
             ephemeral=True,
@@ -569,11 +572,6 @@ class DodoCog(commands.Cog, name="Dodo"):
         member = interaction.guild.get_member(interaction.user.id)
         if not member:
             return False, "Could not find you in this server."
-        if member.joined_at:
-            age = (_now() - member.joined_at.replace(tzinfo=timezone.utc)).days
-            if age < DODO_MIN_SERVER_AGE_DAYS:
-                remaining = DODO_MIN_SERVER_AGE_DAYS - age
-                return False, f"You need to be in this server for at least {DODO_MIN_SERVER_AGE_DAYS} days. {remaining} day(s) remaining."
         return True, ""
 
     # ── Database Helpers ─────────────────────────────────────────────
@@ -670,6 +668,15 @@ class DodoCog(commands.Cog, name="Dodo"):
         if not channel:
             channel = interaction.channel
 
+        # Resolve threads to their parent TextChannel — can't nest threads
+        if isinstance(channel, discord.Thread):
+            channel = channel.parent
+        if not isinstance(channel, discord.TextChannel):
+            raise RuntimeError(
+                "Could not find a valid text channel. "
+                "Set DODO_TASKS_CHANNEL_ID or run /dodo from a text channel."
+            )
+
         if row:
             try:
                 thread = self.bot.get_channel(row["thread_id"])
@@ -695,20 +702,13 @@ class DodoCog(commands.Cog, name="Dodo"):
             except (discord.NotFound, discord.Forbidden):
                 pass  # Thread gone, create new
 
-        # Create new thread
+        # Create new thread in the resolved TextChannel
         thread_name = f"🦤 {interaction.user.display_name}'s Tasks"
-        if isinstance(channel, discord.TextChannel):
-            thread = await channel.create_thread(
-                name=thread_name,
-                type=discord.ChannelType.public_thread,
-                auto_archive_duration=1440,  # 24 hours
-            )
-        else:
-            # Fallback — shouldn't normally happen
-            thread = await channel.create_thread(
-                name=thread_name,
-                auto_archive_duration=1440,
-            )
+        thread = await channel.create_thread(
+            name=thread_name,
+            type=discord.ChannelType.public_thread,
+            auto_archive_duration=1440,  # 24 hours
+        )
 
         view = TaskThreadView(self.bot)
         embed = discord.Embed(title="Loading your dashboard...", color=BOT_COLOR)
