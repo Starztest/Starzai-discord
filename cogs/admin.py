@@ -163,15 +163,15 @@ class AdminCog(commands.Cog, name="Admin"):
             )
             return
 
-        self.bot.allowed_guilds.add(resolved)
-        self.bot.save_allowed_guilds()
+        await self.bot.add_allowed_guild(resolved, str(interaction.user))
 
         guild_obj = self.bot.get_guild(resolved)
         name = guild_obj.name if guild_obj else str(resolved)
         await interaction.response.send_message(
             embed=Embedder.success(
                 "Guild Allowed",
-                f"**{name}** (`{resolved}`) can now use the bot.",
+                f"**{name}** (`{resolved}`) can now use the bot.\n"
+                f"_Persisted to database — survives deploys._",
             ),
             ephemeral=True,
         )
@@ -196,8 +196,7 @@ class AdminCog(commands.Cog, name="Admin"):
             )
             return
 
-        self.bot.allowed_guilds.discard(resolved)
-        self.bot.save_allowed_guilds()
+        await self.bot.remove_allowed_guild(resolved)
 
         guild_obj = self.bot.get_guild(resolved)
         name = guild_obj.name if guild_obj else str(resolved)

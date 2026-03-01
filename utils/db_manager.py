@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import aiosqlite
 
@@ -263,6 +263,13 @@ class DatabaseManager:
                 expires_at      TEXT    NOT NULL,
                 set_by          TEXT    NOT NULL,
                 created_at      TEXT    DEFAULT (datetime('now'))
+            );
+
+            -- ── Allowed Guilds (persistent across deploys) ────────
+            CREATE TABLE IF NOT EXISTS allowed_guilds (
+                guild_id    INTEGER PRIMARY KEY,
+                allowed_by  TEXT    DEFAULT NULL,
+                allowed_at  TEXT    DEFAULT (datetime('now'))
             );
 
             -- ── Auto-News Channels ──────────────────────────────────
@@ -1099,6 +1106,59 @@ class DatabaseManager:
         )
         await self.db.commit()
         return (cur.rowcount or 0) > 0
+
+    # ── Allowed Guilds ────────────────────────────────────────────────
+
+    async def get_allowed_guilds(self) -> Set[int]:
+        """Load all allowed guild IDs from the database."""
+        async with self.db.execute("SELECT guild_id FROM allowed_guilds") as cur:
+            rows = await cur.fetchall()
+            return {row["guild_id"] for row in rows}
+
+    async def add_allowed_guild(self, guild_id: int, allowed_by: str = "") -> None:
+        """Add a guild to the allowlist."""
+        await self.db.execute(
+            """INSERT OR IGNORE INTO allowed_guilds (guild_id, allowed_by)
+               VALUES (?, ?)""",
+            (guild_id, allowed_by),
+        )
+        await self.db.commit()
+
+    async def remove_allowed_guild(self, guild_id: int) -> bool:
+        """Remove a guild from the allowlist. Returns True if removed."""
+        cur = await self.db.execute(
+            "DELETE FROM allowed_guilds WHERE guild_id = ?", (guild_id,),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def migrate_allowed_guilds_from_json(self, json_path: str) -> int:
+        """One-time migration: import allowed_guilds.json into the DB.
+
+        Returns the number of guilds imported.
+        """
+        import os
+        if not os.path.exists(json_path):
+            return 0
+        try:
+            with open(json_path) as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                return 0
+            count = 0
+            for gid in data:
+                await self.db.execute(
+                    "INSERT OR IGNORE INTO allowed_guilds (guild_id, allowed_by) VALUES (?, ?)",
+                    (int(gid), "migrated_from_json"),
+                )
+                count += 1
+            await self.db.commit()
+            # Rename old file so migration only runs once
+            os.rename(json_path, json_path + ".migrated")
+            return count
+        except Exception as exc:
+            logger.warning("Failed to migrate allowed_guilds.json: %s", exc)
+            return 0
 
     # ── Auto-News Channels ────────────────────────────────────────────
 

@@ -6,10 +6,8 @@ Loads configuration, initializes services, and starts the bot.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sys
-from pathlib import Path
 from typing import Optional, Set
 
 import discord
@@ -100,32 +98,25 @@ class StarzaiBot(commands.Bot):
             maxsize=10_000, ttl=3600
         )
 
-        # Guild allowlist — only these guilds can use the bot
-        self._allowed_guilds_path = Path("data/allowed_guilds.json")
-        self.allowed_guilds: Set[int] = self._load_allowed_guilds()
+        # Guild allowlist — loaded from DB in setup_hook, kept in-memory
+        self.allowed_guilds: Set[int] = set()
 
-    # ── Guild allowlist persistence ──────────────────────────────────
+    # ── Guild allowlist (DB-backed, persists across deploys) ─────────
 
-    def _load_allowed_guilds(self) -> Set[int]:
-        """Load the set of allowed guild IDs from disk."""
-        try:
-            if self._allowed_guilds_path.exists():
-                data = json.loads(self._allowed_guilds_path.read_text())
-                if isinstance(data, list):
-                    return {int(g) for g in data}
-        except Exception as exc:
-            logger.warning("Failed to load allowed guilds: %s", exc)
-        return set()
+    async def load_allowed_guilds(self) -> None:
+        """Load the set of allowed guild IDs from the database."""
+        self.allowed_guilds = await self.database.get_allowed_guilds()
+        logger.info("Loaded %d allowed guild(s) from database", len(self.allowed_guilds))
 
-    def save_allowed_guilds(self) -> None:
-        """Persist the allowed guild set to disk."""
-        try:
-            self._allowed_guilds_path.parent.mkdir(parents=True, exist_ok=True)
-            self._allowed_guilds_path.write_text(
-                json.dumps(sorted(self.allowed_guilds))
-            )
-        except Exception as exc:
-            logger.warning("Failed to save allowed guilds: %s", exc)
+    async def add_allowed_guild(self, guild_id: int, allowed_by: str = "") -> None:
+        """Add a guild to the allowlist and persist to DB."""
+        self.allowed_guilds.add(guild_id)
+        await self.database.add_allowed_guild(guild_id, allowed_by)
+
+    async def remove_allowed_guild(self, guild_id: int) -> None:
+        """Remove a guild from the allowlist and persist to DB."""
+        self.allowed_guilds.discard(guild_id)
+        await self.database.remove_allowed_guild(guild_id)
 
     def is_guild_allowed(self, guild_id: Optional[int]) -> bool:
         """Return True if *guild_id* is in the allowlist (or no list configured)."""
@@ -144,6 +135,16 @@ class StarzaiBot(commands.Bot):
 
         # Database
         await self.database.initialize()
+
+        # Migrate allowed_guilds.json → DB (one-time, safe to call repeatedly)
+        migrated = await self.database.migrate_allowed_guilds_from_json(
+            "data/allowed_guilds.json"
+        )
+        if migrated:
+            logger.info("Migrated %d guild(s) from allowed_guilds.json → database", migrated)
+
+        # Load allowed guilds into memory from DB
+        await self.load_allowed_guilds()
 
         # Load cogs
         for cog_path in COGS:
