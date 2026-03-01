@@ -5,6 +5,11 @@ on:
   issue_comment:
     types: [created]
 
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
 concurrency:
   group: railway-deploy
   cancel-in-progress: true
@@ -79,3 +84,4 @@ jobs:
               issue_number: context.payload.issue.number,
               body: '❌ **Deploy failed.** Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.'
             });
+
