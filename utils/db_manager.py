@@ -265,6 +265,19 @@ class DatabaseManager:
                 created_at      TEXT    DEFAULT (datetime('now'))
             );
 
+            -- ── Auto-News Channels ──────────────────────────────────
+            CREATE TABLE IF NOT EXISTS news_channels (
+                guild_id            TEXT    PRIMARY KEY,
+                channel_id          TEXT    NOT NULL,
+                topic               TEXT    NOT NULL,
+                interval_minutes    INTEGER DEFAULT 30,
+                enabled             INTEGER DEFAULT 1,
+                last_sent_at        TEXT    DEFAULT NULL,
+                last_sent_urls      TEXT    DEFAULT '[]',
+                configured_by       TEXT    NOT NULL,
+                configured_at       TEXT    DEFAULT (datetime('now'))
+            );
+
             CREATE INDEX IF NOT EXISTS idx_conversations_user
                 ON conversations(user_id, active);
             CREATE INDEX IF NOT EXISTS idx_usage_logs_user
@@ -283,6 +296,8 @@ class DatabaseManager:
                 ON listening_history(user_id, played_at);
             CREATE INDEX IF NOT EXISTS idx_listening_history_guild
                 ON listening_history(user_id, guild_id, played_at);
+            CREATE INDEX IF NOT EXISTS idx_news_channels_enabled
+                ON news_channels(enabled, last_sent_at);
             """
         )
         await self.db.commit()
@@ -1084,3 +1099,84 @@ class DatabaseManager:
         )
         await self.db.commit()
         return (cur.rowcount or 0) > 0
+
+    # ── Auto-News Channels ────────────────────────────────────────────
+
+    async def set_news_channel(
+        self,
+        guild_id: str,
+        channel_id: str,
+        topic: str,
+        interval_minutes: int,
+        configured_by: str,
+    ) -> None:
+        """Set or update the auto-news channel for a guild."""
+        await self.db.execute(
+            """INSERT INTO news_channels
+                   (guild_id, channel_id, topic, interval_minutes, configured_by)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(guild_id) DO UPDATE SET
+                   channel_id       = excluded.channel_id,
+                   topic            = excluded.topic,
+                   interval_minutes = excluded.interval_minutes,
+                   configured_by    = excluded.configured_by,
+                   enabled          = 1,
+                   configured_at    = datetime('now')
+            """,
+            (guild_id, channel_id, topic, interval_minutes, configured_by),
+        )
+        await self.db.commit()
+
+    async def get_news_channel(self, guild_id: str) -> Optional[Dict[str, Any]]:
+        """Get the auto-news config for a guild."""
+        async with self.db.execute(
+            "SELECT * FROM news_channels WHERE guild_id = ?", (guild_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def get_all_active_news_channels(self) -> List[Dict[str, Any]]:
+        """Get all enabled auto-news channel configs."""
+        async with self.db.execute(
+            "SELECT * FROM news_channels WHERE enabled = 1"
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def remove_news_channel(self, guild_id: str) -> bool:
+        """Remove the auto-news channel for a guild."""
+        cur = await self.db.execute(
+            "DELETE FROM news_channels WHERE guild_id = ?", (guild_id,),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def toggle_news_channel(self, guild_id: str, enabled: bool) -> bool:
+        """Enable or disable auto-news for a guild."""
+        cur = await self.db.execute(
+            "UPDATE news_channels SET enabled = ? WHERE guild_id = ?",
+            (1 if enabled else 0, guild_id),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def update_news_last_sent(
+        self, guild_id: str, sent_urls: Optional[List[str]] = None,
+    ) -> None:
+        """Update last_sent_at and optionally the dedup URL list."""
+        import json
+        if sent_urls is not None:
+            # Keep only the last 50 URLs for dedup
+            urls_json = json.dumps(sent_urls[-50:])
+            await self.db.execute(
+                """UPDATE news_channels
+                   SET last_sent_at = datetime('now'), last_sent_urls = ?
+                   WHERE guild_id = ?""",
+                (urls_json, guild_id),
+            )
+        else:
+            await self.db.execute(
+                "UPDATE news_channels SET last_sent_at = datetime('now') WHERE guild_id = ?",
+                (guild_id,),
+            )
+        await self.db.commit()

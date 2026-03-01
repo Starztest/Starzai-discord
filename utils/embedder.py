@@ -152,8 +152,11 @@ class Embedder:
         sources: str = "",
         search_type: str = "web",
         cached: bool = False,
+        provider: str = "",
+        image_url: str = "",
+        video_text: str = "",
     ) -> discord.Embed:
-        """Create an embed for an AI-synthesized web search answer."""
+        """Create a rich embed for an AI-synthesized web search answer."""
         if len(content) > 3500:
             content = content[:3494] + "\n…"
 
@@ -165,9 +168,44 @@ class Embedder:
         )
         if sources:
             embed.add_field(name="📎 Sources", value=sources[:1024], inline=False)
+        if video_text:
+            embed.add_field(name="🎬 Related Video", value=video_text[:1024], inline=False)
+        if image_url:
+            embed.set_image(url=image_url)
         footer_parts = [f"Search: {search_type}"]
+        if provider:
+            footer_parts.append(f"via {provider}")
         if cached:
             footer_parts.append("cached")
+        footer_parts.append(f"✨ {BOT_NAME}")
+        embed.set_footer(text=" • ".join(footer_parts))
+        return embed
+
+    @classmethod
+    def auto_news(
+        cls,
+        content: str,
+        topic: str,
+        sources: str = "",
+        image_url: str = "",
+        next_update: str = "",
+    ) -> discord.Embed:
+        """Create an embed for automatic news channel updates."""
+        if len(content) > 3500:
+            content = content[:3494] + "\n…"
+
+        embed = cls._base(
+            f"📡 Auto-News: {topic[:60]}",
+            content,
+            BOT_INFO_COLOR,
+        )
+        if sources:
+            embed.add_field(name="📎 Sources", value=sources[:1024], inline=False)
+        if image_url:
+            embed.set_image(url=image_url)
+        footer_parts = ["📡 Auto-News"]
+        if next_update:
+            footer_parts.append(f"Next update: {next_update}")
         footer_parts.append(f"✨ {BOT_NAME}")
         embed.set_footer(text=" • ".join(footer_parts))
         return embed

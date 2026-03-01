@@ -71,6 +71,13 @@ WEB_SEARCH_CACHE_TTL = 300          # 5-minute cache for repeated queries
 WEB_SEARCH_TIMEOUT = 15             # seconds timeout for web search
 WEB_SEARCH_MAX_SNIPPET_CHARS = 500  # max chars per snippet for LLM context
 
+# ── Auto-News ────────────────────────────────────────────────────
+AUTO_NEWS_CHECK_INTERVAL = 5        # minutes between background task ticks
+AUTO_NEWS_MIN_INTERVAL = 15         # minimum user-configurable interval (mins)
+AUTO_NEWS_MAX_INTERVAL = 1440       # maximum interval (24 hours)
+AUTO_NEWS_DEFAULT_INTERVAL = 30     # default interval (30 minutes)
+AUTO_NEWS_MAX_GUILDS_PER_TICK = 5   # rate limit: max guilds processed per tick
+
 # ── Music Premium ────────────────────────────────────────────────────
 MAX_PLAYLISTS_PER_USER = 25
 MAX_SONGS_PER_PLAYLIST = 200
