@@ -126,6 +126,20 @@ class Settings:
         default_factory=lambda: int(os.getenv("MUSIC_API_TIMEOUT", "30"))
     )
 
+    # Dodo Todo System
+    dodo_tasks_channel_id: Optional[int] = field(
+        default_factory=lambda: _parse_optional_int(os.getenv("DODO_TASKS_CHANNEL_ID", ""))
+    )
+    dodo_gc_channel_id: Optional[int] = field(
+        default_factory=lambda: _parse_optional_int(os.getenv("DODO_GC_CHANNEL_ID", ""))
+    )
+    dodo_daily_mvp_role_id: Optional[int] = field(
+        default_factory=lambda: _parse_optional_int(os.getenv("DODO_DAILY_MVP_ROLE_ID", ""))
+    )
+    dodo_weekly_mvp_role_id: Optional[int] = field(
+        default_factory=lambda: _parse_optional_int(os.getenv("DODO_WEEKLY_MVP_ROLE_ID", ""))
+    )
+
     # Railway
     port: int = field(default_factory=lambda: int(os.getenv("PORT", "8080")))
 

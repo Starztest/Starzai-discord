@@ -12,3 +12,4 @@ pytz>=2024.1
 yt-dlp>=2024.1.0
 duckduckgo-search>=7.0.0
 feedparser>=6.0.0
+Pillow>=10.0.0

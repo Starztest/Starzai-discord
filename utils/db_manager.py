@@ -285,6 +285,84 @@ class DatabaseManager:
                 configured_at       TEXT    DEFAULT (datetime('now'))
             );
 
+            -- ── Dodo: Tasks ────────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS dodo_tasks (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         INTEGER NOT NULL,
+                guild_id        INTEGER NOT NULL,
+                task_text       TEXT    NOT NULL,
+                priority        TEXT    NOT NULL,
+                is_hidden       INTEGER DEFAULT 0,
+                is_completed    INTEGER DEFAULT 0,
+                is_expired      INTEGER DEFAULT 0,
+                created_at      TEXT    DEFAULT (datetime('now')),
+                completed_at    TEXT,
+                timer_expires   TEXT,
+                cook_time_mins  INTEGER,
+                remind_enabled  INTEGER DEFAULT 0,
+                remind_intervals TEXT   DEFAULT '[]',
+                next_remind_at  TEXT,
+                remind_stage    INTEGER DEFAULT 0
+            );
+
+            -- ── Dodo: Users ────────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS dodo_users (
+                user_id         INTEGER NOT NULL,
+                guild_id        INTEGER NOT NULL,
+                xp              INTEGER DEFAULT 0,
+                streak          INTEGER DEFAULT 0,
+                last_active     TEXT,
+                steal_shield    INTEGER DEFAULT 0,
+                streak_mercy    INTEGER DEFAULT 0,
+                joined_at       TEXT    DEFAULT (datetime('now')),
+                PRIMARY KEY (user_id, guild_id)
+            );
+
+            -- ── Dodo: MVP ──────────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS dodo_mvp (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id        INTEGER NOT NULL,
+                user_id         INTEGER NOT NULL,
+                mvp_type        TEXT    NOT NULL,
+                awarded_at      TEXT    DEFAULT (datetime('now')),
+                boost_available INTEGER DEFAULT 0,
+                steal_available INTEGER DEFAULT 0,
+                boost_used      INTEGER DEFAULT 0,
+                steal_used      INTEGER DEFAULT 0,
+                steal_target_id INTEGER,
+                expires_at      TEXT
+            );
+
+            -- ── Dodo: Steal Log ────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS dodo_steal_log (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id        INTEGER NOT NULL,
+                stealer_id      INTEGER NOT NULL,
+                target_id       INTEGER NOT NULL,
+                week_start      TEXT    NOT NULL,
+                stolen_xp       INTEGER,
+                created_at      TEXT    DEFAULT (datetime('now')),
+                UNIQUE(stealer_id, target_id, week_start)
+            );
+
+            -- ── Dodo: Strikes ──────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS dodo_strikes (
+                user_id         INTEGER NOT NULL,
+                guild_id        INTEGER NOT NULL,
+                strike_date     TEXT    NOT NULL,
+                strike_count    INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, guild_id, strike_date)
+            );
+
+            -- ── Dodo: Thread Message IDs (for embed editing) ───────
+            CREATE TABLE IF NOT EXISTS dodo_threads (
+                user_id         INTEGER NOT NULL,
+                guild_id        INTEGER NOT NULL,
+                thread_id       INTEGER NOT NULL,
+                message_id      INTEGER NOT NULL,
+                PRIMARY KEY (user_id, guild_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_conversations_user
                 ON conversations(user_id, active);
             CREATE INDEX IF NOT EXISTS idx_usage_logs_user
@@ -305,6 +383,18 @@ class DatabaseManager:
                 ON listening_history(user_id, guild_id, played_at);
             CREATE INDEX IF NOT EXISTS idx_news_channels_enabled
                 ON news_channels(enabled, last_sent_at);
+            CREATE INDEX IF NOT EXISTS idx_dodo_tasks_user
+                ON dodo_tasks(user_id, guild_id, is_completed);
+            CREATE INDEX IF NOT EXISTS idx_dodo_tasks_expiry
+                ON dodo_tasks(timer_expires, is_completed, is_expired);
+            CREATE INDEX IF NOT EXISTS idx_dodo_tasks_remind
+                ON dodo_tasks(remind_enabled, next_remind_at, is_completed);
+            CREATE INDEX IF NOT EXISTS idx_dodo_users_guild
+                ON dodo_users(guild_id, xp);
+            CREATE INDEX IF NOT EXISTS idx_dodo_mvp_guild
+                ON dodo_mvp(guild_id, mvp_type, awarded_at);
+            CREATE INDEX IF NOT EXISTS idx_dodo_strikes_date
+                ON dodo_strikes(strike_date);
             """
         )
         await self.db.commit()

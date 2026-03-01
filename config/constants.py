@@ -83,3 +83,39 @@ MAX_PLAYLISTS_PER_USER = 25
 MAX_SONGS_PER_PLAYLIST = 200
 MAX_FAVORITES = 500
 PREMIUM_VIEW_TIMEOUT = 120                  # seconds for premium interactive views
+
+# ── Dodo Todo System ────────────────────────────────────────────────
+DODO_COOK_TIMES = {"red": 60, "yellow": 45, "green": 20}   # minutes
+DODO_XP_VALUES = {"red": 30, "yellow": 20, "green": 10}    # base XP per check
+DODO_MAX_ACTIVE = {"red": 3, "yellow": 10, "green": 999}   # max active tasks
+DODO_RED_MAX_TIMER_HOURS = 12
+DODO_RED_EXPIRE_PENALTY = 2                                 # XP deducted
+DODO_DAILY_XP_CAP = 10                                      # max tasks counting toward XP/day
+DODO_MIN_SERVER_AGE_DAYS = 7                                # days before user can use bot
+DODO_STREAK_DECAY = 0.5                                     # lose 50% on missed day
+DODO_STREAK_MULTIPLIER_CAP = 3.0
+DODO_STREAK_MILESTONES = [7, 14, 30, 60, 100]
+
+DODO_STRIKE_RULES = {
+    1: "funny",     # public callout — funny
+    2: "serious",   # public callout — serious warning
+    3: "half_xp",   # half XP for the day
+}
+# 4+ → zero XP
+DODO_STRIKE_COLORS = {
+    1: 0xF1C40F,    # yellow
+    2: 0xE67E22,    # orange
+    3: 0xE74C3C,    # red
+    4: 0x000000,    # black
+}
+
+DODO_BSD_CHARACTERS = [
+    {"name": "Atsushi 🐯",      "tone": "Gentle and encouraging",       "color": 0xFFD700},
+    {"name": "Dazai 🎭",        "tone": "Dramatic and teasing",         "color": 0x8B4513},
+    {"name": "Chuuya 🍷",       "tone": "Annoyed and sarcastic",        "color": 0xE74C3C},
+    {"name": "Akutagawa 🖤",    "tone": "Cold and threatening",         "color": 0x000000},
+    {"name": "Dostoyevsky 🕊️",  "tone": "Reflecting and cryptic",       "color": 0x4B0082},
+    {"name": "Sigma 📋",        "tone": "Awkward and trying his best",  "color": 0x808080},
+]
+
+DODO_PRIORITY_EMOJIS = {"red": "🔴", "yellow": "🟡", "green": "🟢"}

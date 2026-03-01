@@ -49,6 +49,7 @@ COGS = [
     "cogs.music",
     "cogs.music_premium",
     "cogs.search",
+    "cogs.dodo",
 ]
 
 
@@ -153,6 +154,16 @@ class StarzaiBot(commands.Bot):
                 logger.info("Loaded cog: %s", cog_path)
             except Exception as exc:
                 logger.error("Failed to load cog %s: %s", cog_path, exc)
+
+        # Register persistent views (survive bot restarts)
+        try:
+            from cogs.dodo import TaskThreadView, MVPPerkView, ShieldView
+            self.add_view(TaskThreadView(self))
+            self.add_view(MVPPerkView(self))
+            self.add_view(ShieldView(self))
+            logger.info("Registered Dodo persistent views")
+        except Exception as exc:
+            logger.warning("Could not register Dodo persistent views: %s", exc)
 
         # Sync slash commands
         try:
