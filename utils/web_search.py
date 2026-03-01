@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -568,27 +569,64 @@ class WebSearcher:
         return "\n".join(lines)
 
     @staticmethod
+    def build_url_map(response: SearchResponse) -> Dict[int, str]:
+        """Build a {1: url, 2: url, ...} mapping from search results."""
+        return {
+            i: r.url
+            for i, r in enumerate(response.results, 1)
+            if r.url
+        }
+
+    @staticmethod
+    def hyperlink_citations(text: str, url_map: Dict[int, str]) -> str:
+        """Replace plain [1], [2] etc. in LLM output with clickable [[1]](url).
+
+        Uses negative look-behind/ahead so already-linked citations and
+        normal markdown links are left untouched.
+        """
+        if not url_map:
+            return text
+
+        def _replace(m: re.Match) -> str:
+            num = int(m.group(1))
+            url = url_map.get(num)
+            if url:
+                return f"[[{num}]]({url})"
+            return m.group(0)  # no URL for this number, leave as-is
+
+        # Match [N] that is NOT preceded by [ (would be [[N]]) and NOT
+        # followed by ( (would be [N](url) — already a markdown link).
+        return re.sub(r"(?<!\[)\[(\d+)\](?!\()", _replace, text)
+
+    @staticmethod
     def format_sources_for_embed(
         response: SearchResponse,
-        max_sources: int = 5,
+        max_sources: int = 8,
         max_length: int = 1024,
     ) -> str:
-        """Format source links for display in a Discord embed.
+        """Compact source list for a Discord embed field.
 
-        Respects Discord's 1024-char embed field limit by stopping
-        before a line would be cut off mid-text.
+        Format: ``[[1]](url) Source Name \u2022 Short Title``
+        Uses hyperlinked citation numbers so ALL sources fit within
+        Discord's 1024-char embed field limit.
         """
         if not response.has_results:
             return ""
         lines: list[str] = []
         total_len = 0
         for i, r in enumerate(response.results[:max_sources], 1):
-            title = r.title[:60] + "…" if len(r.title) > 60 else r.title
-            source_tag = f" • {r.source}" if r.source else ""
-            line = f"{i}. [{title}]({r.url}){source_tag}"
-            # +1 accounts for the "\n" separator between lines
+            source_name = r.source or "Link"
+            # Compact: hyperlinked [N] + source name + short title
+            title_short = r.title[:45] + "…" if len(r.title) > 45 else r.title
+            line = f"[[{i}]]({r.url}) {source_name} — {title_short}"
             added_len = len(line) + (1 if lines else 0)
             if total_len + added_len > max_length:
+                # Still room for a summary line?
+                remaining = len(response.results) - len(lines)
+                if remaining > 0:
+                    note = f"*…and {remaining} more source{'s' if remaining != 1 else ''}*"
+                    if total_len + len(note) + 1 <= max_length:
+                        lines.append(note)
                 break
             lines.append(line)
             total_len += added_len
