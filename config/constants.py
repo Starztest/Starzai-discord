@@ -85,7 +85,7 @@ MAX_FAVORITES = 500
 PREMIUM_VIEW_TIMEOUT = 120                  # seconds for premium interactive views
 
 # ── Dodo Todo System ────────────────────────────────────────────────
-DODO_COOK_TIMES = {"red": 60, "yellow": 45, "green": 20}   # minutes
+DODO_COOLDOWN_MINUTES = 5                                    # minutes before a task unlocks a check permission
 DODO_XP_VALUES = {"red": 30, "yellow": 20, "green": 10}    # base XP per check
 DODO_MAX_ACTIVE = {"red": 3, "yellow": 10, "green": 999}   # max active tasks
 DODO_RED_MAX_TIMER_HOURS = 12
