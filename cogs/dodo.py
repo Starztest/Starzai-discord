@@ -520,7 +520,7 @@ class AddTaskModal(discord.ui.Modal, title="🦤 Add New Task"):
         style=discord.TextStyle.short,
     )
     reminders = discord.ui.TextInput(
-        label="Reminder intervals (optional, comma separated)",
+        label="Reminders (optional, comma-separated)",
         placeholder="e.g. 30m, 1h, 2h",
         required=False,
         max_length=100,
