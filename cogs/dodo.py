@@ -504,10 +504,34 @@ class DodoCog(commands.Cog, name="Dodo"):
     def __init__(self, bot: StarzaiBot):
         self.bot = bot
         self._boost_cache: dict[int, bool] = {}  # user_id -> has active boost
+        self._dodo_config_cache: dict[int, dict] = {}  # guild_id -> {tasks_channel_id, gc_channel_id}
         self.check_expirations.start()
 
     def cog_unload(self):
         self.check_expirations.cancel()
+
+    # ── Channel config helpers (DB → env var fallback) ───────────────
+
+    async def _get_dodo_config(self, guild_id: int) -> dict:
+        """Fetch Dodo channel config for a guild. Checks cache → DB → env var fallback."""
+        if guild_id in self._dodo_config_cache:
+            return self._dodo_config_cache[guild_id]
+
+        row = await self.bot.database.get_dodo_config(guild_id)
+        config = {
+            "tasks_channel_id": (row["tasks_channel_id"] if row and row["tasks_channel_id"] else None)
+                                or self.bot.settings.dodo_tasks_channel_id,
+            "gc_channel_id":    (row["gc_channel_id"] if row and row["gc_channel_id"] else None)
+                                or self.bot.settings.dodo_gc_channel_id,
+        }
+        self._dodo_config_cache[guild_id] = config
+        return config
+
+    async def _get_tasks_channel_id(self, guild_id: int) -> Optional[int]:
+        return (await self._get_dodo_config(guild_id))["tasks_channel_id"]
+
+    async def _get_gc_channel_id(self, guild_id: int) -> Optional[int]:
+        return (await self._get_dodo_config(guild_id))["gc_channel_id"]
 
     # ── /dodo entry point ────────────────────────────────────────────
 
@@ -562,6 +586,73 @@ class DodoCog(commands.Cog, name="Dodo"):
         else:
             embed = await self._build_profile_embed(target.id, interaction.guild_id)
             await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @dodo_group.command(name="setchannel", description="Set the Dodo tasks and/or announcements channel")
+    @app_commands.describe(
+        tasks_channel="Channel where task threads will be created",
+        gc_channel="Channel for public callouts and announcements",
+    )
+    async def setchannel_cmd(
+        self,
+        interaction: discord.Interaction,
+        tasks_channel: Optional[discord.TextChannel] = None,
+        gc_channel: Optional[discord.TextChannel] = None,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                embed=Embedder.error("Server Only", "Dodo can only be used in a server."), ephemeral=True,
+            )
+            return
+
+        guild_id = interaction.guild_id
+
+        # If no args, show current config
+        if tasks_channel is None and gc_channel is None:
+            config = await self._get_dodo_config(guild_id)
+            lines = []
+            if config["tasks_channel_id"]:
+                lines.append(f"📋 Tasks channel: <#{config['tasks_channel_id']}>")
+            else:
+                lines.append("📋 Tasks channel: *not set*")
+            if config["gc_channel_id"]:
+                lines.append(f"📢 Announcements channel: <#{config['gc_channel_id']}>")
+            else:
+                lines.append("📢 Announcements channel: *not set*")
+            lines.append("")
+            lines.append("Use `/dodo setchannel tasks_channel:#channel gc_channel:#channel` to configure.")
+            embed = discord.Embed(
+                title="🦤 Dodo Channel Config",
+                description="\n".join(lines),
+                color=BOT_COLOR,
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        # Save to DB
+        await self.bot.database.set_dodo_config(
+            guild_id=guild_id,
+            tasks_channel_id=tasks_channel.id if tasks_channel else None,
+            gc_channel_id=gc_channel.id if gc_channel else None,
+            configured_by=str(interaction.user.id),
+        )
+
+        # Invalidate cache
+        self._dodo_config_cache.pop(guild_id, None)
+
+        # Build confirmation
+        parts = []
+        if tasks_channel:
+            parts.append(f"📋 Tasks → {tasks_channel.mention}")
+        if gc_channel:
+            parts.append(f"📢 Announcements → {gc_channel.mention}")
+
+        embed = discord.Embed(
+            title="✅ Dodo Channels Updated!",
+            description="\n".join(parts),
+            color=BOT_SUCCESS_COLOR,
+        )
+        embed.set_footer(text="Run /dodo setchannel with no args to see current config")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ── Eligibility Check ────────────────────────────────────────────
 
@@ -661,7 +752,7 @@ class DodoCog(commands.Cog, name="Dodo"):
             row = await cur.fetchone()
 
         # Try to use the configured channel, fall back to current channel
-        channel_id = self.bot.settings.dodo_tasks_channel_id
+        channel_id = await self._get_tasks_channel_id(guild_id)
         channel = None
         if channel_id:
             channel = self.bot.get_channel(channel_id)
@@ -1130,7 +1221,7 @@ class DodoCog(commands.Cog, name="Dodo"):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
         # Public callout in GC
-        gc_channel_id = self.bot.settings.dodo_gc_channel_id
+        gc_channel_id = await self._get_gc_channel_id(guild_id)
         if gc_channel_id:
             gc_channel = self.bot.get_channel(gc_channel_id)
             if gc_channel:
@@ -1229,7 +1320,7 @@ class DodoCog(commands.Cog, name="Dodo"):
                                 pass
 
                 # Announce in GC
-                gc_channel_id = self.bot.settings.dodo_gc_channel_id
+                gc_channel_id = await self._get_gc_channel_id(guild_id)
                 if gc_channel_id:
                     gc_channel = self.bot.get_channel(gc_channel_id)
                     if gc_channel:
@@ -1297,7 +1388,7 @@ class DodoCog(commands.Cog, name="Dodo"):
                                 pass
 
                 # Announce in GC
-                gc_channel_id = self.bot.settings.dodo_gc_channel_id
+                gc_channel_id = await self._get_gc_channel_id(guild_id)
                 if gc_channel_id:
                     gc_channel = self.bot.get_channel(gc_channel_id)
                     if gc_channel:
@@ -1341,7 +1432,7 @@ class DodoCog(commands.Cog, name="Dodo"):
 
     async def _announce_streak_milestone(self, user_id: int, guild_id: int, streak: int) -> None:
         """Announce a streak milestone publicly."""
-        gc_channel_id = self.bot.settings.dodo_gc_channel_id
+        gc_channel_id = await self._get_gc_channel_id(guild_id)
         if not gc_channel_id:
             return
         gc_channel = self.bot.get_channel(gc_channel_id)
@@ -1513,7 +1604,7 @@ class DodoCog(commands.Cog, name="Dodo"):
         )
 
         # Public announcement
-        gc_channel_id = self.bot.settings.dodo_gc_channel_id
+        gc_channel_id = await self._get_gc_channel_id(guild_id)
         if gc_channel_id:
             gc_channel = self.bot.get_channel(gc_channel_id)
             if gc_channel:
@@ -1590,7 +1681,7 @@ class DodoCog(commands.Cog, name="Dodo"):
 
         # Public announcement
         if steal:
-            gc_channel_id = self.bot.settings.dodo_gc_channel_id
+            gc_channel_id = await self._get_gc_channel_id(steal["guild_id"])
             if gc_channel_id:
                 gc_channel = self.bot.get_channel(gc_channel_id)
                 if gc_channel:
@@ -1655,7 +1746,7 @@ class DodoCog(commands.Cog, name="Dodo"):
 
         if is_active:
             # Public ping in GC
-            gc_channel_id = self.bot.settings.dodo_gc_channel_id
+            gc_channel_id = await self._get_gc_channel_id(guild_id)
             if gc_channel_id:
                 gc_channel = self.bot.get_channel(gc_channel_id)
                 if gc_channel:

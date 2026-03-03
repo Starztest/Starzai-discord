@@ -363,6 +363,15 @@ class DatabaseManager:
                 PRIMARY KEY (user_id, guild_id)
             );
 
+            -- ── Dodo: Per-Guild Channel Config ────────────────────
+            CREATE TABLE IF NOT EXISTS dodo_config (
+                guild_id            INTEGER PRIMARY KEY,
+                tasks_channel_id    INTEGER,
+                gc_channel_id       INTEGER,
+                configured_by       TEXT,
+                configured_at       TEXT DEFAULT (datetime('now'))
+            );
+
             CREATE INDEX IF NOT EXISTS idx_conversations_user
                 ON conversations(user_id, active);
             CREATE INDEX IF NOT EXISTS idx_usage_logs_user
@@ -1330,3 +1339,38 @@ class DatabaseManager:
                 (guild_id,),
             )
         await self.db.commit()
+
+    # ══════════════════════════════════════════════════════════════════
+    #  Dodo — Per-Guild Channel Config
+    # ══════════════════════════════════════════════════════════════════
+
+    async def set_dodo_config(
+        self,
+        guild_id: int,
+        tasks_channel_id: Optional[int] = None,
+        gc_channel_id: Optional[int] = None,
+        configured_by: str = "",
+    ) -> None:
+        """Set or update the Dodo channel config for a guild (upsert)."""
+        # Build dynamic SET clause so we only overwrite columns the caller provided
+        await self.db.execute(
+            """INSERT INTO dodo_config (guild_id, tasks_channel_id, gc_channel_id, configured_by)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(guild_id) DO UPDATE SET
+                   tasks_channel_id = COALESCE(excluded.tasks_channel_id, dodo_config.tasks_channel_id),
+                   gc_channel_id    = COALESCE(excluded.gc_channel_id, dodo_config.gc_channel_id),
+                   configured_by    = excluded.configured_by,
+                   configured_at    = datetime('now')
+            """,
+            (guild_id, tasks_channel_id, gc_channel_id, configured_by),
+        )
+        await self.db.commit()
+
+    async def get_dodo_config(self, guild_id: int) -> Optional[Dict[str, Any]]:
+        """Get the Dodo channel config for a guild. Returns dict with tasks_channel_id and gc_channel_id, or None."""
+        async with self.db.execute(
+            "SELECT tasks_channel_id, gc_channel_id, configured_by, configured_at FROM dodo_config WHERE guild_id = ?",
+            (guild_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
