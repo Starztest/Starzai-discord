@@ -99,6 +99,24 @@ def _format_duration(td: timedelta) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  INTERACTION ERROR HELPERS
+# ══════════════════════════════════════════════════════════════════════
+
+_COG_MISSING_MSG = "Dodo module is reloading — try again in a moment."
+
+
+async def _safe_error_response(interaction: discord.Interaction, title: str, msg: str) -> None:
+    """Send an ephemeral error, handling both fresh and already-acked interactions."""
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(embed=Embedder.error(title, msg), ephemeral=True)
+        else:
+            await interaction.followup.send(embed=Embedder.error(title, msg), ephemeral=True)
+    except discord.HTTPException:
+        pass  # interaction expired, nothing we can do
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  PERSISTENT VIEWS & COMPONENTS
 # ══════════════════════════════════════════════════════════════════════
 
@@ -110,109 +128,138 @@ class TaskThreadView(discord.ui.View):
         super().__init__(timeout=None)
         self.bot = bot
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        logger.exception("TaskThreadView error on %s", getattr(item, "custom_id", item))
+        await _safe_error_response(interaction, "Something Went Wrong", "An unexpected error occurred. Please try again.")
+
     @discord.ui.button(
         label="Add Task", style=discord.ButtonStyle.green,
         emoji="➕", custom_id="dodo:add_task", row=0,
     )
     async def add_task_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
-        if not cog:
-            return
-        ok, msg = await cog._check_user_eligible(interaction)
-        if not ok:
-            await interaction.response.send_message(embed=Embedder.error("Not Eligible", msg), ephemeral=True)
-            return
-        await interaction.response.send_modal(AddTaskModal(self.bot))
+        try:
+            cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
+            if not cog:
+                await _safe_error_response(interaction, "Unavailable", _COG_MISSING_MSG)
+                return
+            ok, msg = await cog._check_user_eligible(interaction)
+            if not ok:
+                await interaction.response.send_message(embed=Embedder.error("Not Eligible", msg), ephemeral=True)
+                return
+            await interaction.response.send_modal(AddTaskModal(self.bot))
+        except Exception as exc:
+            logger.exception("add_task_btn failed: %s", exc)
+            await _safe_error_response(interaction, "Something Went Wrong", "Could not open the task form. Please try again.")
 
     @discord.ui.button(
         label="Check Task", style=discord.ButtonStyle.blurple,
         emoji="✅", custom_id="dodo:check_task", row=0,
     )
     async def check_task_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
-        if not cog:
-            return
-        ok, msg = await cog._check_user_eligible(interaction)
-        if not ok:
-            await interaction.response.send_message(embed=Embedder.error("Not Eligible", msg), ephemeral=True)
-            return
-        tasks = await cog._get_user_tasks(interaction.user.id, interaction.guild_id, completed=False)
-        if not tasks:
-            await interaction.response.send_message(
-                embed=Embedder.info("No Tasks", "You don't have any active tasks to check off."), ephemeral=True,
-            )
-            return
-        options = []
-        for t in tasks[:25]:
-            emoji = DODO_PRIORITY_EMOJIS.get(t["priority"], "⬜")
-            label = t["task_text"][:100]
-            options.append(discord.SelectOption(label=label, value=str(t["id"]), emoji=emoji))
-        view = discord.ui.View(timeout=60)
-        dropdown = CheckTaskDropdown(self.bot, options)
-        view.add_item(dropdown)
-        await interaction.response.send_message("Select a task to check off:", view=view, ephemeral=True)
+        try:
+            cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
+            if not cog:
+                await _safe_error_response(interaction, "Unavailable", _COG_MISSING_MSG)
+                return
+            ok, msg = await cog._check_user_eligible(interaction)
+            if not ok:
+                await interaction.response.send_message(embed=Embedder.error("Not Eligible", msg), ephemeral=True)
+                return
+            tasks = await cog._get_user_tasks(interaction.user.id, interaction.guild_id, completed=False)
+            if not tasks:
+                await interaction.response.send_message(
+                    embed=Embedder.info("No Tasks", "You don't have any active tasks to check off."), ephemeral=True,
+                )
+                return
+            options = []
+            for t in tasks[:25]:
+                emoji = DODO_PRIORITY_EMOJIS.get(t["priority"], "⬜")
+                label = t["task_text"][:100]
+                options.append(discord.SelectOption(label=label, value=str(t["id"]), emoji=emoji))
+            view = discord.ui.View(timeout=60)
+            dropdown = CheckTaskDropdown(self.bot, options)
+            view.add_item(dropdown)
+            await interaction.response.send_message("Select a task to check off:", view=view, ephemeral=True)
+        except Exception as exc:
+            logger.exception("check_task_btn failed: %s", exc)
+            await _safe_error_response(interaction, "Something Went Wrong", "Could not load tasks. Please try again.")
 
     @discord.ui.button(
         label="Delete Task", style=discord.ButtonStyle.red,
         emoji="🗑️", custom_id="dodo:delete_task", row=0,
     )
     async def delete_task_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
-        if not cog:
-            return
-        ok, msg = await cog._check_user_eligible(interaction)
-        if not ok:
-            await interaction.response.send_message(embed=Embedder.error("Not Eligible", msg), ephemeral=True)
-            return
-        tasks = await cog._get_user_tasks(interaction.user.id, interaction.guild_id, completed=False)
-        deletable = [t for t in tasks if t["priority"] != "yellow"]
-        if not deletable:
-            await interaction.response.send_message(
-                embed=Embedder.info("No Deletable Tasks", "No tasks available for deletion. Yellow tasks cannot be deleted."),
-                ephemeral=True,
-            )
-            return
-        options = []
-        for t in deletable[:25]:
-            emoji = DODO_PRIORITY_EMOJIS.get(t["priority"], "⬜")
-            label = t["task_text"][:100]
-            options.append(discord.SelectOption(label=label, value=str(t["id"]), emoji=emoji))
-        view = discord.ui.View(timeout=60)
-        dropdown = DeleteTaskDropdown(self.bot, options)
-        view.add_item(dropdown)
-        await interaction.response.send_message("Select a task to delete:", view=view, ephemeral=True)
+        try:
+            cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
+            if not cog:
+                await _safe_error_response(interaction, "Unavailable", _COG_MISSING_MSG)
+                return
+            ok, msg = await cog._check_user_eligible(interaction)
+            if not ok:
+                await interaction.response.send_message(embed=Embedder.error("Not Eligible", msg), ephemeral=True)
+                return
+            tasks = await cog._get_user_tasks(interaction.user.id, interaction.guild_id, completed=False)
+            deletable = [t for t in tasks if t["priority"] != "yellow"]
+            if not deletable:
+                await interaction.response.send_message(
+                    embed=Embedder.info("No Deletable Tasks", "No tasks available for deletion. Yellow tasks cannot be deleted."),
+                    ephemeral=True,
+                )
+                return
+            options = []
+            for t in deletable[:25]:
+                emoji = DODO_PRIORITY_EMOJIS.get(t["priority"], "⬜")
+                label = t["task_text"][:100]
+                options.append(discord.SelectOption(label=label, value=str(t["id"]), emoji=emoji))
+            view = discord.ui.View(timeout=60)
+            dropdown = DeleteTaskDropdown(self.bot, options)
+            view.add_item(dropdown)
+            await interaction.response.send_message("Select a task to delete:", view=view, ephemeral=True)
+        except Exception as exc:
+            logger.exception("delete_task_btn failed: %s", exc)
+            await _safe_error_response(interaction, "Something Went Wrong", "Could not load tasks. Please try again.")
 
     @discord.ui.button(
         label="Summon", style=discord.ButtonStyle.grey,
         emoji="📊", custom_id="dodo:summon", row=1,
     )
     async def summon_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
-        if not cog:
-            return
-        await interaction.response.defer(ephemeral=True)
-        img = await cog._generate_leaderboard_image(interaction.guild_id, "daily")
-        if img:
-            await interaction.followup.send(file=discord.File(img, "leaderboard.png"), ephemeral=True)
-        else:
-            embed = await cog._build_leaderboard_embed(interaction.guild_id, "daily")
-            await interaction.followup.send(embed=embed, ephemeral=True)
+        try:
+            cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
+            if not cog:
+                await _safe_error_response(interaction, "Unavailable", _COG_MISSING_MSG)
+                return
+            await interaction.response.defer(ephemeral=True)
+            img = await cog._generate_leaderboard_image(interaction.guild_id, "daily")
+            if img:
+                await interaction.followup.send(file=discord.File(img, "leaderboard.png"), ephemeral=True)
+            else:
+                embed = await cog._build_leaderboard_embed(interaction.guild_id, "daily")
+                await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as exc:
+            logger.exception("summon_btn failed: %s", exc)
+            await _safe_error_response(interaction, "Something Went Wrong", "Could not load leaderboard. Please try again.")
 
     @discord.ui.button(
         label="Profile", style=discord.ButtonStyle.grey,
         emoji="🦤", custom_id="dodo:profile", row=1,
     )
     async def profile_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
-        if not cog:
-            return
-        await interaction.response.defer(ephemeral=True)
-        img = await cog._generate_profile_card(interaction.user.id, interaction.guild_id)
-        if img:
-            await interaction.followup.send(file=discord.File(img, "profile.png"), ephemeral=True)
-        else:
-            embed = await cog._build_profile_embed(interaction.user.id, interaction.guild_id)
-            await interaction.followup.send(embed=embed, ephemeral=True)
+        try:
+            cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
+            if not cog:
+                await _safe_error_response(interaction, "Unavailable", _COG_MISSING_MSG)
+                return
+            await interaction.response.defer(ephemeral=True)
+            img = await cog._generate_profile_card(interaction.user.id, interaction.guild_id)
+            if img:
+                await interaction.followup.send(file=discord.File(img, "profile.png"), ephemeral=True)
+            else:
+                embed = await cog._build_profile_embed(interaction.user.id, interaction.guild_id)
+                await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as exc:
+            logger.exception("profile_btn failed: %s", exc)
+            await _safe_error_response(interaction, "Something Went Wrong", "Could not load profile. Please try again.")
 
     @discord.ui.button(
         label="Help", style=discord.ButtonStyle.grey,
@@ -257,61 +304,75 @@ class MVPPerkView(discord.ui.View):
         super().__init__(timeout=None)
         self.bot = bot
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        logger.exception("MVPPerkView error on %s", getattr(item, "custom_id", item))
+        await _safe_error_response(interaction, "Something Went Wrong", "An unexpected error occurred. Please try again.")
+
     @discord.ui.button(
         label="Use XP Boost", style=discord.ButtonStyle.green,
         emoji="⚡", custom_id="dodo:mvp_boost",
     )
     async def boost_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
-        if not cog:
-            return
-        success = await cog._use_mvp_boost(interaction.user.id)
-        if success:
-            await interaction.response.send_message(
-                embed=Embedder.success("XP Boost Activated! ⚡", "Your next completed task will earn **double XP**!"),
-            )
-        else:
-            await interaction.response.send_message(
-                embed=Embedder.error("Boost Unavailable", "You don't have a boost available or it has expired."),
-                ephemeral=True,
-            )
+        try:
+            cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
+            if not cog:
+                await _safe_error_response(interaction, "Unavailable", _COG_MISSING_MSG)
+                return
+            success = await cog._use_mvp_boost(interaction.user.id)
+            if success:
+                await interaction.response.send_message(
+                    embed=Embedder.success("XP Boost Activated! ⚡", "Your next completed task will earn **double XP**!"),
+                )
+            else:
+                await interaction.response.send_message(
+                    embed=Embedder.error("Boost Unavailable", "You don't have a boost available or it has expired."),
+                    ephemeral=True,
+                )
+        except Exception as exc:
+            logger.exception("boost_btn failed: %s", exc)
+            await _safe_error_response(interaction, "Something Went Wrong", "Could not activate boost. Please try again.")
 
     @discord.ui.button(
         label="Steal XP", style=discord.ButtonStyle.red,
         emoji="💀", custom_id="dodo:mvp_steal",
     )
     async def steal_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
-        if not cog:
-            return
-        # Check if steal is available
-        available = await cog._check_steal_available(interaction.user.id)
-        if not available:
-            await interaction.response.send_message(
-                embed=Embedder.error("Steal Unavailable", "You don't have a steal available or it has expired."),
-                ephemeral=True,
-            )
-            return
-        # Build target dropdown from active guild members
-        guild_id = await cog._get_user_guild(interaction.user.id)
-        if not guild_id:
-            await interaction.response.send_message(
-                embed=Embedder.error("Error", "Could not determine your server."), ephemeral=True,
-            )
-            return
-        targets = await cog._get_steal_targets(guild_id, interaction.user.id)
-        if not targets:
-            await interaction.response.send_message(
-                embed=Embedder.info("No Targets", "No eligible steal targets found."), ephemeral=True,
-            )
-            return
-        options = [
-            discord.SelectOption(label=name[:100], value=str(uid))
-            for uid, name in targets[:25]
-        ]
-        view = discord.ui.View(timeout=120)
-        view.add_item(StealTargetDropdown(self.bot, options))
-        await interaction.response.send_message("Select a target to steal from:", view=view, ephemeral=True)
+        try:
+            cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
+            if not cog:
+                await _safe_error_response(interaction, "Unavailable", _COG_MISSING_MSG)
+                return
+            # Check if steal is available
+            available = await cog._check_steal_available(interaction.user.id)
+            if not available:
+                await interaction.response.send_message(
+                    embed=Embedder.error("Steal Unavailable", "You don't have a steal available or it has expired."),
+                    ephemeral=True,
+                )
+                return
+            # Build target dropdown from active guild members
+            guild_id = await cog._get_user_guild(interaction.user.id)
+            if not guild_id:
+                await interaction.response.send_message(
+                    embed=Embedder.error("Error", "Could not determine your server."), ephemeral=True,
+                )
+                return
+            targets = await cog._get_steal_targets(guild_id, interaction.user.id)
+            if not targets:
+                await interaction.response.send_message(
+                    embed=Embedder.info("No Targets", "No eligible steal targets found."), ephemeral=True,
+                )
+                return
+            options = [
+                discord.SelectOption(label=name[:100], value=str(uid))
+                for uid, name in targets[:25]
+            ]
+            view = discord.ui.View(timeout=120)
+            view.add_item(StealTargetDropdown(self.bot, options))
+            await interaction.response.send_message("Select a target to steal from:", view=view, ephemeral=True)
+        except Exception as exc:
+            logger.exception("steal_btn failed: %s", exc)
+            await _safe_error_response(interaction, "Something Went Wrong", "Could not initiate steal. Please try again.")
 
 
 class ShieldView(discord.ui.View):
@@ -322,23 +383,32 @@ class ShieldView(discord.ui.View):
         self.bot = bot
         self.steal_log_id = steal_log_id
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        logger.exception("ShieldView error on %s", getattr(item, "custom_id", item))
+        await _safe_error_response(interaction, "Something Went Wrong", "An unexpected error occurred. Please try again.")
+
     @discord.ui.button(
         label="Use Shield 🛡️", style=discord.ButtonStyle.green,
         custom_id="dodo:use_shield",
     )
     async def use_shield_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
-        if not cog:
-            return
-        success = await cog._use_shield(interaction.user.id)
-        if success:
-            await interaction.response.send_message(
-                embed=Embedder.success("Shield Used! 🛡️", "The steal has been blocked! Your XP is safe."),
-            )
-        else:
-            await interaction.response.send_message(
-                embed=Embedder.error("No Shield", "You don't have a shield to use."), ephemeral=True,
-            )
+        try:
+            cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
+            if not cog:
+                await _safe_error_response(interaction, "Unavailable", _COG_MISSING_MSG)
+                return
+            success = await cog._use_shield(interaction.user.id)
+            if success:
+                await interaction.response.send_message(
+                    embed=Embedder.success("Shield Used! 🛡️", "The steal has been blocked! Your XP is safe."),
+                )
+            else:
+                await interaction.response.send_message(
+                    embed=Embedder.error("No Shield", "You don't have a shield to use."), ephemeral=True,
+                )
+        except Exception as exc:
+            logger.exception("use_shield_btn failed: %s", exc)
+            await _safe_error_response(interaction, "Something Went Wrong", "Could not use shield. Please try again.")
 
 
 
@@ -357,11 +427,16 @@ class CheckTaskDropdown(discord.ui.Select):
         self.bot = bot
 
     async def callback(self, interaction: discord.Interaction):
-        cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
-        if not cog:
-            return
-        task_id = int(self.values[0])
-        await cog._handle_check_task(interaction, task_id)
+        try:
+            cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
+            if not cog:
+                await _safe_error_response(interaction, "Unavailable", _COG_MISSING_MSG)
+                return
+            task_id = int(self.values[0])
+            await cog._handle_check_task(interaction, task_id)
+        except Exception as exc:
+            logger.exception("CheckTaskDropdown callback failed: %s", exc)
+            await _safe_error_response(interaction, "Something Went Wrong", "Could not check off task. Please try again.")
 
 
 class DeleteTaskDropdown(discord.ui.Select):
@@ -376,11 +451,16 @@ class DeleteTaskDropdown(discord.ui.Select):
         self.bot = bot
 
     async def callback(self, interaction: discord.Interaction):
-        cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
-        if not cog:
-            return
-        task_id = int(self.values[0])
-        await cog._handle_delete_task(interaction, task_id)
+        try:
+            cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
+            if not cog:
+                await _safe_error_response(interaction, "Unavailable", _COG_MISSING_MSG)
+                return
+            task_id = int(self.values[0])
+            await cog._handle_delete_task(interaction, task_id)
+        except Exception as exc:
+            logger.exception("DeleteTaskDropdown callback failed: %s", exc)
+            await _safe_error_response(interaction, "Something Went Wrong", "Could not delete task. Please try again.")
 
 
 class StealTargetDropdown(discord.ui.Select):
@@ -395,11 +475,16 @@ class StealTargetDropdown(discord.ui.Select):
         self.bot = bot
 
     async def callback(self, interaction: discord.Interaction):
-        cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
-        if not cog:
-            return
-        target_id = int(self.values[0])
-        await cog._handle_steal(interaction, target_id)
+        try:
+            cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
+            if not cog:
+                await _safe_error_response(interaction, "Unavailable", _COG_MISSING_MSG)
+                return
+            target_id = int(self.values[0])
+            await cog._handle_steal(interaction, target_id)
+        except Exception as exc:
+            logger.exception("StealTargetDropdown callback failed: %s", exc)
+            await _safe_error_response(interaction, "Something Went Wrong", "Could not execute steal. Please try again.")
 
 
 # ── Modal ────────────────────────────────────────────────────────────
@@ -435,7 +520,7 @@ class AddTaskModal(discord.ui.Modal, title="🦤 Add New Task"):
         style=discord.TextStyle.short,
     )
     reminders = discord.ui.TextInput(
-        label="Reminder intervals (optional, comma separated)",
+        label="Reminders (optional, comma-separated)",
         placeholder="e.g. 30m, 1h, 2h",
         required=False,
         max_length=100,
@@ -447,50 +532,59 @@ class AddTaskModal(discord.ui.Modal, title="🦤 Add New Task"):
         self.bot = bot
 
     async def on_submit(self, interaction: discord.Interaction):
-        cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
-        if not cog:
-            return
+        try:
+            cog: Optional[DodoCog] = self.bot.get_cog("Dodo")
+            if not cog:
+                await _safe_error_response(interaction, "Unavailable", _COG_MISSING_MSG)
+                return
 
-        # Parse priority
-        raw_p = self.priority.value.strip().lower()
-        priority_map = {"r": "red", "y": "yellow", "g": "green", "red": "red", "yellow": "yellow", "green": "green"}
-        priority = priority_map.get(raw_p)
-        if not priority:
-            await interaction.response.send_message(
-                embed=Embedder.error("Invalid Priority", "Use `r` (red), `y` (yellow), or `g` (green)."),
-                ephemeral=True,
+            # Parse priority
+            raw_p = self.priority.value.strip().lower()
+            priority_map = {"r": "red", "y": "yellow", "g": "green", "red": "red", "yellow": "yellow", "green": "green"}
+            priority = priority_map.get(raw_p)
+            if not priority:
+                await interaction.response.send_message(
+                    embed=Embedder.error("Invalid Priority", "Use `r` (red), `y` (yellow), or `g` (green)."),
+                    ephemeral=True,
+                )
+                return
+
+            # Parse timer
+            timer_td = _parse_timer(self.timer.value) if self.timer.value else None
+            if priority == "red" and not timer_td:
+                await interaction.response.send_message(
+                    embed=Embedder.error("Timer Required", "Red tasks require a timer (max 12 hours). Example: `2h`, `1h30m`"),
+                    ephemeral=True,
+                )
+                return
+            if timer_td and timer_td > timedelta(hours=DODO_RED_MAX_TIMER_HOURS):
+                await interaction.response.send_message(
+                    embed=Embedder.error("Timer Too Long", f"Maximum timer is {DODO_RED_MAX_TIMER_HOURS} hours."),
+                    ephemeral=True,
+                )
+                return
+
+            # Parse hidden
+            is_hidden = self.hide_task.value.strip().lower() in ("y", "yes", "true", "1")
+
+            # Parse reminders
+            remind_intervals = _parse_remind_intervals(self.reminders.value) if self.reminders.value else []
+
+            await cog._handle_add_task(
+                interaction=interaction,
+                task_text=self.task_name.value.strip(),
+                priority=priority,
+                timer_td=timer_td,
+                is_hidden=is_hidden,
+                remind_intervals=remind_intervals,
             )
-            return
+        except Exception as exc:
+            logger.exception("AddTaskModal on_submit failed: %s", exc)
+            await _safe_error_response(interaction, "Something Went Wrong", "Could not add your task. Please try again.")
 
-        # Parse timer
-        timer_td = _parse_timer(self.timer.value) if self.timer.value else None
-        if priority == "red" and not timer_td:
-            await interaction.response.send_message(
-                embed=Embedder.error("Timer Required", "Red tasks require a timer (max 12 hours). Example: `2h`, `1h30m`"),
-                ephemeral=True,
-            )
-            return
-        if timer_td and timer_td > timedelta(hours=DODO_RED_MAX_TIMER_HOURS):
-            await interaction.response.send_message(
-                embed=Embedder.error("Timer Too Long", f"Maximum timer is {DODO_RED_MAX_TIMER_HOURS} hours."),
-                ephemeral=True,
-            )
-            return
-
-        # Parse hidden
-        is_hidden = self.hide_task.value.strip().lower() in ("y", "yes", "true", "1")
-
-        # Parse reminders
-        remind_intervals = _parse_remind_intervals(self.reminders.value) if self.reminders.value else []
-
-        await cog._handle_add_task(
-            interaction=interaction,
-            task_text=self.task_name.value.strip(),
-            priority=priority,
-            timer_td=timer_td,
-            is_hidden=is_hidden,
-            remind_intervals=remind_intervals,
-        )
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        logger.exception("AddTaskModal error: %s", error)
+        await _safe_error_response(interaction, "Something Went Wrong", "An unexpected error occurred. Please try again.")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -504,10 +598,34 @@ class DodoCog(commands.Cog, name="Dodo"):
     def __init__(self, bot: StarzaiBot):
         self.bot = bot
         self._boost_cache: dict[int, bool] = {}  # user_id -> has active boost
+        self._dodo_config_cache: dict[int, dict] = {}  # guild_id -> {tasks_channel_id, gc_channel_id}
         self.check_expirations.start()
 
     def cog_unload(self):
         self.check_expirations.cancel()
+
+    # ── Channel config helpers (DB → env var fallback) ───────────────
+
+    async def _get_dodo_config(self, guild_id: int) -> dict:
+        """Fetch Dodo channel config for a guild. Checks cache → DB → env var fallback."""
+        if guild_id in self._dodo_config_cache:
+            return self._dodo_config_cache[guild_id]
+
+        row = await self.bot.database.get_dodo_config(guild_id)
+        config = {
+            "tasks_channel_id": (row["tasks_channel_id"] if row and row["tasks_channel_id"] else None)
+                                or self.bot.settings.dodo_tasks_channel_id,
+            "gc_channel_id":    (row["gc_channel_id"] if row and row["gc_channel_id"] else None)
+                                or self.bot.settings.dodo_gc_channel_id,
+        }
+        self._dodo_config_cache[guild_id] = config
+        return config
+
+    async def _get_tasks_channel_id(self, guild_id: int) -> Optional[int]:
+        return (await self._get_dodo_config(guild_id))["tasks_channel_id"]
+
+    async def _get_gc_channel_id(self, guild_id: int) -> Optional[int]:
+        return (await self._get_dodo_config(guild_id))["gc_channel_id"]
 
     # ── /dodo entry point ────────────────────────────────────────────
 
@@ -562,6 +680,73 @@ class DodoCog(commands.Cog, name="Dodo"):
         else:
             embed = await self._build_profile_embed(target.id, interaction.guild_id)
             await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @dodo_group.command(name="setchannel", description="Set the Dodo tasks and/or announcements channel")
+    @app_commands.describe(
+        tasks_channel="Channel where task threads will be created",
+        gc_channel="Channel for public callouts and announcements",
+    )
+    async def setchannel_cmd(
+        self,
+        interaction: discord.Interaction,
+        tasks_channel: Optional[discord.TextChannel] = None,
+        gc_channel: Optional[discord.TextChannel] = None,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                embed=Embedder.error("Server Only", "Dodo can only be used in a server."), ephemeral=True,
+            )
+            return
+
+        guild_id = interaction.guild_id
+
+        # If no args, show current config
+        if tasks_channel is None and gc_channel is None:
+            config = await self._get_dodo_config(guild_id)
+            lines = []
+            if config["tasks_channel_id"]:
+                lines.append(f"📋 Tasks channel: <#{config['tasks_channel_id']}>")
+            else:
+                lines.append("📋 Tasks channel: *not set*")
+            if config["gc_channel_id"]:
+                lines.append(f"📢 Announcements channel: <#{config['gc_channel_id']}>")
+            else:
+                lines.append("📢 Announcements channel: *not set*")
+            lines.append("")
+            lines.append("Use `/dodo setchannel tasks_channel:#channel gc_channel:#channel` to configure.")
+            embed = discord.Embed(
+                title="🦤 Dodo Channel Config",
+                description="\n".join(lines),
+                color=BOT_COLOR,
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        # Save to DB
+        await self.bot.database.set_dodo_config(
+            guild_id=guild_id,
+            tasks_channel_id=tasks_channel.id if tasks_channel else None,
+            gc_channel_id=gc_channel.id if gc_channel else None,
+            configured_by=str(interaction.user.id),
+        )
+
+        # Invalidate cache
+        self._dodo_config_cache.pop(guild_id, None)
+
+        # Build confirmation
+        parts = []
+        if tasks_channel:
+            parts.append(f"📋 Tasks → {tasks_channel.mention}")
+        if gc_channel:
+            parts.append(f"📢 Announcements → {gc_channel.mention}")
+
+        embed = discord.Embed(
+            title="✅ Dodo Channels Updated!",
+            description="\n".join(parts),
+            color=BOT_SUCCESS_COLOR,
+        )
+        embed.set_footer(text="Run /dodo setchannel with no args to see current config")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ── Eligibility Check ────────────────────────────────────────────
 
@@ -661,7 +846,7 @@ class DodoCog(commands.Cog, name="Dodo"):
             row = await cur.fetchone()
 
         # Try to use the configured channel, fall back to current channel
-        channel_id = self.bot.settings.dodo_tasks_channel_id
+        channel_id = await self._get_tasks_channel_id(guild_id)
         channel = None
         if channel_id:
             channel = self.bot.get_channel(channel_id)
@@ -1130,7 +1315,7 @@ class DodoCog(commands.Cog, name="Dodo"):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
         # Public callout in GC
-        gc_channel_id = self.bot.settings.dodo_gc_channel_id
+        gc_channel_id = await self._get_gc_channel_id(guild_id)
         if gc_channel_id:
             gc_channel = self.bot.get_channel(gc_channel_id)
             if gc_channel:
@@ -1229,7 +1414,7 @@ class DodoCog(commands.Cog, name="Dodo"):
                                 pass
 
                 # Announce in GC
-                gc_channel_id = self.bot.settings.dodo_gc_channel_id
+                gc_channel_id = await self._get_gc_channel_id(guild_id)
                 if gc_channel_id:
                     gc_channel = self.bot.get_channel(gc_channel_id)
                     if gc_channel:
@@ -1297,7 +1482,7 @@ class DodoCog(commands.Cog, name="Dodo"):
                                 pass
 
                 # Announce in GC
-                gc_channel_id = self.bot.settings.dodo_gc_channel_id
+                gc_channel_id = await self._get_gc_channel_id(guild_id)
                 if gc_channel_id:
                     gc_channel = self.bot.get_channel(gc_channel_id)
                     if gc_channel:
@@ -1341,7 +1526,7 @@ class DodoCog(commands.Cog, name="Dodo"):
 
     async def _announce_streak_milestone(self, user_id: int, guild_id: int, streak: int) -> None:
         """Announce a streak milestone publicly."""
-        gc_channel_id = self.bot.settings.dodo_gc_channel_id
+        gc_channel_id = await self._get_gc_channel_id(guild_id)
         if not gc_channel_id:
             return
         gc_channel = self.bot.get_channel(gc_channel_id)
@@ -1513,7 +1698,7 @@ class DodoCog(commands.Cog, name="Dodo"):
         )
 
         # Public announcement
-        gc_channel_id = self.bot.settings.dodo_gc_channel_id
+        gc_channel_id = await self._get_gc_channel_id(guild_id)
         if gc_channel_id:
             gc_channel = self.bot.get_channel(gc_channel_id)
             if gc_channel:
@@ -1590,7 +1775,7 @@ class DodoCog(commands.Cog, name="Dodo"):
 
         # Public announcement
         if steal:
-            gc_channel_id = self.bot.settings.dodo_gc_channel_id
+            gc_channel_id = await self._get_gc_channel_id(steal["guild_id"])
             if gc_channel_id:
                 gc_channel = self.bot.get_channel(gc_channel_id)
                 if gc_channel:
@@ -1655,7 +1840,7 @@ class DodoCog(commands.Cog, name="Dodo"):
 
         if is_active:
             # Public ping in GC
-            gc_channel_id = self.bot.settings.dodo_gc_channel_id
+            gc_channel_id = await self._get_gc_channel_id(guild_id)
             if gc_channel_id:
                 gc_channel = self.bot.get_channel(gc_channel_id)
                 if gc_channel:
