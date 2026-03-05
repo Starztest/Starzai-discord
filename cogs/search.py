@@ -585,6 +585,8 @@ class SearchCog(commands.Cog, name="Search"):
     @tasks.loop(minutes=AUTO_NEWS_CHECK_INTERVAL)
     async def auto_news_task(self) -> None:
         """Periodic task that sends news to configured channels."""
+        if not self.bot.database.is_ready:
+            return
         try:
             configs = await self.bot.database.get_all_active_news_channels()
             if not configs:

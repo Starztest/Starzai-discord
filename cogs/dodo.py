@@ -138,6 +138,16 @@ class TaskThreadView(discord.ui.View):
         super().__init__(timeout=None)
         self.bot = bot
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Block all button presses while the database is unavailable."""
+        if not self.bot.database.is_ready:
+            await _safe_error_response(
+                interaction, "Database Unavailable",
+                "The database connection is being established. Please try again in a moment.",
+            )
+            return False
+        return True
+
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
         logger.exception("TaskThreadView error on %s", getattr(item, "custom_id", item))
         await _safe_error_response(interaction, "Something Went Wrong", "An unexpected error occurred. Please try again.")
@@ -350,6 +360,15 @@ class MVPPerkView(discord.ui.View):
         super().__init__(timeout=None)
         self.bot = bot
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not self.bot.database.is_ready:
+            await _safe_error_response(
+                interaction, "Database Unavailable",
+                "The database connection is being established. Please try again in a moment.",
+            )
+            return False
+        return True
+
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
         logger.exception("MVPPerkView error on %s", getattr(item, "custom_id", item))
         await _safe_error_response(interaction, "Something Went Wrong", "An unexpected error occurred. Please try again.")
@@ -428,6 +447,15 @@ class ShieldView(discord.ui.View):
         super().__init__(timeout=None)
         self.bot = bot
         self.steal_log_id = steal_log_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not self.bot.database.is_ready:
+            await _safe_error_response(
+                interaction, "Database Unavailable",
+                "The database connection is being established. Please try again in a moment.",
+            )
+            return False
+        return True
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
         logger.exception("ShieldView error on %s", getattr(item, "custom_id", item))
@@ -1996,6 +2024,8 @@ class DodoCog(commands.Cog, name="Dodo"):
     @tasks.loop(minutes=1)
     async def check_expirations(self):
         """Background task: red task expiry, reminders, MVP, strike reset."""
+        if not self.bot.database.is_ready:
+            return
         try:
             pool = self.bot.database.pool
             now = _now()
