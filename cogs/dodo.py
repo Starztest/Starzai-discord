@@ -828,80 +828,75 @@ class DodoCog(commands.Cog, name="Dodo"):
     # ── Database Helpers ─────────────────────────────────────────────
 
     async def _ensure_dodo_user(self, user_id: int, guild_id: int) -> None:
-        db = self.bot.database.db
-        await db.execute(
-            "INSERT OR IGNORE INTO dodo_users (user_id, guild_id) VALUES (?, ?)",
-            (user_id, guild_id),
+        pool = self.bot.database.pool
+        await pool.execute(
+            "INSERT INTO dodo_users (user_id, guild_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            user_id, guild_id,
         )
-        await db.commit()
 
     async def _get_dodo_user(self, user_id: int, guild_id: int) -> Optional[Dict[str, Any]]:
-        db = self.bot.database.db
-        async with db.execute(
-            "SELECT * FROM dodo_users WHERE user_id = ? AND guild_id = ?",
-            (user_id, guild_id),
-        ) as cur:
-            row = await cur.fetchone()
-            return dict(row) if row else None
+        pool = self.bot.database.pool
+        row = await pool.fetchrow(
+            "SELECT * FROM dodo_users WHERE user_id = $1 AND guild_id = $2",
+            user_id, guild_id,
+        )
+        return dict(row) if row else None
 
     async def _get_user_tasks(
         self, user_id: int, guild_id: int, completed: Optional[bool] = None
     ) -> List[Dict[str, Any]]:
-        db = self.bot.database.db
-        query = "SELECT * FROM dodo_tasks WHERE user_id = ? AND guild_id = ? AND is_expired = 0"
-        params: list = [user_id, guild_id]
+        pool = self.bot.database.pool
         if completed is not None:
-            query += " AND is_completed = ?"
-            params.append(int(completed))
-        query += " ORDER BY created_at DESC"
-        async with db.execute(query, params) as cur:
-            rows = await cur.fetchall()
-            return [dict(r) for r in rows]
+            rows = await pool.fetch(
+                "SELECT * FROM dodo_tasks WHERE user_id = $1 AND guild_id = $2 AND is_expired = 0 AND is_completed = $3 ORDER BY created_at DESC",
+                user_id, guild_id, int(completed),
+            )
+        else:
+            rows = await pool.fetch(
+                "SELECT * FROM dodo_tasks WHERE user_id = $1 AND guild_id = $2 AND is_expired = 0 ORDER BY created_at DESC",
+                user_id, guild_id,
+            )
+        return [dict(r) for r in rows]
 
     async def _get_task_by_id(self, task_id: int) -> Optional[Dict[str, Any]]:
-        db = self.bot.database.db
-        async with db.execute("SELECT * FROM dodo_tasks WHERE id = ?", (task_id,)) as cur:
-            row = await cur.fetchone()
-            return dict(row) if row else None
+        pool = self.bot.database.pool
+        row = await pool.fetchrow("SELECT * FROM dodo_tasks WHERE id = $1", task_id)
+        return dict(row) if row else None
 
     async def _get_thread_owner(self, thread_id: int, guild_id: int) -> Optional[int]:
         """Look up the user_id that owns a given dodo thread."""
-        db = self.bot.database.db
-        async with db.execute(
-            "SELECT user_id FROM dodo_threads WHERE thread_id = ? AND guild_id = ?",
-            (thread_id, guild_id),
-        ) as cur:
-            row = await cur.fetchone()
-            return row["user_id"] if row else None
+        pool = self.bot.database.pool
+        row = await pool.fetchrow(
+            "SELECT user_id FROM dodo_threads WHERE thread_id = $1 AND guild_id = $2",
+            thread_id, guild_id,
+        )
+        return row["user_id"] if row else None
 
     async def _count_active_by_priority(self, user_id: int, guild_id: int, priority: str) -> int:
-        db = self.bot.database.db
-        async with db.execute(
-            "SELECT COUNT(*) as cnt FROM dodo_tasks WHERE user_id = ? AND guild_id = ? AND priority = ? AND is_completed = 0 AND is_expired = 0",
-            (user_id, guild_id, priority),
-        ) as cur:
-            row = await cur.fetchone()
-            return row["cnt"] if row else 0
+        pool = self.bot.database.pool
+        row = await pool.fetchrow(
+            "SELECT COUNT(*) as cnt FROM dodo_tasks WHERE user_id = $1 AND guild_id = $2 AND priority = $3 AND is_completed = 0 AND is_expired = 0",
+            user_id, guild_id, priority,
+        )
+        return row["cnt"] if row else 0
 
     async def _count_completed_today(self, user_id: int, guild_id: int) -> int:
-        db = self.bot.database.db
+        pool = self.bot.database.pool
         today = _today()
-        async with db.execute(
-            "SELECT COUNT(*) as cnt FROM dodo_tasks WHERE user_id = ? AND guild_id = ? AND is_completed = 1 AND date(completed_at) = ?",
-            (user_id, guild_id, today),
-        ) as cur:
-            row = await cur.fetchone()
-            return row["cnt"] if row else 0
+        row = await pool.fetchrow(
+            "SELECT COUNT(*) as cnt FROM dodo_tasks WHERE user_id = $1 AND guild_id = $2 AND is_completed = 1 AND CAST(completed_at AS DATE) = CAST($3 AS DATE)",
+            user_id, guild_id, today,
+        )
+        return row["cnt"] if row else 0
 
     async def _get_strike_count(self, user_id: int, guild_id: int) -> int:
-        db = self.bot.database.db
+        pool = self.bot.database.pool
         today = _today()
-        async with db.execute(
-            "SELECT strike_count FROM dodo_strikes WHERE user_id = ? AND guild_id = ? AND strike_date = ?",
-            (user_id, guild_id, today),
-        ) as cur:
-            row = await cur.fetchone()
-            return row["strike_count"] if row else 0
+        row = await pool.fetchrow(
+            "SELECT strike_count FROM dodo_strikes WHERE user_id = $1 AND guild_id = $2 AND strike_date = $3",
+            user_id, guild_id, today,
+        )
+        return row["strike_count"] if row else 0
 
 
     # ── Thread & Embed System ────────────────────────────────────────
@@ -910,16 +905,15 @@ class DodoCog(commands.Cog, name="Dodo"):
         self, interaction: discord.Interaction
     ) -> Tuple[discord.Thread, discord.Message]:
         """Get or create a thread for the user in the dodo-tasks channel."""
-        db = self.bot.database.db
+        pool = self.bot.database.pool
         guild_id = interaction.guild_id
         user_id = interaction.user.id
 
         # Check for existing thread record
-        async with db.execute(
-            "SELECT thread_id, message_id FROM dodo_threads WHERE user_id = ? AND guild_id = ?",
-            (user_id, guild_id),
-        ) as cur:
-            row = await cur.fetchone()
+        row = await pool.fetchrow(
+            "SELECT thread_id, message_id FROM dodo_threads WHERE user_id = $1 AND guild_id = $2",
+            user_id, guild_id,
+        )
 
         # Try to use the configured channel, fall back to current channel
         channel_id = await self._get_tasks_channel_id(guild_id)
@@ -954,11 +948,10 @@ class DodoCog(commands.Cog, name="Dodo"):
                         # Message deleted, create new one
                         view = TaskThreadView(self.bot)
                         message = await thread.send(embed=discord.Embed(title="Loading..."), view=view)
-                        await db.execute(
-                            "UPDATE dodo_threads SET message_id = ? WHERE user_id = ? AND guild_id = ?",
-                            (message.id, user_id, guild_id),
+                        await pool.execute(
+                            "UPDATE dodo_threads SET message_id = $1 WHERE user_id = $2 AND guild_id = $3",
+                            message.id, user_id, guild_id,
                         )
-                        await db.commit()
                         return thread, message
             except (discord.NotFound, discord.Forbidden):
                 pass  # Thread gone, create new
@@ -976,11 +969,11 @@ class DodoCog(commands.Cog, name="Dodo"):
         message = await thread.send(embed=embed, view=view)
 
         # Store thread info
-        await db.execute(
-            "INSERT OR REPLACE INTO dodo_threads (user_id, guild_id, thread_id, message_id) VALUES (?, ?, ?, ?)",
-            (user_id, guild_id, thread.id, message.id),
+        await pool.execute(
+            """INSERT INTO dodo_threads (user_id, guild_id, thread_id, message_id) VALUES ($1, $2, $3, $4)
+               ON CONFLICT (user_id, guild_id) DO UPDATE SET thread_id = EXCLUDED.thread_id, message_id = EXCLUDED.message_id""",
+            user_id, guild_id, thread.id, message.id,
         )
-        await db.commit()
         return thread, message
 
     async def _update_thread_embed(
@@ -1055,13 +1048,12 @@ class DodoCog(commands.Cog, name="Dodo"):
             logger.warning("Failed to update thread embed: %s", e)
 
     async def _get_user_rank(self, user_id: int, guild_id: int) -> int:
-        db = self.bot.database.db
-        async with db.execute(
-            "SELECT COUNT(*) + 1 as rank FROM dodo_users WHERE guild_id = ? AND xp > (SELECT COALESCE(xp, 0) FROM dodo_users WHERE user_id = ? AND guild_id = ?)",
-            (guild_id, user_id, guild_id),
-        ) as cur:
-            row = await cur.fetchone()
-            return row["rank"] if row else 1
+        pool = self.bot.database.pool
+        row = await pool.fetchrow(
+            "SELECT COUNT(*) + 1 as rank FROM dodo_users WHERE guild_id = $1 AND xp > (SELECT COALESCE(xp, 0) FROM dodo_users WHERE user_id = $2 AND guild_id = $3)",
+            guild_id, user_id, guild_id,
+        )
+        return row["rank"] if row else 1
 
     async def _get_check_permissions(self, user_id: int, guild_id: int) -> Tuple[int, Optional[timedelta]]:
         """Return (available_checks, time_until_next_unlock).
@@ -1071,51 +1063,48 @@ class DodoCog(commands.Cog, name="Dodo"):
         - After 5 min, if the task still exists (not deleted/expired early), one check permission unlocks.
         - available = unlocked - checks_used_in_last_24h
         """
-        db = self.bot.database.db
+        pool = self.bot.database.pool
         now = _now()
         cutoff = _sql_dt(now - timedelta(minutes=DODO_COOLDOWN_MINUTES))
         day_ago = _sql_dt(now - timedelta(hours=24))
 
         # Unlocked: tasks created >= 5 min ago that still exist in DB and weren't expired early
-        async with db.execute(
+        row = await pool.fetchrow(
             """SELECT COUNT(*) as cnt FROM dodo_tasks
-               WHERE user_id = ? AND guild_id = ? AND created_at <= ?
-               AND NOT (is_expired = 1 AND timer_expires IS NOT NULL AND timer_expires < ?)""",
-            (user_id, guild_id, cutoff, cutoff),
-        ) as cur:
-            row = await cur.fetchone()
-            unlocked = row["cnt"] if row else 0
+               WHERE user_id = $1 AND guild_id = $2 AND created_at <= $3
+               AND NOT (is_expired = 1 AND timer_expires IS NOT NULL AND timer_expires < $4)""",
+            user_id, guild_id, cutoff, cutoff,
+        )
+        unlocked = row["cnt"] if row else 0
 
         # Used: tasks checked in the last 24 hours
-        async with db.execute(
+        row = await pool.fetchrow(
             """SELECT COUNT(*) as cnt FROM dodo_tasks
-               WHERE user_id = ? AND guild_id = ? AND is_completed = 1 AND completed_at >= ?""",
-            (user_id, guild_id, day_ago),
-        ) as cur:
-            row = await cur.fetchone()
-            used = row["cnt"] if row else 0
+               WHERE user_id = $1 AND guild_id = $2 AND is_completed = 1 AND completed_at >= $3""",
+            user_id, guild_id, day_ago,
+        )
+        used = row["cnt"] if row else 0
 
         available = max(0, unlocked - used)
 
         # Time until next unlock: earliest task created < 5 min ago
         next_unlock: Optional[timedelta] = None
         if available == 0:
-            async with db.execute(
+            row = await pool.fetchrow(
                 """SELECT MIN(created_at) as earliest FROM dodo_tasks
-                   WHERE user_id = ? AND guild_id = ? AND created_at > ?
+                   WHERE user_id = $1 AND guild_id = $2 AND created_at > $3
                    AND is_expired = 0""",
-                (user_id, guild_id, cutoff),
-            ) as cur:
-                row = await cur.fetchone()
-                if row and row["earliest"]:
-                    try:
-                        earliest = datetime.fromisoformat(row["earliest"]).replace(tzinfo=timezone.utc)
-                        unlock_at = earliest + timedelta(minutes=DODO_COOLDOWN_MINUTES)
-                        remaining = unlock_at - now
-                        if remaining.total_seconds() > 0:
-                            next_unlock = remaining
-                    except (ValueError, TypeError):
-                        pass
+                user_id, guild_id, cutoff,
+            )
+            if row and row["earliest"]:
+                try:
+                    earliest = datetime.fromisoformat(row["earliest"]).replace(tzinfo=timezone.utc)
+                    unlock_at = earliest + timedelta(minutes=DODO_COOLDOWN_MINUTES)
+                    remaining = unlock_at - now
+                    if remaining.total_seconds() > 0:
+                        next_unlock = remaining
+                except (ValueError, TypeError):
+                    pass
 
         return available, next_unlock
 
@@ -1164,19 +1153,16 @@ class DodoCog(commands.Cog, name="Dodo"):
             if first_td:
                 next_remind = _sql_dt(now + first_td)
 
-        db = self.bot.database.db
-        await db.execute(
+        pool = self.bot.database.pool
+        await pool.execute(
             """INSERT INTO dodo_tasks
                 (user_id, guild_id, task_text, priority, is_hidden,
                  timer_expires, remind_enabled, remind_intervals, next_remind_at, remind_character)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                user_id, guild_id, task_text, priority, int(is_hidden),
-                timer_expires, int(remind_enabled), json.dumps(remind_intervals), next_remind,
-                remind_character,
-            ),
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)""",
+            user_id, guild_id, task_text, priority, int(is_hidden),
+            timer_expires, int(remind_enabled), json.dumps(remind_intervals), next_remind,
+            remind_character,
         )
-        await db.commit()
 
         emoji = DODO_PRIORITY_EMOJIS[priority]
         desc_parts = [
@@ -1239,13 +1225,12 @@ class DodoCog(commands.Cog, name="Dodo"):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        db = self.bot.database.db
+        pool = self.bot.database.pool
         now = _now()
-        await db.execute(
-            "UPDATE dodo_tasks SET is_completed = 1, completed_at = ? WHERE id = ?",
-            (_sql_dt(now), task_id),
+        await pool.execute(
+            "UPDATE dodo_tasks SET is_completed = 1, completed_at = $1 WHERE id = $2",
+            _sql_dt(now), task_id,
         )
-        await db.commit()
 
         # Grant XP
         xp_earned = await self._grant_xp(user_id, guild_id, task["priority"])
@@ -1292,9 +1277,8 @@ class DodoCog(commands.Cog, name="Dodo"):
             )
             return
 
-        db = self.bot.database.db
-        await db.execute("DELETE FROM dodo_tasks WHERE id = ?", (task_id,))
-        await db.commit()
+        pool = self.bot.database.pool
+        await pool.execute("DELETE FROM dodo_tasks WHERE id = $1", task_id)
 
         await interaction.response.send_message(
             embed=Embedder.success("Task Deleted 🗑️", f"**{task['task_text']}** has been removed."),
@@ -1304,12 +1288,11 @@ class DodoCog(commands.Cog, name="Dodo"):
 
     async def _refresh_user_embed(self, user_id: int, guild_id: int) -> None:
         """Refresh the user's thread embed."""
-        db = self.bot.database.db
-        async with db.execute(
-            "SELECT thread_id, message_id FROM dodo_threads WHERE user_id = ? AND guild_id = ?",
-            (user_id, guild_id),
-        ) as cur:
-            row = await cur.fetchone()
+        pool = self.bot.database.pool
+        row = await pool.fetchrow(
+            "SELECT thread_id, message_id FROM dodo_threads WHERE user_id = $1 AND guild_id = $2",
+            user_id, guild_id,
+        )
 
         if not row:
             return
@@ -1357,28 +1340,26 @@ class DodoCog(commands.Cog, name="Dodo"):
             xp *= 2
             self._boost_cache.pop(user_id, None)
             # Mark boost as used in DB
-            db = self.bot.database.db
-            await db.execute(
-                "UPDATE dodo_mvp SET boost_used = 1 WHERE user_id = ? AND boost_available = 1 AND boost_used = 0",
-                (user_id,),
+            pool = self.bot.database.pool
+            await pool.execute(
+                "UPDATE dodo_mvp SET boost_used = 1 WHERE user_id = $1 AND boost_available = 1 AND boost_used = 0",
+                user_id,
             )
-            await db.commit()
 
         if half_xp:
             xp = xp // 2
 
         # Apply XP
-        db = self.bot.database.db
-        await db.execute(
-            "UPDATE dodo_users SET xp = xp + ? WHERE user_id = ? AND guild_id = ?",
-            (xp, user_id, guild_id),
+        pool = self.bot.database.pool
+        await pool.execute(
+            "UPDATE dodo_users SET xp = xp + $1 WHERE user_id = $2 AND guild_id = $3",
+            xp, user_id, guild_id,
         )
-        await db.commit()
         return xp
 
     async def _update_streak(self, user_id: int, guild_id: int) -> None:
         """Update streak on task completion."""
-        db = self.bot.database.db
+        pool = self.bot.database.pool
         user_data = await self._get_dodo_user(user_id, guild_id)
         if not user_data:
             return
@@ -1408,28 +1389,26 @@ class DodoCog(commands.Cog, name="Dodo"):
         else:
             new_streak = 1
 
-        await db.execute(
-            "UPDATE dodo_users SET streak = ?, last_active = ? WHERE user_id = ? AND guild_id = ?",
-            (new_streak, today, user_id, guild_id),
+        await pool.execute(
+            "UPDATE dodo_users SET streak = $1, last_active = $2 WHERE user_id = $3 AND guild_id = $4",
+            new_streak, today, user_id, guild_id,
         )
-        await db.commit()
 
     async def _apply_strike(self, interaction: discord.Interaction, task: Dict[str, Any]) -> None:
         """Apply a strike for anti-abuse violations."""
         user_id = interaction.user.id
         guild_id = interaction.guild_id
-        db = self.bot.database.db
+        pool = self.bot.database.pool
         today = _today()
 
         # Increment strike
-        await db.execute(
+        await pool.execute(
             """INSERT INTO dodo_strikes (user_id, guild_id, strike_date, strike_count)
-               VALUES (?, ?, ?, 1)
+               VALUES ($1, $2, $3, 1)
                ON CONFLICT(user_id, guild_id, strike_date)
-               DO UPDATE SET strike_count = strike_count + 1""",
-            (user_id, guild_id, today),
+               DO UPDATE SET strike_count = dodo_strikes.strike_count + 1""",
+            user_id, guild_id, today,
         )
-        await db.commit()
 
         strike_count = await self._get_strike_count(user_id, guild_id)
 
@@ -1471,15 +1450,14 @@ class DodoCog(commands.Cog, name="Dodo"):
         """Calculate daily MVP score: (tasks_completed_today * 10) + xp_earned_today."""
         completed = await self._count_completed_today(user_id, guild_id)
         # XP earned today = sum of XP from tasks completed today
-        db = self.bot.database.db
+        pool = self.bot.database.pool
         today = _today()
-        async with db.execute(
+        row = await pool.fetchrow(
             """SELECT COUNT(*) as cnt FROM dodo_tasks
-               WHERE user_id = ? AND guild_id = ? AND is_completed = 1 AND date(completed_at) = ?""",
-            (user_id, guild_id, today),
-        ) as cur:
-            row = await cur.fetchone()
-            tasks_done = row["cnt"] if row else 0
+               WHERE user_id = $1 AND guild_id = $2 AND is_completed = 1 AND CAST(completed_at AS DATE) = CAST($3 AS DATE)""",
+            user_id, guild_id, today,
+        )
+        tasks_done = row["cnt"] if row else 0
         # Approximate XP earned today
         user_data = await self._get_dodo_user(user_id, guild_id)
         xp = user_data["xp"] if user_data else 0
@@ -1487,26 +1465,25 @@ class DodoCog(commands.Cog, name="Dodo"):
 
     async def _announce_daily_mvp(self) -> None:
         """Announce the daily MVP for each guild."""
-        db = self.bot.database.db
+        pool = self.bot.database.pool
         today = _today()
 
         # Get all guilds with active dodo users
-        async with db.execute("SELECT DISTINCT guild_id FROM dodo_users") as cur:
-            guilds = [row["guild_id"] for row in await cur.fetchall()]
+        rows = await pool.fetch("SELECT DISTINCT guild_id FROM dodo_users")
+        guilds = [row["guild_id"] for row in rows]
 
         for guild_id in guilds:
             try:
                 # Find user with highest score today
-                async with db.execute(
+                row = await pool.fetchrow(
                     """SELECT user_id, COUNT(*) as tasks_done
                        FROM dodo_tasks
-                       WHERE guild_id = ? AND is_completed = 1 AND date(completed_at) = ?
+                       WHERE guild_id = $1 AND is_completed = 1 AND CAST(completed_at AS DATE) = CAST($2 AS DATE)
                        GROUP BY user_id
                        ORDER BY tasks_done DESC
                        LIMIT 1""",
-                    (guild_id, today),
-                ) as cur:
-                    row = await cur.fetchone()
+                    guild_id, today,
+                )
 
                 if not row:
                     continue
@@ -1515,18 +1492,17 @@ class DodoCog(commands.Cog, name="Dodo"):
                 score = row["tasks_done"]
 
                 # Record MVP
-                await db.execute(
+                await pool.execute(
                     """INSERT INTO dodo_mvp (guild_id, user_id, mvp_type, expires_at)
-                       VALUES (?, ?, 'daily', datetime('now', '+1 day'))""",
-                    (guild_id, winner_id),
+                       VALUES ($1, $2, 'daily', NOW() + INTERVAL '1 day')""",
+                    guild_id, winner_id,
                 )
 
                 # Grant steal shield
-                await db.execute(
-                    "UPDATE dodo_users SET steal_shield = 1 WHERE user_id = ? AND guild_id = ?",
-                    (winner_id, guild_id),
+                await pool.execute(
+                    "UPDATE dodo_users SET steal_shield = 1 WHERE user_id = $1 AND guild_id = $2",
+                    winner_id, guild_id,
                 )
-                await db.commit()
 
                 # Assign role
                 guild = self.bot.get_guild(guild_id)
@@ -1568,19 +1544,18 @@ class DodoCog(commands.Cog, name="Dodo"):
 
     async def _announce_weekly_mvp(self) -> None:
         """Announce the weekly MVP for each guild."""
-        db = self.bot.database.db
+        pool = self.bot.database.pool
 
-        async with db.execute("SELECT DISTINCT guild_id FROM dodo_users") as cur:
-            guilds = [row["guild_id"] for row in await cur.fetchall()]
+        rows = await pool.fetch("SELECT DISTINCT guild_id FROM dodo_users")
+        guilds = [row["guild_id"] for row in rows]
 
         for guild_id in guilds:
             try:
                 # User with most XP
-                async with db.execute(
-                    "SELECT user_id, xp FROM dodo_users WHERE guild_id = ? ORDER BY xp DESC LIMIT 1",
-                    (guild_id,),
-                ) as cur:
-                    row = await cur.fetchone()
+                row = await pool.fetchrow(
+                    "SELECT user_id, xp FROM dodo_users WHERE guild_id = $1 ORDER BY xp DESC LIMIT 1",
+                    guild_id,
+                )
 
                 if not row:
                     continue
@@ -1591,12 +1566,11 @@ class DodoCog(commands.Cog, name="Dodo"):
                 # Record MVP with perks
                 now = _now()
                 next_sunday = now + timedelta(days=(6 - now.weekday()) % 7 + 7)
-                await db.execute(
+                await pool.execute(
                     """INSERT INTO dodo_mvp (guild_id, user_id, mvp_type, boost_available, steal_available, expires_at)
-                       VALUES (?, ?, 'weekly', 1, 1, ?)""",
-                    (guild_id, winner_id, _sql_dt(next_sunday)),
+                       VALUES ($1, $2, 'weekly', 1, 1, $3)""",
+                    guild_id, winner_id, _sql_dt(next_sunday),
                 )
-                await db.commit()
 
                 # Assign role
                 guild = self.bot.get_guild(guild_id)
@@ -1683,57 +1657,53 @@ class DodoCog(commands.Cog, name="Dodo"):
 
     async def _use_mvp_boost(self, user_id: int) -> bool:
         """Activate XP boost for the user."""
-        db = self.bot.database.db
+        pool = self.bot.database.pool
         now = _sql_now()
-        async with db.execute(
+        row = await pool.fetchrow(
             """SELECT id FROM dodo_mvp
-               WHERE user_id = ? AND boost_available = 1 AND boost_used = 0
-               AND (expires_at IS NULL OR expires_at > ?)
+               WHERE user_id = $1 AND boost_available = 1 AND boost_used = 0
+               AND (expires_at IS NULL OR expires_at > $2)
                ORDER BY awarded_at DESC LIMIT 1""",
-            (user_id, now),
-        ) as cur:
-            row = await cur.fetchone()
+            user_id, now,
+        )
         if not row:
             return False
         self._boost_cache[user_id] = True
         return True
 
     async def _check_steal_available(self, user_id: int) -> bool:
-        db = self.bot.database.db
+        pool = self.bot.database.pool
         now = _sql_now()
-        async with db.execute(
+        row = await pool.fetchrow(
             """SELECT id FROM dodo_mvp
-               WHERE user_id = ? AND steal_available = 1 AND steal_used = 0
-               AND (expires_at IS NULL OR expires_at > ?)
+               WHERE user_id = $1 AND steal_available = 1 AND steal_used = 0
+               AND (expires_at IS NULL OR expires_at > $2)
                ORDER BY awarded_at DESC LIMIT 1""",
-            (user_id, now),
-        ) as cur:
-            row = await cur.fetchone()
+            user_id, now,
+        )
         return row is not None
 
     async def _get_user_guild(self, user_id: int) -> Optional[int]:
-        db = self.bot.database.db
-        async with db.execute(
-            "SELECT guild_id FROM dodo_users WHERE user_id = ? LIMIT 1", (user_id,),
-        ) as cur:
-            row = await cur.fetchone()
-            return row["guild_id"] if row else None
+        pool = self.bot.database.pool
+        row = await pool.fetchrow(
+            "SELECT guild_id FROM dodo_users WHERE user_id = $1 LIMIT 1", user_id,
+        )
+        return row["guild_id"] if row else None
 
     async def _get_steal_targets(self, guild_id: int, stealer_id: int) -> List[Tuple[int, str]]:
         """Get eligible steal targets (active dodo users, not the stealer, not already stolen this week)."""
-        db = self.bot.database.db
+        pool = self.bot.database.pool
         week = _week_start()
-        async with db.execute(
+        rows = await pool.fetch(
             """SELECT du.user_id FROM dodo_users du
-               WHERE du.guild_id = ? AND du.user_id != ?
+               WHERE du.guild_id = $1 AND du.user_id != $2
                AND du.user_id NOT IN (
                    SELECT target_id FROM dodo_steal_log
-                   WHERE stealer_id = ? AND week_start = ?
+                   WHERE stealer_id = $3 AND week_start = $4
                )
                ORDER BY du.xp DESC LIMIT 25""",
-            (guild_id, stealer_id, stealer_id, week),
-        ) as cur:
-            rows = await cur.fetchall()
+            guild_id, stealer_id, stealer_id, week,
+        )
 
         targets = []
         guild = self.bot.get_guild(guild_id)
@@ -1750,7 +1720,7 @@ class DodoCog(commands.Cog, name="Dodo"):
     async def _handle_steal(self, interaction: discord.Interaction, target_id: int) -> None:
         """Execute steal: take 30% of target's daily XP."""
         stealer_id = interaction.user.id
-        db = self.bot.database.db
+        pool = self.bot.database.pool
         now = _now()
         week = _week_start()
 
@@ -1763,11 +1733,11 @@ class DodoCog(commands.Cog, name="Dodo"):
             return
 
         # Check one-per-target-per-week
-        async with db.execute(
-            "SELECT id FROM dodo_steal_log WHERE stealer_id = ? AND target_id = ? AND week_start = ?",
-            (stealer_id, target_id, week),
-        ) as cur:
-            if await cur.fetchone():
+        steal_exists = await pool.fetchrow(
+            "SELECT id FROM dodo_steal_log WHERE stealer_id = $1 AND target_id = $2 AND week_start = $3",
+            stealer_id, target_id, week,
+        )
+        if steal_exists:
                 await interaction.response.send_message(
                     embed=Embedder.error("Already Stolen", "You've already stolen from this user this week."),
                     ephemeral=True,
@@ -1799,29 +1769,28 @@ class DodoCog(commands.Cog, name="Dodo"):
             return
 
         # Execute steal
-        await db.execute(
-            "UPDATE dodo_users SET xp = xp - ? WHERE user_id = ? AND guild_id = ?",
-            (stolen_xp, target_id, guild_id),
+        await pool.execute(
+            "UPDATE dodo_users SET xp = xp - $1 WHERE user_id = $2 AND guild_id = $3",
+            stolen_xp, target_id, guild_id,
         )
-        await db.execute(
-            "UPDATE dodo_users SET xp = xp + ? WHERE user_id = ? AND guild_id = ?",
-            (stolen_xp, stealer_id, guild_id),
+        await pool.execute(
+            "UPDATE dodo_users SET xp = xp + $1 WHERE user_id = $2 AND guild_id = $3",
+            stolen_xp, stealer_id, guild_id,
         )
-        await db.execute(
-            "INSERT INTO dodo_steal_log (guild_id, stealer_id, target_id, week_start, stolen_xp) VALUES (?, ?, ?, ?, ?)",
-            (guild_id, stealer_id, target_id, week, stolen_xp),
+        await pool.execute(
+            "INSERT INTO dodo_steal_log (guild_id, stealer_id, target_id, week_start, stolen_xp) VALUES ($1, $2, $3, $4, $5)",
+            guild_id, stealer_id, target_id, week, stolen_xp,
         )
         # Mark steal as used
-        await db.execute(
-            "UPDATE dodo_mvp SET steal_used = 1, steal_target_id = ? WHERE user_id = ? AND steal_available = 1 AND steal_used = 0",
-            (target_id, stealer_id),
+        await pool.execute(
+            "UPDATE dodo_mvp SET steal_used = 1, steal_target_id = $1 WHERE user_id = $2 AND steal_available = 1 AND steal_used = 0",
+            target_id, stealer_id,
         )
         # Using a perk makes you steal-eligible
-        await db.execute(
-            "UPDATE dodo_users SET steal_shield = 0 WHERE user_id = ? AND guild_id = ?",
-            (stealer_id, guild_id),
+        await pool.execute(
+            "UPDATE dodo_users SET steal_shield = 0 WHERE user_id = $1 AND guild_id = $2",
+            stealer_id, guild_id,
         )
-        await db.commit()
 
         await interaction.response.send_message(
             embed=Embedder.success(
@@ -1872,40 +1841,37 @@ class DodoCog(commands.Cog, name="Dodo"):
 
     async def _use_shield(self, user_id: int) -> bool:
         """Use steal shield to block a steal."""
-        db = self.bot.database.db
+        pool = self.bot.database.pool
         # Check shield
-        async with db.execute(
-            "SELECT steal_shield FROM dodo_users WHERE user_id = ? AND steal_shield = 1",
-            (user_id,),
-        ) as cur:
-            row = await cur.fetchone()
+        row = await pool.fetchrow(
+            "SELECT steal_shield FROM dodo_users WHERE user_id = $1 AND steal_shield = 1",
+            user_id,
+        )
         if not row:
             return False
 
         # Reverse the most recent steal against this user
-        async with db.execute(
-            "SELECT id, stealer_id, guild_id, stolen_xp FROM dodo_steal_log WHERE target_id = ? ORDER BY created_at DESC LIMIT 1",
-            (user_id,),
-        ) as cur:
-            steal = await cur.fetchone()
+        steal = await pool.fetchrow(
+            "SELECT id, stealer_id, guild_id, stolen_xp FROM dodo_steal_log WHERE target_id = $1 ORDER BY created_at DESC LIMIT 1",
+            user_id,
+        )
 
         if steal:
             # Reverse XP transfer
-            await db.execute(
-                "UPDATE dodo_users SET xp = xp + ? WHERE user_id = ? AND guild_id = ?",
-                (steal["stolen_xp"], user_id, steal["guild_id"]),
+            await pool.execute(
+                "UPDATE dodo_users SET xp = xp + $1 WHERE user_id = $2 AND guild_id = $3",
+                steal["stolen_xp"], user_id, steal["guild_id"],
             )
-            await db.execute(
-                "UPDATE dodo_users SET xp = MAX(0, xp - ?) WHERE user_id = ? AND guild_id = ?",
-                (steal["stolen_xp"], steal["stealer_id"], steal["guild_id"]),
+            await pool.execute(
+                "UPDATE dodo_users SET xp = GREATEST(0, xp - $1) WHERE user_id = $2 AND guild_id = $3",
+                steal["stolen_xp"], steal["stealer_id"], steal["guild_id"],
             )
-            await db.execute("DELETE FROM dodo_steal_log WHERE id = ?", (steal["id"],))
+            await pool.execute("DELETE FROM dodo_steal_log WHERE id = $1", steal["id"])
 
         # Consume shield
-        await db.execute(
-            "UPDATE dodo_users SET steal_shield = 0 WHERE user_id = ?", (user_id,),
+        await pool.execute(
+            "UPDATE dodo_users SET steal_shield = 0 WHERE user_id = $1", user_id,
         )
-        await db.commit()
 
         # Public announcement
         if steal:
@@ -2009,40 +1975,37 @@ class DodoCog(commands.Cog, name="Dodo"):
     async def check_expirations(self):
         """Background task: red task expiry, reminders, MVP, strike reset."""
         try:
-            db = self.bot.database.db
+            pool = self.bot.database.pool
             now = _now()
             now_iso = _sql_dt(now)
 
             # 1. Red task expiry
-            async with db.execute(
+            expired_tasks = await pool.fetch(
                 """SELECT id, user_id, guild_id FROM dodo_tasks
                    WHERE priority = 'red' AND is_completed = 0 AND is_expired = 0
-                   AND timer_expires IS NOT NULL AND timer_expires < ?""",
-                (now_iso,),
-            ) as cur:
-                expired_tasks = await cur.fetchall()
+                   AND timer_expires IS NOT NULL AND timer_expires < $1""",
+                now_iso,
+            )
 
             for task in expired_tasks:
-                await db.execute(
-                    "UPDATE dodo_tasks SET is_expired = 1 WHERE id = ?", (task["id"],),
+                await pool.execute(
+                    "UPDATE dodo_tasks SET is_expired = 1 WHERE id = $1", task["id"],
                 )
                 # Deduct XP
-                await db.execute(
-                    "UPDATE dodo_users SET xp = MAX(0, xp - ?) WHERE user_id = ? AND guild_id = ?",
-                    (DODO_RED_EXPIRE_PENALTY, task["user_id"], task["guild_id"]),
+                await pool.execute(
+                    "UPDATE dodo_users SET xp = GREATEST(0, xp - $1) WHERE user_id = $2 AND guild_id = $3",
+                    DODO_RED_EXPIRE_PENALTY, task["user_id"], task["guild_id"],
                 )
                 await self._refresh_user_embed(task["user_id"], task["guild_id"])
-            if expired_tasks:
-                await db.commit()
 
             # 2. BSD reminders
-            async with db.execute(
+            reminder_rows = await pool.fetch(
                 """SELECT * FROM dodo_tasks
                    WHERE remind_enabled = 1 AND is_completed = 0 AND is_expired = 0
-                   AND next_remind_at IS NOT NULL AND next_remind_at <= ?""",
-                (now_iso,),
-            ) as cur:
-                reminder_tasks = [dict(r) for r in await cur.fetchall()]
+                   AND next_remind_at IS NOT NULL AND next_remind_at <= $1""",
+                now_iso,
+            )
+            reminder_tasks = [dict(r) for r in reminder_rows]
 
             for task in reminder_tasks:
                 try:
@@ -2067,12 +2030,10 @@ class DodoCog(commands.Cog, name="Dodo"):
                 else:
                     next_remind = None  # No more reminders
 
-                await db.execute(
-                    "UPDATE dodo_tasks SET remind_stage = ?, next_remind_at = ? WHERE id = ?",
-                    (new_stage, next_remind, task["id"]),
+                await pool.execute(
+                    "UPDATE dodo_tasks SET remind_stage = $1, next_remind_at = $2 WHERE id = $3",
+                    new_stage, next_remind, task["id"],
                 )
-            if reminder_tasks:
-                await db.commit()
 
             # 3. Daily MVP at midnight UTC
             if now.hour == 0 and now.minute == 0:
@@ -2190,12 +2151,11 @@ class DodoCog(commands.Cog, name="Dodo"):
             return None
 
         try:
-            db = self.bot.database.db
-            async with db.execute(
-                "SELECT user_id, xp, streak FROM dodo_users WHERE guild_id = ? ORDER BY xp DESC LIMIT 5",
-                (guild_id,),
-            ) as cur:
-                rows = await cur.fetchall()
+            pool = self.bot.database.pool
+            rows = await pool.fetch(
+                "SELECT user_id, xp, streak FROM dodo_users WHERE guild_id = $1 ORDER BY xp DESC LIMIT 5",
+                guild_id,
+            )
 
             if not rows:
                 return None
@@ -2353,12 +2313,11 @@ class DodoCog(commands.Cog, name="Dodo"):
 
     async def _build_leaderboard_embed(self, guild_id: int, filter_type: str) -> discord.Embed:
         """Build a text-based leaderboard embed (fallback)."""
-        db = self.bot.database.db
-        async with db.execute(
-            "SELECT user_id, xp, streak FROM dodo_users WHERE guild_id = ? ORDER BY xp DESC LIMIT 10",
-            (guild_id,),
-        ) as cur:
-            rows = await cur.fetchall()
+        pool = self.bot.database.pool
+        rows = await pool.fetch(
+            "SELECT user_id, xp, streak FROM dodo_users WHERE guild_id = $1 ORDER BY xp DESC LIMIT 10",
+            guild_id,
+        )
 
         if not rows:
             return Embedder.info("Empty Leaderboard", "No one has used Dodo in this server yet!")

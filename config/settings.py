@@ -110,6 +110,11 @@ class Settings:
         )
     )
 
+    # Database (Supabase PostgreSQL)
+    database_url: str = field(
+        default_factory=lambda: os.getenv("DATABASE_URL", "")
+    )
+
     # Music API mirrors (comma-separated JioSaavn mirrors)
     music_api_urls: List[str] = field(
         default_factory=lambda: _parse_list(
@@ -161,4 +166,6 @@ class Settings:
             errors.append("MEGALLM_API_KEY is required")
         if not self.available_models:
             errors.append("AVAILABLE_MODELS must contain at least one model")
+        if not self.database_url:
+            errors.append("DATABASE_URL is required (Supabase PostgreSQL connection string)")
         return errors

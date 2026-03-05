@@ -90,7 +90,7 @@ class StarzaiBot(commands.Bot):
             daily_token_limit_user=settings.daily_token_limit_user,
             daily_token_limit_server=settings.daily_token_limit_server,
         )
-        self.database = DatabaseManager()
+        self.database = DatabaseManager(settings.database_url)
         self.background_tasks = None  # Will be initialized after setup
         self._health_runner: Optional[web.AppRunner] = None
         # Bounded cache for per-(user, guild) message counters; TTL=1h to
