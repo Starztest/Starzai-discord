@@ -34,6 +34,7 @@ class DatabaseManager:
         await self._db.execute("PRAGMA foreign_keys=ON")
         await self._create_tables()
         await self._migrate_user_context_table()
+        await self._migrate_dodo_tasks_remind_character()
         logger.info("Database initialized at %s", self.db_path)
 
     async def close(self) -> None:
@@ -98,6 +99,23 @@ class DatabaseManager:
             """
         )
         await self.db.commit()
+
+    async def _migrate_dodo_tasks_remind_character(self) -> None:
+        """Add remind_character column to dodo_tasks if it doesn't exist."""
+        async with self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dodo_tasks'"
+        ) as cur:
+            exists = await cur.fetchone()
+        if not exists:
+            return
+
+        async with self.db.execute("PRAGMA table_info(dodo_tasks)") as cur:
+            cols = [row["name"] for row in await cur.fetchall()]
+
+        if "remind_character" not in cols:
+            logger.info("Migrating dodo_tasks: adding remind_character column")
+            await self.db.execute("ALTER TABLE dodo_tasks ADD COLUMN remind_character TEXT")
+            await self.db.commit()
 
     # ── Schema ───────────────────────────────────────────────────────
 
@@ -302,7 +320,8 @@ class DatabaseManager:
                 remind_enabled  INTEGER DEFAULT 0,
                 remind_intervals TEXT   DEFAULT '[]',
                 next_remind_at  TEXT,
-                remind_stage    INTEGER DEFAULT 0
+                remind_stage    INTEGER DEFAULT 0,
+                remind_character TEXT
             );
 
             -- ── Dodo: Users ────────────────────────────────────────
@@ -361,6 +380,15 @@ class DatabaseManager:
                 thread_id       INTEGER NOT NULL,
                 message_id      INTEGER NOT NULL,
                 PRIMARY KEY (user_id, guild_id)
+            );
+
+            -- ── Dodo: Per-Guild Channel Config ────────────────────
+            CREATE TABLE IF NOT EXISTS dodo_config (
+                guild_id            INTEGER PRIMARY KEY,
+                tasks_channel_id    INTEGER,
+                gc_channel_id       INTEGER,
+                configured_by       TEXT,
+                configured_at       TEXT DEFAULT (datetime('now'))
             );
 
             CREATE INDEX IF NOT EXISTS idx_conversations_user
@@ -1330,3 +1358,38 @@ class DatabaseManager:
                 (guild_id,),
             )
         await self.db.commit()
+
+    # ══════════════════════════════════════════════════════════════════
+    #  Dodo — Per-Guild Channel Config
+    # ══════════════════════════════════════════════════════════════════
+
+    async def set_dodo_config(
+        self,
+        guild_id: int,
+        tasks_channel_id: Optional[int] = None,
+        gc_channel_id: Optional[int] = None,
+        configured_by: str = "",
+    ) -> None:
+        """Set or update the Dodo channel config for a guild (upsert)."""
+        # Build dynamic SET clause so we only overwrite columns the caller provided
+        await self.db.execute(
+            """INSERT INTO dodo_config (guild_id, tasks_channel_id, gc_channel_id, configured_by)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(guild_id) DO UPDATE SET
+                   tasks_channel_id = COALESCE(excluded.tasks_channel_id, dodo_config.tasks_channel_id),
+                   gc_channel_id    = COALESCE(excluded.gc_channel_id, dodo_config.gc_channel_id),
+                   configured_by    = excluded.configured_by,
+                   configured_at    = datetime('now')
+            """,
+            (guild_id, tasks_channel_id, gc_channel_id, configured_by),
+        )
+        await self.db.commit()
+
+    async def get_dodo_config(self, guild_id: int) -> Optional[Dict[str, Any]]:
+        """Get the Dodo channel config for a guild. Returns dict with tasks_channel_id and gc_channel_id, or None."""
+        async with self.db.execute(
+            "SELECT tasks_channel_id, gc_channel_id, configured_by, configured_at FROM dodo_config WHERE guild_id = ?",
+            (guild_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
