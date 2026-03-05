@@ -43,6 +43,7 @@ class DatabaseManager:
             )
             await self._create_tables()
             await self._migrate_dodo_tasks_remind_character()
+            await self._migrate_dodo_config_role_columns()
             logger.info("Database initialized (PostgreSQL via asyncpg)")
             return True
         except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError, TimeoutError) as exc:
@@ -136,6 +137,26 @@ class DatabaseManager:
             if tbl:
                 logger.info("Migrating dodo_tasks: adding remind_character column")
                 await self.pool.execute("ALTER TABLE dodo_tasks ADD COLUMN remind_character TEXT")
+
+    async def _migrate_dodo_config_role_columns(self) -> None:
+        """Add MVP role columns to dodo_config if they don't exist."""
+        tbl = await self.pool.fetchval(
+            """SELECT 1 FROM information_schema.tables
+               WHERE table_name = 'dodo_config'"""
+        )
+        if not tbl:
+            return
+        for col_name in ("daily_mvp_role_id", "weekly_mvp_role_id"):
+            exists = await self.pool.fetchval(
+                """SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'dodo_config' AND column_name = $1""",
+                col_name,
+            )
+            if not exists:
+                logger.info("Migrating dodo_config: adding %s column", col_name)
+                await self.pool.execute(
+                    f"ALTER TABLE dodo_config ADD COLUMN {col_name} BIGINT"
+                )
 
 
     # ── Schema ───────────────────────────────────────────────────────
@@ -417,11 +438,13 @@ class DatabaseManager:
             """)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS dodo_config (
-                    guild_id            BIGINT PRIMARY KEY,
-                    tasks_channel_id    BIGINT,
-                    gc_channel_id       BIGINT,
-                    configured_by       TEXT,
-                    configured_at       TIMESTAMPTZ DEFAULT NOW()
+                    guild_id                BIGINT PRIMARY KEY,
+                    tasks_channel_id        BIGINT,
+                    gc_channel_id           BIGINT,
+                    daily_mvp_role_id       BIGINT,
+                    weekly_mvp_role_id      BIGINT,
+                    configured_by           TEXT,
+                    configured_at           TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
             # ── Indexes ──────────────────────────────────────────
@@ -1287,25 +1310,35 @@ class DatabaseManager:
         guild_id: int,
         tasks_channel_id: Optional[int] = None,
         gc_channel_id: Optional[int] = None,
+        daily_mvp_role_id: Optional[int] = None,
+        weekly_mvp_role_id: Optional[int] = None,
         configured_by: str = "",
     ) -> None:
-        """Set or update the Dodo channel config for a guild (upsert)."""
+        """Set or update the Dodo config for a guild (upsert)."""
         await self.pool.execute(
-            """INSERT INTO dodo_config (guild_id, tasks_channel_id, gc_channel_id, configured_by)
-               VALUES ($1, $2, $3, $4)
+            """INSERT INTO dodo_config
+                   (guild_id, tasks_channel_id, gc_channel_id,
+                    daily_mvp_role_id, weekly_mvp_role_id, configured_by)
+               VALUES ($1, $2, $3, $4, $5, $6)
                ON CONFLICT(guild_id) DO UPDATE SET
-                   tasks_channel_id = COALESCE(EXCLUDED.tasks_channel_id, dodo_config.tasks_channel_id),
-                   gc_channel_id    = COALESCE(EXCLUDED.gc_channel_id, dodo_config.gc_channel_id),
-                   configured_by    = EXCLUDED.configured_by,
-                   configured_at    = NOW()
+                   tasks_channel_id   = COALESCE(EXCLUDED.tasks_channel_id,   dodo_config.tasks_channel_id),
+                   gc_channel_id      = COALESCE(EXCLUDED.gc_channel_id,      dodo_config.gc_channel_id),
+                   daily_mvp_role_id  = COALESCE(EXCLUDED.daily_mvp_role_id,  dodo_config.daily_mvp_role_id),
+                   weekly_mvp_role_id = COALESCE(EXCLUDED.weekly_mvp_role_id, dodo_config.weekly_mvp_role_id),
+                   configured_by      = EXCLUDED.configured_by,
+                   configured_at      = NOW()
             """,
-            guild_id, tasks_channel_id, gc_channel_id, configured_by,
+            guild_id, tasks_channel_id, gc_channel_id,
+            daily_mvp_role_id, weekly_mvp_role_id, configured_by,
         )
 
     async def get_dodo_config(self, guild_id: int) -> Optional[Dict[str, Any]]:
-        """Get the Dodo channel config for a guild."""
+        """Get the Dodo config for a guild."""
         row = await self.pool.fetchrow(
-            "SELECT tasks_channel_id, gc_channel_id, configured_by, configured_at FROM dodo_config WHERE guild_id = $1",
+            """SELECT tasks_channel_id, gc_channel_id,
+                      daily_mvp_role_id, weekly_mvp_role_id,
+                      configured_by, configured_at
+               FROM dodo_config WHERE guild_id = $1""",
             guild_id,
         )
         return dict(row) if row else None
