@@ -25,6 +25,9 @@ class BackgroundTasks:
     @tasks.loop(hours=24)
     async def cleanup_task(self):
         """Clean up old messages daily (runs every 24 hours)."""
+        if not self.bot.database.is_ready:
+            logger.debug("Skipping cleanup — database not available yet")
+            return
         try:
             deleted_count = await self.bot.database.cleanup_old_messages(days=30)
             logger.info("🧹 Cleaned up %d old messages (>30 days)", deleted_count)

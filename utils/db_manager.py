@@ -22,53 +22,96 @@ class DatabaseManager:
     def __init__(self, database_url: str):
         self.database_url = database_url
         self._pool: Optional[asyncpg.Pool] = None
+        self._connect_task: Optional[asyncio.Task] = None
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
+    @property
+    def is_ready(self) -> bool:
+        """True when the connection pool is open and usable."""
+        return self._pool is not None
+
+    async def _try_connect(self) -> bool:
+        """Attempt a single connection cycle. Returns True on success."""
+        try:
+            self._pool = await asyncpg.create_pool(
+                self.database_url,
+                min_size=2,
+                max_size=10,
+                statement_cache_size=0,  # Required for Supabase PgBouncer compatibility
+                command_timeout=30,
+            )
+            await self._create_tables()
+            await self._migrate_dodo_tasks_remind_character()
+            logger.info("Database initialized (PostgreSQL via asyncpg)")
+            return True
+        except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError, TimeoutError) as exc:
+            # Clean up partial pool if it was created
+            if self._pool is not None:
+                try:
+                    await self._pool.close()
+                except Exception:
+                    pass
+                self._pool = None
+            raise exc
+
     async def initialize(
         self, *, max_retries: int = 5, base_delay: float = 2.0
-    ) -> None:
+    ) -> bool:
         """Open the connection pool and create tables if needed.
 
         Retries with exponential back-off so transient network errors
         (common on containerised platforms like Railway) don't crash
-        the bot on startup.
+        the bot on startup.  Returns True on success, False if all
+        retries were exhausted (the bot can still start without DB).
         """
-        last_exc: Optional[Exception] = None
         for attempt in range(1, max_retries + 1):
             try:
-                self._pool = await asyncpg.create_pool(
-                    self.database_url,
-                    min_size=2,
-                    max_size=10,
-                    statement_cache_size=0,  # Required for Supabase PgBouncer compatibility
-                    command_timeout=30,
-                )
-                await self._create_tables()
-                await self._migrate_dodo_tasks_remind_character()
-                logger.info("Database initialized (PostgreSQL via asyncpg)")
-                return
-            except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as exc:
-                last_exc = exc
+                await self._try_connect()
+                return True
+            except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError, TimeoutError) as exc:
                 delay = base_delay * (2 ** (attempt - 1))  # 2, 4, 8, 16, 32 s
                 logger.warning(
                     "DB connect attempt %d/%d failed: %s — retrying in %.0fs",
                     attempt, max_retries, exc, delay,
                 )
-                # Clean up partial pool if it was created
-                if self._pool is not None:
-                    try:
-                        await self._pool.close()
-                    except Exception:
-                        pass
-                    self._pool = None
                 await asyncio.sleep(delay)
 
-        raise RuntimeError(
-            f"Could not connect to database after {max_retries} attempts"
-        ) from last_exc
+        logger.error("Could not connect to database after %d attempts", max_retries)
+        return False
+
+    async def connect_forever(
+        self, *, interval: float = 30.0
+    ) -> None:
+        """Keep trying to connect in the background until successful.
+
+        Intended to be launched as an ``asyncio.Task`` when the initial
+        ``initialize()`` fails so the bot can come online and recover
+        once the DB becomes reachable.
+        """
+        while not self.is_ready:
+            try:
+                await self._try_connect()
+                logger.info("Background DB reconnect succeeded")
+                return
+            except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError, TimeoutError) as exc:
+                logger.warning(
+                    "Background DB reconnect failed: %s — next try in %.0fs",
+                    exc, interval,
+                )
+                await asyncio.sleep(interval)
+
+    def start_background_connect(self) -> None:
+        """Spawn a background task that keeps retrying the DB connection."""
+        if self._connect_task is None or self._connect_task.done():
+            self._connect_task = asyncio.create_task(
+                self.connect_forever(), name="db-reconnect"
+            )
+            logger.info("Spawned background DB reconnect task")
 
     async def close(self) -> None:
+        if self._connect_task and not self._connect_task.done():
+            self._connect_task.cancel()
         if self._pool:
             await self._pool.close()
             logger.info("Database connection pool closed")

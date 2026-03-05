@@ -134,22 +134,28 @@ class StarzaiBot(commands.Bot):
         """Called once when the bot starts. Load cogs and init services."""
         logger.info("Running setup_hook…")
 
-        # Database (retries automatically on transient network errors)
-        try:
-            await self.database.initialize()
-        except RuntimeError as exc:
-            logger.critical("Database initialization failed: %s", exc)
-            raise
+        # Database (retries automatically on transient network errors).
+        # If the DB is unreachable the bot will still come online and keep
+        # retrying in the background — DB-dependent features degrade
+        # gracefully until the connection is established.
+        db_ready = await self.database.initialize()
 
-        # Migrate allowed_guilds.json → DB (one-time, safe to call repeatedly)
-        migrated = await self.database.migrate_allowed_guilds_from_json(
-            "data/allowed_guilds.json"
-        )
-        if migrated:
-            logger.info("Migrated %d guild(s) from allowed_guilds.json → database", migrated)
+        if db_ready:
+            # Migrate allowed_guilds.json → DB (one-time, safe to call repeatedly)
+            migrated = await self.database.migrate_allowed_guilds_from_json(
+                "data/allowed_guilds.json"
+            )
+            if migrated:
+                logger.info("Migrated %d guild(s) from allowed_guilds.json → database", migrated)
 
-        # Load allowed guilds into memory from DB
-        await self.load_allowed_guilds()
+            # Load allowed guilds into memory from DB
+            await self.load_allowed_guilds()
+        else:
+            logger.warning(
+                "Bot is starting WITHOUT database — DB-dependent features "
+                "will be unavailable until the connection is established"
+            )
+            self.database.start_background_connect()
 
         # Load cogs
         for cog_path in COGS:
@@ -191,6 +197,13 @@ class StarzaiBot(commands.Bot):
             )
         )
 
+        # If the DB came up after setup_hook, run deferred DB init steps
+        if self.database.is_ready and not self.allowed_guilds:
+            try:
+                await self.load_allowed_guilds()
+            except Exception as exc:
+                logger.warning("Deferred guild load failed: %s", exc)
+
     async def on_message(self, message: discord.Message) -> None:
         """Track user messages for personalization."""
         # Ignore bot messages
@@ -201,7 +214,10 @@ class StarzaiBot(commands.Bot):
         if not message.guild:
             return
 
-        # Store message for context
+        # Store message for context (skip silently if DB not yet available)
+        if not self.database.is_ready:
+            await self.process_commands(message)
+            return
         try:
             await self.database.store_user_message(
                 user_id=str(message.author.id),
