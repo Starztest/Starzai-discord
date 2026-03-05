@@ -156,6 +156,18 @@ class TaskThreadView(discord.ui.View):
             if not ok:
                 await interaction.response.send_message(embed=Embedder.error("Not Eligible", msg), ephemeral=True)
                 return
+            # Thread-owner access control
+            if interaction.channel and interaction.guild:
+                thread_owner = await cog._get_thread_owner(interaction.channel_id, interaction.guild_id)
+                if thread_owner is not None and interaction.user.id != thread_owner:
+                    await interaction.response.send_message(
+                        embed=Embedder.error(
+                            "Not Your Dashboard",
+                            "This isn't your task dashboard! Use `/dodo start` to open yours."
+                        ),
+                        ephemeral=True,
+                    )
+                    return
             await interaction.response.send_modal(AddTaskModal(self.bot))
         except Exception as exc:
             logger.exception("add_task_btn failed: %s", exc)
@@ -175,6 +187,18 @@ class TaskThreadView(discord.ui.View):
             if not ok:
                 await interaction.response.send_message(embed=Embedder.error("Not Eligible", msg), ephemeral=True)
                 return
+            # Thread-owner access control
+            if interaction.channel and interaction.guild:
+                thread_owner = await cog._get_thread_owner(interaction.channel_id, interaction.guild_id)
+                if thread_owner is not None and interaction.user.id != thread_owner:
+                    await interaction.response.send_message(
+                        embed=Embedder.error(
+                            "Not Your Dashboard",
+                            "This isn't your task dashboard! Use `/dodo start` to open yours."
+                        ),
+                        ephemeral=True,
+                    )
+                    return
             tasks = await cog._get_user_tasks(interaction.user.id, interaction.guild_id, completed=False)
             if not tasks:
                 await interaction.response.send_message(
@@ -208,6 +232,18 @@ class TaskThreadView(discord.ui.View):
             if not ok:
                 await interaction.response.send_message(embed=Embedder.error("Not Eligible", msg), ephemeral=True)
                 return
+            # Thread-owner access control
+            if interaction.channel and interaction.guild:
+                thread_owner = await cog._get_thread_owner(interaction.channel_id, interaction.guild_id)
+                if thread_owner is not None and interaction.user.id != thread_owner:
+                    await interaction.response.send_message(
+                        embed=Embedder.error(
+                            "Not Your Dashboard",
+                            "This isn't your task dashboard! Use `/dodo start` to open yours."
+                        ),
+                        ephemeral=True,
+                    )
+                    return
             tasks = await cog._get_user_tasks(interaction.user.id, interaction.guild_id, completed=False)
             deletable = [t for t in tasks if t["priority"] != "yellow"]
             if not deletable:
@@ -432,7 +468,6 @@ class CheckTaskDropdown(discord.ui.Select):
         super().__init__(
             placeholder="Select a task to check off...",
             options=options,
-            custom_id="dodo:check_select",
         )
         self.bot = bot
 
@@ -456,7 +491,6 @@ class DeleteTaskDropdown(discord.ui.Select):
         super().__init__(
             placeholder="Select a task to delete...",
             options=options,
-            custom_id="dodo:delete_select",
         )
         self.bot = bot
 
@@ -480,7 +514,6 @@ class StealTargetDropdown(discord.ui.Select):
         super().__init__(
             placeholder="Select a target to steal from...",
             options=options,
-            custom_id="dodo:steal_select",
         )
         self.bot = bot
 
@@ -830,6 +863,16 @@ class DodoCog(commands.Cog, name="Dodo"):
         async with db.execute("SELECT * FROM dodo_tasks WHERE id = ?", (task_id,)) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
+
+    async def _get_thread_owner(self, thread_id: int, guild_id: int) -> Optional[int]:
+        """Look up the user_id that owns a given dodo thread."""
+        db = self.bot.database.db
+        async with db.execute(
+            "SELECT user_id FROM dodo_threads WHERE thread_id = ? AND guild_id = ?",
+            (thread_id, guild_id),
+        ) as cur:
+            row = await cur.fetchone()
+            return row["user_id"] if row else None
 
     async def _count_active_by_priority(self, user_id: int, guild_id: int, priority: str) -> int:
         db = self.bot.database.db
