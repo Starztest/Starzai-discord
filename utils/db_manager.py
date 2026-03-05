@@ -5,6 +5,7 @@ Uses asyncpg to connect to Supabase PostgreSQL.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -24,17 +25,48 @@ class DatabaseManager:
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
-    async def initialize(self) -> None:
-        """Open the connection pool and create tables if needed."""
-        self._pool = await asyncpg.create_pool(
-            self.database_url,
-            min_size=2,
-            max_size=10,
-            statement_cache_size=0,  # Required for Supabase PgBouncer compatibility
-        )
-        await self._create_tables()
-        await self._migrate_dodo_tasks_remind_character()
-        logger.info("Database initialized (PostgreSQL via asyncpg)")
+    async def initialize(
+        self, *, max_retries: int = 5, base_delay: float = 2.0
+    ) -> None:
+        """Open the connection pool and create tables if needed.
+
+        Retries with exponential back-off so transient network errors
+        (common on containerised platforms like Railway) don't crash
+        the bot on startup.
+        """
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                self._pool = await asyncpg.create_pool(
+                    self.database_url,
+                    min_size=2,
+                    max_size=10,
+                    statement_cache_size=0,  # Required for Supabase PgBouncer compatibility
+                    command_timeout=30,
+                )
+                await self._create_tables()
+                await self._migrate_dodo_tasks_remind_character()
+                logger.info("Database initialized (PostgreSQL via asyncpg)")
+                return
+            except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as exc:
+                last_exc = exc
+                delay = base_delay * (2 ** (attempt - 1))  # 2, 4, 8, 16, 32 s
+                logger.warning(
+                    "DB connect attempt %d/%d failed: %s — retrying in %.0fs",
+                    attempt, max_retries, exc, delay,
+                )
+                # Clean up partial pool if it was created
+                if self._pool is not None:
+                    try:
+                        await self._pool.close()
+                    except Exception:
+                        pass
+                    self._pool = None
+                await asyncio.sleep(delay)
+
+        raise RuntimeError(
+            f"Could not connect to database after {max_retries} attempts"
+        ) from last_exc
 
     async def close(self) -> None:
         if self._pool:

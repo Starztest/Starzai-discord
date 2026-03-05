@@ -134,8 +134,12 @@ class StarzaiBot(commands.Bot):
         """Called once when the bot starts. Load cogs and init services."""
         logger.info("Running setup_hook…")
 
-        # Database
-        await self.database.initialize()
+        # Database (retries automatically on transient network errors)
+        try:
+            await self.database.initialize()
+        except RuntimeError as exc:
+            logger.critical("Database initialization failed: %s", exc)
+            raise
 
         # Migrate allowed_guilds.json → DB (one-time, safe to call repeatedly)
         migrated = await self.database.migrate_allowed_guilds_from_json(
