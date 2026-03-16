@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import socket
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urlparse, urlunparse
 
@@ -31,6 +32,110 @@ _CONNECT_ERRORS = (
     ValueError,
 )
 
+# ── Supabase region helpers ──────────────────────────────────────────
+
+# Canonical list of AWS regions where Supabase projects can be deployed.
+# Pooler hostnames follow the pattern: aws-0-{REGION}.pooler.supabase.com
+_VALID_SUPABASE_REGIONS = {
+    "us-east-1", "us-east-2", "us-west-1",
+    "ca-central-1",
+    "eu-west-1", "eu-west-2", "eu-west-3",
+    "eu-central-1", "eu-central-2", "eu-north-1",
+    "ap-south-1", "ap-southeast-1", "ap-southeast-2",
+    "ap-northeast-1", "ap-northeast-2",
+    "sa-east-1",
+}
+
+
+def _normalize_region(raw: str) -> str:
+    """Try to fix common SUPABASE_REGION typos and return a valid region.
+
+    Common mistakes:
+      - GCP-style names:  ``asia-northeast1`` → ``ap-northeast-1``
+      - Missing dash:     ``ap-northeast1``   → ``ap-northeast-1``
+      - Trailing junk:    ``ap-northeast1-1`` → ``ap-northeast-1``
+      - Extra whitespace: `` us-east-1 ``     → ``us-east-1``
+
+    Returns the corrected region if a match is found, otherwise the
+    original string (the caller should log a warning).
+    """
+    region = raw.strip().lower()
+
+    # Already valid
+    if region in _VALID_SUPABASE_REGIONS:
+        return region
+
+    # Strategy 1: insert missing dashes.
+    # AWS regions always end with a direction + dash + digit, e.g.
+    # "east-1", "northeast-2", "central-1", "south-1".
+    # A common typo drops the dash: "northeast1" or adds extra: "northeast1-1".
+    # Normalise by enforcing <letters>-<digit> at the end.
+    normalised = re.sub(r"([a-z])(\d)(?:-\d)?$", r"\1-\2", region)
+    if normalised in _VALID_SUPABASE_REGIONS:
+        return normalised
+
+    # Strategy 2: GCP-style "asia-northeast1" → "ap-northeast-1"
+    gcp_map = {
+        "asia-northeast": "ap-northeast",
+        "asia-southeast": "ap-southeast",
+        "asia-south": "ap-south",
+    }
+    for gcp_prefix, aws_prefix in gcp_map.items():
+        if region.startswith(gcp_prefix):
+            candidate = region.replace(gcp_prefix, aws_prefix, 1)
+            candidate = re.sub(r"([a-z])(\d)(?:-\d)?$", r"\1-\2", candidate)
+            if candidate in _VALID_SUPABASE_REGIONS:
+                return candidate
+
+    # No match found — return original
+    return region
+
+
+def _resolve_host(hostname: str) -> bool:
+    """Return True if *hostname* resolves via DNS."""
+    try:
+        socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        return True
+    except (socket.gaierror, OSError):
+        return False
+
+
+def _find_working_region(project_ref: str, preferred: str) -> str:
+    """Return a region whose pooler hostname resolves via DNS.
+
+    Tries the preferred region first, then falls back to probing all
+    known regions.  Returns the preferred region as-is if nothing works
+    (the connection attempt will fail later with a clear error).
+    """
+    preferred_host = f"aws-0-{preferred}.pooler.supabase.com"
+    if _resolve_host(preferred_host):
+        return preferred
+
+    logger.warning(
+        "Pooler hostname %s does not resolve — trying other regions…",
+        preferred_host,
+    )
+    for region in sorted(_VALID_SUPABASE_REGIONS):
+        if region == preferred:
+            continue
+        host = f"aws-0-{region}.pooler.supabase.com"
+        if _resolve_host(host):
+            logger.info(
+                "Found working pooler region via DNS probe: %s", region
+            )
+            return region
+
+    # Nothing resolved — return preferred so the error message is useful
+    logger.error(
+        "No Supabase pooler hostname resolved via DNS. "
+        "Please set DATABASE_URL to the Session Pooler connection string "
+        "from: Supabase Dashboard → Project Settings → Database → "
+        "Connection string → 'Session Pooler' tab."
+    )
+    return preferred
+
+
+# ── URL auto-conversion ──────────────────────────────────────────────
 
 def _to_pooler_url(url: str) -> str:
     """Auto-convert a **direct** Supabase connection string to the
@@ -98,10 +203,25 @@ def _to_pooler_url(url: str) -> str:
 
     password = parsed.password or ""
 
-    # Supabase region detection: try to pull from env, otherwise
-    # default to the most common region.  The user can override by
-    # providing the pooler URL directly or setting SUPABASE_REGION.
-    region = os.getenv("SUPABASE_REGION", "us-east-1")
+    # Supabase region detection: try to pull from env, normalise typos,
+    # then verify via DNS — falling back to probing all known regions.
+    raw_region = os.getenv("SUPABASE_REGION", "us-east-1")
+    region = _normalize_region(raw_region)
+    if region != raw_region:
+        logger.info(
+            "Normalised SUPABASE_REGION '%s' → '%s'", raw_region, region,
+        )
+
+    if region not in _VALID_SUPABASE_REGIONS:
+        logger.warning(
+            "SUPABASE_REGION '%s' is not a recognised AWS region. "
+            "Valid regions: %s",
+            region, ", ".join(sorted(_VALID_SUPABASE_REGIONS)),
+        )
+
+    # DNS-check the generated hostname; if it fails, try other regions
+    region = _find_working_region(project_ref, region)
+
     new_host = f"aws-0-{region}.pooler.supabase.com"
 
     # Session Pooler uses port 5432 (supports prepared statements)
