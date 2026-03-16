@@ -930,10 +930,12 @@ class DodoCog(commands.Cog, name="Dodo"):
 
     async def _count_completed_today(self, user_id: int, guild_id: int) -> int:
         pool = self.bot.database.pool
-        today = _today()
+        now = _now()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow_start = today_start + timedelta(days=1)
         row = await pool.fetchrow(
-            "SELECT COUNT(*) as cnt FROM dodo_tasks WHERE user_id = $1 AND guild_id = $2 AND is_completed = 1 AND CAST(completed_at AS DATE) = CAST($3 AS DATE)",
-            user_id, guild_id, today,
+            "SELECT COUNT(*) as cnt FROM dodo_tasks WHERE user_id = $1 AND guild_id = $2 AND is_completed = 1 AND completed_at >= $3 AND completed_at < $4",
+            user_id, guild_id, today_start, tomorrow_start,
         )
         return row["cnt"] if row else 0
 
@@ -1822,29 +1824,32 @@ class DodoCog(commands.Cog, name="Dodo"):
             )
             return
 
-        # Execute steal
-        await pool.execute(
-            "UPDATE dodo_users SET xp = xp - $1 WHERE user_id = $2 AND guild_id = $3",
-            stolen_xp, target_id, guild_id,
-        )
-        await pool.execute(
-            "UPDATE dodo_users SET xp = xp + $1 WHERE user_id = $2 AND guild_id = $3",
-            stolen_xp, stealer_id, guild_id,
-        )
-        await pool.execute(
-            "INSERT INTO dodo_steal_log (guild_id, stealer_id, target_id, week_start, stolen_xp) VALUES ($1, $2, $3, $4, $5)",
-            guild_id, stealer_id, target_id, week, stolen_xp,
-        )
-        # Mark steal as used
-        await pool.execute(
-            "UPDATE dodo_mvp SET steal_used = 1, steal_target_id = $1 WHERE user_id = $2 AND steal_available = 1 AND steal_used = 0",
-            target_id, stealer_id,
-        )
-        # Using a perk makes you steal-eligible
-        await pool.execute(
-            "UPDATE dodo_users SET steal_shield = 0 WHERE user_id = $1 AND guild_id = $2",
-            stealer_id, guild_id,
-        )
+        # Execute steal atomically — all XP changes, audit log, and perk
+        # consumption must succeed or fail together.
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE dodo_users SET xp = xp - $1 WHERE user_id = $2 AND guild_id = $3",
+                    stolen_xp, target_id, guild_id,
+                )
+                await conn.execute(
+                    "UPDATE dodo_users SET xp = xp + $1 WHERE user_id = $2 AND guild_id = $3",
+                    stolen_xp, stealer_id, guild_id,
+                )
+                await conn.execute(
+                    "INSERT INTO dodo_steal_log (guild_id, stealer_id, target_id, week_start, stolen_xp) VALUES ($1, $2, $3, $4, $5)",
+                    guild_id, stealer_id, target_id, week, stolen_xp,
+                )
+                # Mark steal as used
+                await conn.execute(
+                    "UPDATE dodo_mvp SET steal_used = 1, steal_target_id = $1 WHERE user_id = $2 AND steal_available = 1 AND steal_used = 0",
+                    target_id, stealer_id,
+                )
+                # Using a perk makes you steal-eligible
+                await conn.execute(
+                    "UPDATE dodo_users SET steal_shield = 0 WHERE user_id = $1 AND guild_id = $2",
+                    stealer_id, guild_id,
+                )
 
         await interaction.response.send_message(
             embed=Embedder.success(
@@ -1910,22 +1915,24 @@ class DodoCog(commands.Cog, name="Dodo"):
             user_id,
         )
 
-        if steal:
-            # Reverse XP transfer
-            await pool.execute(
-                "UPDATE dodo_users SET xp = xp + $1 WHERE user_id = $2 AND guild_id = $3",
-                steal["stolen_xp"], user_id, steal["guild_id"],
-            )
-            await pool.execute(
-                "UPDATE dodo_users SET xp = GREATEST(0, xp - $1) WHERE user_id = $2 AND guild_id = $3",
-                steal["stolen_xp"], steal["stealer_id"], steal["guild_id"],
-            )
-            await pool.execute("DELETE FROM dodo_steal_log WHERE id = $1", steal["id"])
+        # Reverse XP + delete log + consume shield atomically
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                if steal:
+                    await conn.execute(
+                        "UPDATE dodo_users SET xp = xp + $1 WHERE user_id = $2 AND guild_id = $3",
+                        steal["stolen_xp"], user_id, steal["guild_id"],
+                    )
+                    await conn.execute(
+                        "UPDATE dodo_users SET xp = GREATEST(0, xp - $1) WHERE user_id = $2 AND guild_id = $3",
+                        steal["stolen_xp"], steal["stealer_id"], steal["guild_id"],
+                    )
+                    await conn.execute("DELETE FROM dodo_steal_log WHERE id = $1", steal["id"])
 
-        # Consume shield
-        await pool.execute(
-            "UPDATE dodo_users SET steal_shield = 0 WHERE user_id = $1", user_id,
-        )
+                # Consume shield
+                await conn.execute(
+                    "UPDATE dodo_users SET steal_shield = 0 WHERE user_id = $1", user_id,
+                )
 
         # Public announcement
         if steal:
@@ -2033,14 +2040,14 @@ class DodoCog(commands.Cog, name="Dodo"):
         try:
             pool = self.bot.database.pool
             now = _now()
-            now_iso = _sql_dt(now)
+            now_dt = _sql_dt(now)
 
             # 1. Red task expiry
             expired_tasks = await pool.fetch(
                 """SELECT id, user_id, guild_id FROM dodo_tasks
                    WHERE priority = 'red' AND is_completed = 0 AND is_expired = 0
                    AND timer_expires IS NOT NULL AND timer_expires < $1""",
-                now_iso,
+                now_dt,
             )
 
             for task in expired_tasks:
@@ -2059,7 +2066,7 @@ class DodoCog(commands.Cog, name="Dodo"):
                 """SELECT * FROM dodo_tasks
                    WHERE remind_enabled = 1 AND is_completed = 0 AND is_expired = 0
                    AND next_remind_at IS NOT NULL AND next_remind_at <= $1""",
-                now_iso,
+                now_dt,
             )
             reminder_tasks = [dict(r) for r in reminder_rows]
 
