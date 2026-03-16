@@ -59,12 +59,14 @@ def _today() -> str:
     return _now().strftime("%Y-%m-%d")
 
 
-def _sql_dt(dt: datetime) -> str:
-    """Format a datetime for SQLite comparison — matches datetime('now') format."""
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+def _sql_dt(dt: datetime) -> datetime:
+    """Ensure a datetime is timezone-aware (UTC) for asyncpg TIMESTAMPTZ columns."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
-def _sql_now() -> str:
-    """Current UTC time in SQLite-compatible format."""
+def _sql_now() -> datetime:
+    """Current UTC time as a timezone-aware datetime."""
     return _sql_dt(_now())
 
 def _week_start() -> str:
@@ -1055,7 +1057,7 @@ class DodoCog(commands.Cog, name="Dodo"):
             line = f"{emoji} {text}"
             if t["priority"] == "red" and t["timer_expires"]:
                 try:
-                    expires = datetime.fromisoformat(t["timer_expires"])
+                    expires = t["timer_expires"] if isinstance(t["timer_expires"], datetime) else datetime.fromisoformat(t["timer_expires"])
                     remaining = expires - _now()
                     if remaining.total_seconds() > 0:
                         line += f" ⏰ {_format_duration(remaining)}"
@@ -1144,7 +1146,9 @@ class DodoCog(commands.Cog, name="Dodo"):
             )
             if row and row["earliest"]:
                 try:
-                    earliest = datetime.fromisoformat(row["earliest"]).replace(tzinfo=timezone.utc)
+                    earliest = row["earliest"] if isinstance(row["earliest"], datetime) else datetime.fromisoformat(row["earliest"])
+                    if earliest.tzinfo is None:
+                        earliest = earliest.replace(tzinfo=timezone.utc)
                     unlock_at = earliest + timedelta(minutes=DODO_COOLDOWN_MINUTES)
                     remaining = unlock_at - now
                     if remaining.total_seconds() > 0:
@@ -2073,7 +2077,9 @@ class DodoCog(commands.Cog, name="Dodo"):
                     next_td = _parse_timer(intervals[new_stage])
                     if next_td:
                         try:
-                            created = datetime.fromisoformat(task["created_at"]).replace(tzinfo=timezone.utc)
+                            created = task["created_at"] if isinstance(task["created_at"], datetime) else datetime.fromisoformat(task["created_at"])
+                            if created.tzinfo is None:
+                                created = created.replace(tzinfo=timezone.utc)
                             next_remind = _sql_dt(created + next_td)
                         except (ValueError, TypeError):
                             next_remind = _sql_dt(now + next_td)
