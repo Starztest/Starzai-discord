@@ -5,6 +5,7 @@ Uses asyncpg to connect to Supabase PostgreSQL.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -21,22 +22,97 @@ class DatabaseManager:
     def __init__(self, database_url: str):
         self.database_url = database_url
         self._pool: Optional[asyncpg.Pool] = None
+        self._connect_task: Optional[asyncio.Task] = None
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
-    async def initialize(self) -> None:
-        """Open the connection pool and create tables if needed."""
-        self._pool = await asyncpg.create_pool(
-            self.database_url,
-            min_size=2,
-            max_size=10,
-            statement_cache_size=0,  # Required for Supabase PgBouncer compatibility
-        )
-        await self._create_tables()
-        await self._migrate_dodo_tasks_remind_character()
-        logger.info("Database initialized (PostgreSQL via asyncpg)")
+    @property
+    def is_ready(self) -> bool:
+        """True when the connection pool is open and usable."""
+        return self._pool is not None
+
+    async def _try_connect(self) -> bool:
+        """Attempt a single connection cycle. Returns True on success."""
+        try:
+            self._pool = await asyncpg.create_pool(
+                self.database_url,
+                min_size=2,
+                max_size=10,
+                statement_cache_size=0,  # Required for Supabase PgBouncer compatibility
+                command_timeout=30,
+            )
+            await self._create_tables()
+            await self._migrate_dodo_tasks_remind_character()
+            await self._migrate_dodo_config_role_columns()
+            logger.info("Database initialized (PostgreSQL via asyncpg)")
+            return True
+        except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError, TimeoutError) as exc:
+            # Clean up partial pool if it was created
+            if self._pool is not None:
+                try:
+                    await self._pool.close()
+                except Exception:
+                    pass
+                self._pool = None
+            raise exc
+
+    async def initialize(
+        self, *, max_retries: int = 5, base_delay: float = 2.0
+    ) -> bool:
+        """Open the connection pool and create tables if needed.
+
+        Retries with exponential back-off so transient network errors
+        (common on containerised platforms like Railway) don't crash
+        the bot on startup.  Returns True on success, False if all
+        retries were exhausted (the bot can still start without DB).
+        """
+        for attempt in range(1, max_retries + 1):
+            try:
+                await self._try_connect()
+                return True
+            except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError, TimeoutError) as exc:
+                delay = base_delay * (2 ** (attempt - 1))  # 2, 4, 8, 16, 32 s
+                logger.warning(
+                    "DB connect attempt %d/%d failed: %s — retrying in %.0fs",
+                    attempt, max_retries, exc, delay,
+                )
+                await asyncio.sleep(delay)
+
+        logger.error("Could not connect to database after %d attempts", max_retries)
+        return False
+
+    async def connect_forever(
+        self, *, interval: float = 30.0
+    ) -> None:
+        """Keep trying to connect in the background until successful.
+
+        Intended to be launched as an ``asyncio.Task`` when the initial
+        ``initialize()`` fails so the bot can come online and recover
+        once the DB becomes reachable.
+        """
+        while not self.is_ready:
+            try:
+                await self._try_connect()
+                logger.info("Background DB reconnect succeeded")
+                return
+            except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError, TimeoutError) as exc:
+                logger.warning(
+                    "Background DB reconnect failed: %s — next try in %.0fs",
+                    exc, interval,
+                )
+                await asyncio.sleep(interval)
+
+    def start_background_connect(self) -> None:
+        """Spawn a background task that keeps retrying the DB connection."""
+        if self._connect_task is None or self._connect_task.done():
+            self._connect_task = asyncio.create_task(
+                self.connect_forever(), name="db-reconnect"
+            )
+            logger.info("Spawned background DB reconnect task")
 
     async def close(self) -> None:
+        if self._connect_task and not self._connect_task.done():
+            self._connect_task.cancel()
         if self._pool:
             await self._pool.close()
             logger.info("Database connection pool closed")
@@ -62,6 +138,25 @@ class DatabaseManager:
                 logger.info("Migrating dodo_tasks: adding remind_character column")
                 await self.pool.execute("ALTER TABLE dodo_tasks ADD COLUMN remind_character TEXT")
 
+    async def _migrate_dodo_config_role_columns(self) -> None:
+        """Add MVP role columns to dodo_config if they don't exist."""
+        tbl = await self.pool.fetchval(
+            """SELECT 1 FROM information_schema.tables
+               WHERE table_name = 'dodo_config'"""
+        )
+        if not tbl:
+            return
+        for col_name in ("daily_mvp_role_id", "weekly_mvp_role_id"):
+            exists = await self.pool.fetchval(
+                """SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'dodo_config' AND column_name = $1""",
+                col_name,
+            )
+            if not exists:
+                logger.info("Migrating dodo_config: adding %s column", col_name)
+                await self.pool.execute(
+                    f"ALTER TABLE dodo_config ADD COLUMN {col_name} BIGINT"
+                )
 
     # ── Schema ───────────────────────────────────────────────────────
 
@@ -342,11 +437,13 @@ class DatabaseManager:
             """)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS dodo_config (
-                    guild_id            BIGINT PRIMARY KEY,
-                    tasks_channel_id    BIGINT,
-                    gc_channel_id       BIGINT,
-                    configured_by       TEXT,
-                    configured_at       TIMESTAMPTZ DEFAULT NOW()
+                    guild_id                BIGINT PRIMARY KEY,
+                    tasks_channel_id        BIGINT,
+                    gc_channel_id           BIGINT,
+                    daily_mvp_role_id       BIGINT,
+                    weekly_mvp_role_id      BIGINT,
+                    configured_by           TEXT,
+                    configured_at           TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
             # ── Indexes ──────────────────────────────────────────
@@ -1212,25 +1309,35 @@ class DatabaseManager:
         guild_id: int,
         tasks_channel_id: Optional[int] = None,
         gc_channel_id: Optional[int] = None,
+        daily_mvp_role_id: Optional[int] = None,
+        weekly_mvp_role_id: Optional[int] = None,
         configured_by: str = "",
     ) -> None:
-        """Set or update the Dodo channel config for a guild (upsert)."""
+        """Set or update the Dodo config for a guild (upsert)."""
         await self.pool.execute(
-            """INSERT INTO dodo_config (guild_id, tasks_channel_id, gc_channel_id, configured_by)
-               VALUES ($1, $2, $3, $4)
+            """INSERT INTO dodo_config
+                   (guild_id, tasks_channel_id, gc_channel_id,
+                    daily_mvp_role_id, weekly_mvp_role_id, configured_by)
+               VALUES ($1, $2, $3, $4, $5, $6)
                ON CONFLICT(guild_id) DO UPDATE SET
-                   tasks_channel_id = COALESCE(EXCLUDED.tasks_channel_id, dodo_config.tasks_channel_id),
-                   gc_channel_id    = COALESCE(EXCLUDED.gc_channel_id, dodo_config.gc_channel_id),
-                   configured_by    = EXCLUDED.configured_by,
-                   configured_at    = NOW()
+                   tasks_channel_id   = COALESCE(EXCLUDED.tasks_channel_id,   dodo_config.tasks_channel_id),
+                   gc_channel_id      = COALESCE(EXCLUDED.gc_channel_id,      dodo_config.gc_channel_id),
+                   daily_mvp_role_id  = COALESCE(EXCLUDED.daily_mvp_role_id,  dodo_config.daily_mvp_role_id),
+                   weekly_mvp_role_id = COALESCE(EXCLUDED.weekly_mvp_role_id, dodo_config.weekly_mvp_role_id),
+                   configured_by      = EXCLUDED.configured_by,
+                   configured_at      = NOW()
             """,
-            guild_id, tasks_channel_id, gc_channel_id, configured_by,
+            guild_id, tasks_channel_id, gc_channel_id,
+            daily_mvp_role_id, weekly_mvp_role_id, configured_by,
         )
 
     async def get_dodo_config(self, guild_id: int) -> Optional[Dict[str, Any]]:
-        """Get the Dodo channel config for a guild."""
+        """Get the Dodo config for a guild."""
         row = await self.pool.fetchrow(
-            "SELECT tasks_channel_id, gc_channel_id, configured_by, configured_at FROM dodo_config WHERE guild_id = $1",
+            """SELECT tasks_channel_id, gc_channel_id,
+                      daily_mvp_role_id, weekly_mvp_role_id,
+                      configured_by, configured_at
+               FROM dodo_config WHERE guild_id = $1""",
             guild_id,
         )
         return dict(row) if row else None
