@@ -210,11 +210,47 @@ class Settings:
 
     # ── Helpers ──────────────────────────────────────────────────────
     def resolve_model(self, name: str) -> str:
-        """Resolve a model alias or name to its canonical form."""
-        lower = name.strip().lower()
-        resolved = self.model_aliases.get(lower, name.strip())
-        if resolved in self.available_models:
-            return resolved
+        """Resolve a model alias or name to its canonical form.
+
+        Resolution order:
+        1. Check the model registry (canonical names + aliases)
+        2. Check env-var MODEL_ALIASES
+        3. Check env-var AVAILABLE_MODELS (legacy)
+        4. Pass through as-is if it looks like a provider-specific ID
+           (contains '/' e.g. "Qwen/Qwen2.5-7B-Instruct")
+        5. Fall back to default_model
+        """
+        from utils.model_registry import build_registry
+
+        stripped = name.strip()
+        lower = stripped.lower()
+
+        # 1. Registry lookup (canonical + aliases)
+        registry = build_registry()
+        entry = registry.get(stripped)
+        if entry:
+            return entry.canonical
+
+        # 2. Env-var aliases (MODEL_ALIASES)
+        alias_resolved = self.model_aliases.get(lower)
+        if alias_resolved:
+            # Re-check against registry for the alias target
+            entry = registry.get(alias_resolved)
+            if entry:
+                return entry.canonical
+            # If alias target is in legacy available_models, accept it
+            if alias_resolved in self.available_models:
+                return alias_resolved
+
+        # 3. Legacy AVAILABLE_MODELS list
+        if stripped in self.available_models:
+            return stripped
+
+        # 4. Provider-specific IDs (pass-through)
+        if "/" in stripped:
+            return stripped
+
+        # 5. Default
         return self.default_model
 
     def has_any_llm_provider(self) -> bool:
@@ -239,8 +275,9 @@ class Settings:
                 "Set one or more of: REQUESTY_API_KEY, FEATHERLESS_API_KEY, "
                 "MODELSLAB_API_KEY, CHUTES_API_KEY, PUTER_AUTH_TOKEN, MEGALLM_API_KEY"
             )
-        if not self.available_models:
-            errors.append("AVAILABLE_MODELS must contain at least one model")
+        # Note: AVAILABLE_MODELS is no longer required — the model registry
+        # provides the full catalogue.  The env var is still respected for
+        # backward compatibility but an empty list is not an error.
         if not self.database_url:
             errors.append("DATABASE_URL is required (Supabase PostgreSQL connection string)")
         return errors
@@ -274,37 +311,12 @@ class Settings:
             "megallm": self.default_model,
         }
 
-        # Model name mappings: canonical name → provider-specific name
-        # This allows cogs to request "gpt-4" and each provider translates it
+        # Model name mappings: canonical name → provider-specific name.
+        # Uses the consolidated map from the model registry.
+        from utils.model_registry import PROVIDER_MODEL_MAP
         provider_model_maps = {
-            "requesty": {
-                "gpt-4": "openai/gpt-4",
-                "gpt-4o": "openai/gpt-4o",
-                "gpt-4o-mini": "openai/gpt-4o-mini",
-                "gpt-3.5-turbo": "openai/gpt-3.5-turbo",
-                "claude-3-opus": "anthropic/claude-3-opus-20240229",
-                "claude-3-sonnet": "anthropic/claude-3-5-sonnet-20241022",
-                "claude-3-haiku": "anthropic/claude-3-haiku-20240307",
-            },
-            "featherless": {
-                # Featherless serves open-source models — map to closest equivalents
-                "gpt-4": "Qwen/Qwen2.5-72B-Instruct",
-                "gpt-4o": "Qwen/Qwen2.5-72B-Instruct",
-                "gpt-4o-mini": "Qwen/Qwen2.5-7B-Instruct",
-                "gpt-3.5-turbo": "Qwen/Qwen2.5-7B-Instruct",
-            },
-            "modelslab": {},  # ModelsLab passes model names through
-            "chutes": {
-                "gpt-4": "deepseek-ai/DeepSeek-V3-0324",
-                "gpt-4o": "deepseek-ai/DeepSeek-V3-0324",
-                "gpt-3.5-turbo": "deepseek-ai/DeepSeek-V3-0324",
-            },
-            "puter": {
-                # Puter supports OpenAI model names directly
-                "gpt-4": "gpt-4o",
-                "gpt-3.5-turbo": "gpt-4o-mini",
-            },
-            "megallm": {},  # MegaLLM passes through
+            name: PROVIDER_MODEL_MAP.get(name, {})
+            for name in provider_creds
         }
 
         # Extra headers per provider

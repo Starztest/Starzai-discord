@@ -118,7 +118,7 @@ class Embedder:
 
     @classmethod
     def model_list(cls, models: List[str], current: str) -> discord.Embed:
-        """Create an embed listing available models."""
+        """Create an embed listing available models (legacy flat list)."""
         lines = []
         for m in models:
             marker = " ◀ *current*" if m == current else ""
@@ -126,6 +126,61 @@ class Embedder:
         return cls.standard(
             "🤖 Available Models",
             "\n".join(lines) or "No models configured.",
+        )
+
+    @classmethod
+    def model_catalogue(
+        cls,
+        current: str,
+        categories: Optional[List[dict]] = None,
+        provider_names: Optional[List[str]] = None,
+    ) -> discord.Embed:
+        """Create a rich model catalogue embed with categories."""
+        lines = [
+            f"Your current model: **`{current}`**\n",
+            "Choose a category below to browse models, "
+            "or type `/set-model` with a model name.\n",
+        ]
+
+        if categories:
+            for cat in categories:
+                emoji = cat.get("emoji", "")
+                label = cat.get("label", "")
+                desc = cat.get("description", "")
+                count = cat.get("count", 0)
+                lines.append(f"{emoji} **{label}** — {desc} ({count} models)")
+
+        if provider_names:
+            lines.append(f"\n🔗 **Active providers:** {', '.join(provider_names)}")
+
+        return cls.standard(
+            "🤖 AI Model Catalogue",
+            "\n".join(lines),
+        )
+
+    @classmethod
+    def model_category_list(
+        cls,
+        category_name: str,
+        category_emoji: str,
+        models: List[dict],
+        current: str,
+    ) -> discord.Embed:
+        """Create an embed listing models in a specific category."""
+        lines = []
+        for m in models:
+            name = m.get("canonical", "")
+            display = m.get("display_name", name)
+            desc = m.get("description", "")
+            providers = m.get("providers", [])
+            marker = " ◀" if name == current else ""
+            prov_str = f" ({', '.join(providers)})" if providers else ""
+            lines.append(f"`{name}` — **{display}**{marker}\n  {desc}{prov_str}")
+
+        return cls.standard(
+            f"{category_emoji} {category_name} Models",
+            "\n".join(lines) or "No models in this category.",
+            footer="Use the dropdown to select a model",
         )
 
     @classmethod

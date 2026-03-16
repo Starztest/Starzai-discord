@@ -490,6 +490,40 @@ class LLMClient:
         """Return providers that are currently available (not in cooldown)."""
         return [p for p in self._providers if p.is_available]
 
+    def _providers_for_model(self, model: str) -> List[_ProviderClient]:
+        """Return available providers sorted by suitability for *model*.
+
+        Providers that have *model* in their model_map are returned first
+        (i.e. they natively support it), followed by any remaining
+        available providers as fallbacks.
+        """
+        available = self._available_providers()
+        if not available:
+            return available
+
+        # Also check the registry for provider-level support
+        try:
+            from utils.model_registry import build_registry
+            registry = build_registry()
+            entry = registry.get(model)
+        except Exception:
+            entry = None
+
+        native: List[_ProviderClient] = []
+        fallback: List[_ProviderClient] = []
+
+        for p in available:
+            has_in_map = model in p.cfg.model_map
+            has_in_registry = (
+                entry is not None and p.cfg.name in entry.providers
+            )
+            if has_in_map or has_in_registry:
+                native.append(p)
+            else:
+                fallback.append(p)
+
+        return native + fallback
+
     # ── Core Chat Completion (with fallback) ──────────────────────
 
     async def chat(
@@ -501,7 +535,7 @@ class LLMClient:
     ) -> LLMResponse:
         """Send a chat completion request, falling back across providers."""
         model = model or self.default_model
-        available = self._available_providers()
+        available = self._providers_for_model(model)
 
         if not available:
             # All providers in cooldown — forcibly try the first enabled one
@@ -554,7 +588,7 @@ class LLMClient:
     ) -> AsyncIterator[str]:
         """Stream chat tokens, falling back across providers on pre-stream errors."""
         model = model or self.default_model
-        available = self._available_providers()
+        available = self._providers_for_model(model)
 
         if not available:
             available = [p for p in self._providers if p.cfg.enabled and p.cfg.api_key]
