@@ -110,9 +110,15 @@ class Settings:
         )
     )
 
-    # Database (Supabase PostgreSQL)
+    # Database (Supabase PostgreSQL — use Session Pooler URL for IPv4 compat)
     database_url: str = field(
         default_factory=lambda: os.getenv("DATABASE_URL", "")
+    )
+    # Supabase region — used for auto-converting direct connection strings
+    # to Session Pooler format.  Only needed if you use a direct DB URL;
+    # ignored when you provide a pooler URL directly.
+    supabase_region: str = field(
+        default_factory=lambda: os.getenv("SUPABASE_REGION", "us-east-1")
     )
 
     # Music API mirrors (comma-separated JioSaavn mirrors)

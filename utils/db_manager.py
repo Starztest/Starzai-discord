@@ -9,7 +9,9 @@ import asyncio
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional, Set
+from urllib.parse import urlparse, urlunparse
 
 import asyncpg
 
@@ -30,11 +32,87 @@ _CONNECT_ERRORS = (
 )
 
 
+def _to_pooler_url(url: str) -> str:
+    """Auto-convert a **direct** Supabase connection string to the
+    free IPv4-compatible **Session Pooler** format.
+
+    Direct format (IPv6 only — fails on Railway / Render / most VPS):
+        postgresql://postgres:[PASS]@db.<REF>.supabase.co:5432/postgres
+
+    Session Pooler format (IPv4 + IPv6 — works everywhere, FREE):
+        postgresql://postgres.<REF>:[PASS]@aws-0-<REGION>.pooler.supabase.com:5432/postgres
+
+    If the URL is already a pooler URL, or is not a Supabase URL at all,
+    it is returned unchanged.
+    """
+    if not url:
+        return url
+
+    # Already using pooler → nothing to do
+    if "pooler.supabase.com" in url:
+        logger.info("DATABASE_URL already uses Supabase Session Pooler (IPv4 OK)")
+        return url
+
+    # Match direct Supabase connection: db.<REF>.supabase.co
+    m = re.search(r"@db\.([a-z0-9]+)\.supabase\.co", url)
+    if not m:
+        # Not a Supabase direct URL — could be local/other PG, leave as-is
+        return url
+
+    project_ref = m.group(1)
+    logger.warning(
+        "Detected direct Supabase connection string (db.%s.supabase.co). "
+        "Direct connections require IPv6 which is unavailable on most "
+        "deployment platforms.  Auto-converting to Session Pooler…",
+        project_ref,
+    )
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        logger.error("Could not parse DATABASE_URL — returning as-is")
+        return url
+
+    # Original user is usually 'postgres', pooler needs 'postgres.<REF>'
+    orig_user = parsed.username or "postgres"
+    # Strip any existing .ref suffix to avoid double-appending
+    base_user = orig_user.split(".")[0]
+    new_user = f"{base_user}.{project_ref}"
+
+    password = parsed.password or ""
+
+    # Supabase region detection: try to pull from env, otherwise
+    # default to the most common region.  The user can override by
+    # providing the pooler URL directly or setting SUPABASE_REGION.
+    region = os.getenv("SUPABASE_REGION", "us-east-1")
+    new_host = f"aws-0-{region}.pooler.supabase.com"
+
+    # Session Pooler uses port 5432 (supports prepared statements)
+    # Transaction Pooler uses port 6543 (does NOT support prepared stmts)
+    new_port = 5432
+
+    new_netloc = f"{new_user}:{password}@{new_host}:{new_port}"
+    pooler_url = urlunparse((
+        parsed.scheme or "postgresql",
+        new_netloc,
+        parsed.path or "/postgres",
+        parsed.params,
+        parsed.query,
+        parsed.fragment,
+    ))
+
+    logger.info(
+        "Converted to Session Pooler: %s@%s:%d (region=%s)",
+        new_user, new_host, new_port, region,
+    )
+    return pooler_url
+
+
 class DatabaseManager:
     """Async PostgreSQL wrapper for all bot persistence (Supabase)."""
 
     def __init__(self, database_url: str):
-        self.database_url = database_url
+        self.database_url = _to_pooler_url(database_url)
         self._pool: Optional[asyncpg.Pool] = None
         self._connect_task: Optional[asyncio.Task] = None
 
@@ -48,17 +126,27 @@ class DatabaseManager:
     async def _try_connect(self) -> bool:
         """Attempt a single connection cycle. Returns True on success."""
         try:
+            import ssl as _ssl
+            _ctx = _ssl.create_default_context()
+            # Supabase Session Pooler requires TLS but the cert CN
+            # won't match the pooler hostname \u2014 skip verification.
+            _ctx.check_hostname = False
+            _ctx.verify_mode = _ssl.CERT_NONE
+
             self._pool = await asyncpg.create_pool(
                 self.database_url,
                 min_size=2,
                 max_size=10,
-                statement_cache_size=0,  # Required for Supabase PgBouncer compatibility
+                statement_cache_size=0,  # Required for Supabase pooler compatibility
                 command_timeout=30,
+                ssl=_ctx,
             )
             await self._create_tables()
             await self._migrate_dodo_tasks_remind_character()
             await self._migrate_dodo_config_role_columns()
-            logger.info("Database initialized (PostgreSQL via asyncpg)")
+            logger.info(
+                "Database initialized (PostgreSQL via asyncpg + Session Pooler)"
+            )
             return True
         except _CONNECT_ERRORS as exc:
             # Clean up partial pool if it was created
