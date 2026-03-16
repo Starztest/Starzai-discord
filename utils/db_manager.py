@@ -48,6 +48,23 @@ def _to_pooler_url(url: str) -> str:
     if not url:
         return url
 
+    # Detect common mistake: user pasted the Supabase *API* URL
+    # (https://xxx.supabase.co) instead of the PostgreSQL connection string.
+    if url.startswith("https://") and ".supabase.co" in url:
+        m_ref = re.search(r"https://([a-z0-9]+)\.supabase\.co", url)
+        if m_ref:
+            logger.critical(
+                "DATABASE_URL is set to the Supabase **REST API** URL "
+                "(https://%s.supabase.co) — this is NOT a PostgreSQL connection string!\n"
+                "Go to: Supabase Dashboard → Project Settings → Database → "
+                "Connection string → 'Session Pooler' tab and copy the "
+                "postgresql:// URL.",
+                m_ref.group(1),
+            )
+        # Return as-is — asyncpg will fail with a clear scheme error,
+        # and the retry logic will surface the CRITICAL log above.
+        return url
+
     # Already using pooler → nothing to do
     if "pooler.supabase.com" in url:
         logger.info("DATABASE_URL already uses Supabase Session Pooler (IPv4 OK)")
@@ -575,6 +592,8 @@ class DatabaseManager:
         )
 
     async def get_user_model(self, user_id: int) -> Optional[str]:
+        if not self.is_ready:
+            return None
         row = await self.pool.fetchrow(
             "SELECT preferred_model FROM users WHERE user_id = $1", user_id
         )
@@ -588,6 +607,8 @@ class DatabaseManager:
         )
 
     async def add_user_tokens(self, user_id: int, tokens: int) -> None:
+        if not self.is_ready:
+            return
         await self.ensure_user(user_id)
         await self.pool.execute(
             "UPDATE users SET total_tokens = total_tokens + $1, updated_at = NOW() WHERE user_id = $2",
@@ -715,13 +736,18 @@ class DatabaseManager:
         success: bool = True,
         error_message: Optional[str] = None,
     ) -> None:
-        await self.pool.execute(
-            """INSERT INTO usage_logs
-               (user_id, guild_id, command, model, tokens_used, latency_ms, success, error_message)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
-            user_id, guild_id, command, model, tokens_used, latency_ms,
-            1 if success else 0, error_message,
-        )
+        if not self.is_ready:
+            return  # Silently skip — analytics are non-critical
+        try:
+            await self.pool.execute(
+                """INSERT INTO usage_logs
+                   (user_id, guild_id, command, model, tokens_used, latency_ms, success, error_message)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
+                user_id, guild_id, command, model, tokens_used, latency_ms,
+                1 if success else 0, error_message,
+            )
+        except Exception as exc:
+            logger.debug("log_usage skipped: %s", exc)
 
     async def get_global_stats(self) -> Dict[str, Any]:
         """Return aggregate bot statistics."""
