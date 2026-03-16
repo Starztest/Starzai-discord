@@ -15,6 +15,20 @@ import asyncpg
 
 logger = logging.getLogger(__name__)
 
+# All exception types that can occur during asyncpg connection attempts.
+# - OSError / TimeoutError: network-level failures
+# - asyncpg.PostgresError / InterfaceError: driver-level failures
+# - ValueError: raised by Python's urllib.parse when the DSN contains a
+#   hostname that looks like a bracketed IPv6 literal but isn't
+#   (common with Supabase connection strings on some Python versions).
+_CONNECT_ERRORS = (
+    OSError,
+    asyncpg.PostgresError,
+    asyncpg.InterfaceError,
+    TimeoutError,
+    ValueError,
+)
+
 
 class DatabaseManager:
     """Async PostgreSQL wrapper for all bot persistence (Supabase)."""
@@ -46,7 +60,7 @@ class DatabaseManager:
             await self._migrate_dodo_config_role_columns()
             logger.info("Database initialized (PostgreSQL via asyncpg)")
             return True
-        except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError, TimeoutError) as exc:
+        except _CONNECT_ERRORS as exc:
             # Clean up partial pool if it was created
             if self._pool is not None:
                 try:
@@ -70,7 +84,7 @@ class DatabaseManager:
             try:
                 await self._try_connect()
                 return True
-            except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError, TimeoutError) as exc:
+            except _CONNECT_ERRORS as exc:
                 delay = base_delay * (2 ** (attempt - 1))  # 2, 4, 8, 16, 32 s
                 logger.warning(
                     "DB connect attempt %d/%d failed: %s — retrying in %.0fs",
@@ -95,7 +109,7 @@ class DatabaseManager:
                 await self._try_connect()
                 logger.info("Background DB reconnect succeeded")
                 return
-            except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError, TimeoutError) as exc:
+            except _CONNECT_ERRORS as exc:
                 logger.warning(
                     "Background DB reconnect failed: %s — next try in %.0fs",
                     exc, interval,
