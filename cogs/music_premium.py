@@ -433,6 +433,23 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
 
     # ── Helpers ──────────────────────────────────────────────────────
 
+    async def _require_db(self, interaction: discord.Interaction) -> bool:
+        """Check database readiness; send an error and return False if unavailable."""
+        if self.bot.database.is_ready:
+            return True
+        embed = Embedder.error(
+            "Database Unavailable",
+            "The database connection is being established.\nPlease try again in a moment.",
+        )
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+        except discord.NotFound:
+            pass
+        return False
+
     def _get_music_cog(self):
         """Get the main MusicCog instance."""
         return self.bot.get_cog("Music")
@@ -636,6 +653,8 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
         if not interaction.guild_id:
             await interaction.response.send_message("Server only.", ephemeral=True)
             return
+        if not await self._require_db(interaction):
+            return
 
         state = self._get_music_state(interaction.guild_id)
         if not state or not state.current:
@@ -675,6 +694,8 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
 
     @app_commands.command(name="favorites", description="View your favorite songs")
     async def favorites_cmd(self, interaction: discord.Interaction) -> None:
+        if not await self._require_db(interaction):
+            return
         db = self.bot.database
         uid = str(interaction.user.id)
         favorites = await db.get_favorites(uid, limit=MAX_FAVORITES)
@@ -695,6 +716,8 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
     async def playlist_create_cmd(
         self, interaction: discord.Interaction, name: str, description: str = ""
     ) -> None:
+        if not await self._require_db(interaction):
+            return
         db = self.bot.database
         uid = str(interaction.user.id)
 
@@ -732,6 +755,8 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
 
     @playlist_group.command(name="list", description="List all your playlists")
     async def playlist_list_cmd(self, interaction: discord.Interaction) -> None:
+        if not await self._require_db(interaction):
+            return
         db = self.bot.database
         uid = str(interaction.user.id)
         playlists = await db.get_playlists(uid)
@@ -764,6 +789,8 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
     @playlist_group.command(name="view", description="View songs in a playlist")
     @app_commands.describe(name="Playlist name")
     async def playlist_view_cmd(self, interaction: discord.Interaction, name: str) -> None:
+        if not await self._require_db(interaction):
+            return
         db = self.bot.database
         uid = str(interaction.user.id)
         playlist = await db.get_playlist_by_name(uid, name)
@@ -784,6 +811,8 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
     async def playlist_add_cmd(
         self, interaction: discord.Interaction, name: str, query: Optional[str] = None
     ) -> None:
+        if not await self._require_db(interaction):
+            return
         db = self.bot.database
         uid = str(interaction.user.id)
         playlist = await db.get_playlist_by_name(uid, name)
@@ -880,6 +909,8 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
     async def playlist_remove_cmd(
         self, interaction: discord.Interaction, name: str, position: int
     ) -> None:
+        if not await self._require_db(interaction):
+            return
         db = self.bot.database
         uid = str(interaction.user.id)
         playlist = await db.get_playlist_by_name(uid, name)
@@ -912,6 +943,8 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
     @playlist_group.command(name="play", description="Load a playlist into the queue and start playing")
     @app_commands.describe(name="Playlist name")
     async def playlist_play_cmd(self, interaction: discord.Interaction, name: str) -> None:
+        if not await self._require_db(interaction):
+            return
         db = self.bot.database
         uid = str(interaction.user.id)
         playlist = await db.get_playlist_by_name(uid, name)
@@ -937,6 +970,8 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
     @playlist_group.command(name="delete", description="Delete a playlist")
     @app_commands.describe(name="Playlist name")
     async def playlist_delete_cmd(self, interaction: discord.Interaction, name: str) -> None:
+        if not await self._require_db(interaction):
+            return
         db = self.bot.database
         uid = str(interaction.user.id)
         playlist = await db.get_playlist_by_name(uid, name)
@@ -967,6 +1002,8 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
     async def playlist_rename_cmd(
         self, interaction: discord.Interaction, name: str, new_name: str
     ) -> None:
+        if not await self._require_db(interaction):
+            return
         db = self.bot.database
         uid = str(interaction.user.id)
         playlist = await db.get_playlist_by_name(uid, name)
@@ -1022,6 +1059,8 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
             )
             return
 
+        if not await self._require_db(interaction):
+            return
         db = self.bot.database
         uid = str(interaction.user.id)
 
@@ -1059,6 +1098,8 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
         self, interaction: discord.Interaction, user: Optional[discord.User] = None
     ) -> None:
         target = user or interaction.user
+        if not await self._require_db(interaction):
+            return
         db = self.bot.database
         profile = await db.get_music_profile(str(target.id))
 
@@ -1161,6 +1202,8 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
             )
             return
 
+        if not await self._require_db(interaction):
+            return
         db = self.bot.database
         gid = str(interaction.guild_id)
 
@@ -1207,7 +1250,7 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
         if channel_id is None:
             # Check DB
             db = getattr(self.bot, "database", None)
-            if not db:
+            if not db or not db.is_ready:
                 return
             ch_id = await db.get_request_channel(str(guild_id))
             if ch_id:
@@ -1432,6 +1475,8 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
     async def import_cmd(
         self, interaction: discord.Interaction, url: str, playlist_name: Optional[str] = None
     ) -> None:
+        if not await self._require_db(interaction):
+            return
         await interaction.response.defer()
 
         # Detect platform

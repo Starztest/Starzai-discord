@@ -59,12 +59,14 @@ def _today() -> str:
     return _now().strftime("%Y-%m-%d")
 
 
-def _sql_dt(dt: datetime) -> str:
-    """Format a datetime for SQLite comparison — matches datetime('now') format."""
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+def _sql_dt(dt: datetime) -> datetime:
+    """Ensure a datetime is timezone-aware (UTC) for asyncpg TIMESTAMPTZ columns."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
-def _sql_now() -> str:
-    """Current UTC time in SQLite-compatible format."""
+def _sql_now() -> datetime:
+    """Current UTC time as a timezone-aware datetime."""
     return _sql_dt(_now())
 
 def _week_start() -> str:
@@ -137,6 +139,16 @@ class TaskThreadView(discord.ui.View):
     def __init__(self, bot: StarzaiBot):
         super().__init__(timeout=None)
         self.bot = bot
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Block all button presses while the database is unavailable."""
+        if not self.bot.database.is_ready:
+            await _safe_error_response(
+                interaction, "Database Unavailable",
+                "The database connection is being established. Please try again in a moment.",
+            )
+            return False
+        return True
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
         logger.exception("TaskThreadView error on %s", getattr(item, "custom_id", item))
@@ -350,6 +362,15 @@ class MVPPerkView(discord.ui.View):
         super().__init__(timeout=None)
         self.bot = bot
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not self.bot.database.is_ready:
+            await _safe_error_response(
+                interaction, "Database Unavailable",
+                "The database connection is being established. Please try again in a moment.",
+            )
+            return False
+        return True
+
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
         logger.exception("MVPPerkView error on %s", getattr(item, "custom_id", item))
         await _safe_error_response(interaction, "Something Went Wrong", "An unexpected error occurred. Please try again.")
@@ -428,6 +449,15 @@ class ShieldView(discord.ui.View):
         super().__init__(timeout=None)
         self.bot = bot
         self.steal_log_id = steal_log_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not self.bot.database.is_ready:
+            await _safe_error_response(
+                interaction, "Database Unavailable",
+                "The database connection is being established. Please try again in a moment.",
+            )
+            return False
+        return True
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
         logger.exception("ShieldView error on %s", getattr(item, "custom_id", item))
@@ -664,19 +694,19 @@ class DodoCog(commands.Cog, name="Dodo"):
     def cog_unload(self):
         self.check_expirations.cancel()
 
-    # ── Channel config helpers (DB → env var fallback) ───────────────
+    # ── Config helpers (DB-backed, per-guild) ──────────────────────
 
     async def _get_dodo_config(self, guild_id: int) -> dict:
-        """Fetch Dodo channel config for a guild. Checks cache → DB → env var fallback."""
+        """Fetch Dodo config for a guild. Checks cache → DB."""
         if guild_id in self._dodo_config_cache:
             return self._dodo_config_cache[guild_id]
 
         row = await self.bot.database.get_dodo_config(guild_id)
         config = {
-            "tasks_channel_id": (row["tasks_channel_id"] if row and row["tasks_channel_id"] else None)
-                                or self.bot.settings.dodo_tasks_channel_id,
-            "gc_channel_id":    (row["gc_channel_id"] if row and row["gc_channel_id"] else None)
-                                or self.bot.settings.dodo_gc_channel_id,
+            "tasks_channel_id":    row["tasks_channel_id"] if row else None,
+            "gc_channel_id":       row["gc_channel_id"] if row else None,
+            "daily_mvp_role_id":   row["daily_mvp_role_id"] if row else None,
+            "weekly_mvp_role_id":  row["weekly_mvp_role_id"] if row else None,
         }
         self._dodo_config_cache[guild_id] = config
         return config
@@ -741,16 +771,20 @@ class DodoCog(commands.Cog, name="Dodo"):
             embed = await self._build_profile_embed(target.id, interaction.guild_id)
             await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @dodo_group.command(name="setchannel", description="Set the Dodo tasks and/or announcements channel")
+    @dodo_group.command(name="setchannel", description="Configure Dodo channels and MVP roles")
     @app_commands.describe(
         tasks_channel="Channel where task threads will be created",
         gc_channel="Channel for public callouts and announcements",
+        daily_mvp_role="Role assigned to the daily MVP",
+        weekly_mvp_role="Role assigned to the weekly MVP",
     )
     async def setchannel_cmd(
         self,
         interaction: discord.Interaction,
         tasks_channel: Optional[discord.TextChannel] = None,
         gc_channel: Optional[discord.TextChannel] = None,
+        daily_mvp_role: Optional[discord.Role] = None,
+        weekly_mvp_role: Optional[discord.Role] = None,
     ) -> None:
         if not interaction.guild:
             await interaction.response.send_message(
@@ -761,7 +795,7 @@ class DodoCog(commands.Cog, name="Dodo"):
         guild_id = interaction.guild_id
 
         # If no args, show current config
-        if tasks_channel is None and gc_channel is None:
+        if all(v is None for v in (tasks_channel, gc_channel, daily_mvp_role, weekly_mvp_role)):
             config = await self._get_dodo_config(guild_id)
             lines = []
             if config["tasks_channel_id"]:
@@ -772,10 +806,18 @@ class DodoCog(commands.Cog, name="Dodo"):
                 lines.append(f"📢 Announcements channel: <#{config['gc_channel_id']}>")
             else:
                 lines.append("📢 Announcements channel: *not set*")
+            if config.get("daily_mvp_role_id"):
+                lines.append(f"🏆 Daily MVP role: <@&{config['daily_mvp_role_id']}>")
+            else:
+                lines.append("🏆 Daily MVP role: *not set*")
+            if config.get("weekly_mvp_role_id"):
+                lines.append(f"👑 Weekly MVP role: <@&{config['weekly_mvp_role_id']}>")
+            else:
+                lines.append("👑 Weekly MVP role: *not set*")
             lines.append("")
-            lines.append("Use `/dodo setchannel tasks_channel:#channel gc_channel:#channel` to configure.")
+            lines.append("Use `/dodo setchannel` with any combination of options to configure.")
             embed = discord.Embed(
-                title="🦤 Dodo Channel Config",
+                title="🦤 Dodo Config",
                 description="\n".join(lines),
                 color=BOT_COLOR,
             )
@@ -787,6 +829,8 @@ class DodoCog(commands.Cog, name="Dodo"):
             guild_id=guild_id,
             tasks_channel_id=tasks_channel.id if tasks_channel else None,
             gc_channel_id=gc_channel.id if gc_channel else None,
+            daily_mvp_role_id=daily_mvp_role.id if daily_mvp_role else None,
+            weekly_mvp_role_id=weekly_mvp_role.id if weekly_mvp_role else None,
             configured_by=str(interaction.user.id),
         )
 
@@ -799,9 +843,13 @@ class DodoCog(commands.Cog, name="Dodo"):
             parts.append(f"📋 Tasks → {tasks_channel.mention}")
         if gc_channel:
             parts.append(f"📢 Announcements → {gc_channel.mention}")
+        if daily_mvp_role:
+            parts.append(f"🏆 Daily MVP role → {daily_mvp_role.mention}")
+        if weekly_mvp_role:
+            parts.append(f"👑 Weekly MVP role → {weekly_mvp_role.mention}")
 
         embed = discord.Embed(
-            title="✅ Dodo Channels Updated!",
+            title="✅ Dodo Config Updated!",
             description="\n".join(parts),
             color=BOT_SUCCESS_COLOR,
         )
@@ -882,10 +930,12 @@ class DodoCog(commands.Cog, name="Dodo"):
 
     async def _count_completed_today(self, user_id: int, guild_id: int) -> int:
         pool = self.bot.database.pool
-        today = _today()
+        now = _now()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow_start = today_start + timedelta(days=1)
         row = await pool.fetchrow(
-            "SELECT COUNT(*) as cnt FROM dodo_tasks WHERE user_id = $1 AND guild_id = $2 AND is_completed = 1 AND CAST(completed_at AS DATE) = CAST($3 AS DATE)",
-            user_id, guild_id, today,
+            "SELECT COUNT(*) as cnt FROM dodo_tasks WHERE user_id = $1 AND guild_id = $2 AND is_completed = 1 AND completed_at >= $3 AND completed_at < $4",
+            user_id, guild_id, today_start, tomorrow_start,
         )
         return row["cnt"] if row else 0
 
@@ -929,7 +979,7 @@ class DodoCog(commands.Cog, name="Dodo"):
         if not isinstance(channel, discord.TextChannel):
             raise RuntimeError(
                 "Could not find a valid text channel. "
-                "Set DODO_TASKS_CHANNEL_ID or run /dodo from a text channel."
+                "Run `/dodo setchannel` to configure or use /dodo from a text channel."
             )
 
         if row:
@@ -1009,7 +1059,7 @@ class DodoCog(commands.Cog, name="Dodo"):
             line = f"{emoji} {text}"
             if t["priority"] == "red" and t["timer_expires"]:
                 try:
-                    expires = datetime.fromisoformat(t["timer_expires"])
+                    expires = t["timer_expires"] if isinstance(t["timer_expires"], datetime) else datetime.fromisoformat(t["timer_expires"])
                     remaining = expires - _now()
                     if remaining.total_seconds() > 0:
                         line += f" ⏰ {_format_duration(remaining)}"
@@ -1098,7 +1148,9 @@ class DodoCog(commands.Cog, name="Dodo"):
             )
             if row and row["earliest"]:
                 try:
-                    earliest = datetime.fromisoformat(row["earliest"]).replace(tzinfo=timezone.utc)
+                    earliest = row["earliest"] if isinstance(row["earliest"], datetime) else datetime.fromisoformat(row["earliest"])
+                    if earliest.tzinfo is None:
+                        earliest = earliest.replace(tzinfo=timezone.utc)
                     unlock_at = earliest + timedelta(minutes=DODO_COOLDOWN_MINUTES)
                     remaining = unlock_at - now
                     if remaining.total_seconds() > 0:
@@ -1506,8 +1558,10 @@ class DodoCog(commands.Cog, name="Dodo"):
 
                 # Assign role
                 guild = self.bot.get_guild(guild_id)
-                if guild and self.bot.settings.dodo_daily_mvp_role_id:
-                    role = guild.get_role(self.bot.settings.dodo_daily_mvp_role_id)
+                dodo_cfg = await self._get_dodo_config(guild_id)
+                daily_role_id = dodo_cfg.get("daily_mvp_role_id")
+                if guild and daily_role_id:
+                    role = guild.get_role(daily_role_id)
                     if role:
                         # Remove from previous holder
                         for member in role.members:
@@ -1574,8 +1628,10 @@ class DodoCog(commands.Cog, name="Dodo"):
 
                 # Assign role
                 guild = self.bot.get_guild(guild_id)
-                if guild and self.bot.settings.dodo_weekly_mvp_role_id:
-                    role = guild.get_role(self.bot.settings.dodo_weekly_mvp_role_id)
+                dodo_cfg = await self._get_dodo_config(guild_id)
+                weekly_role_id = dodo_cfg.get("weekly_mvp_role_id")
+                if guild and weekly_role_id:
+                    role = guild.get_role(weekly_role_id)
                     if role:
                         for member in role.members:
                             try:
@@ -1768,29 +1824,32 @@ class DodoCog(commands.Cog, name="Dodo"):
             )
             return
 
-        # Execute steal
-        await pool.execute(
-            "UPDATE dodo_users SET xp = xp - $1 WHERE user_id = $2 AND guild_id = $3",
-            stolen_xp, target_id, guild_id,
-        )
-        await pool.execute(
-            "UPDATE dodo_users SET xp = xp + $1 WHERE user_id = $2 AND guild_id = $3",
-            stolen_xp, stealer_id, guild_id,
-        )
-        await pool.execute(
-            "INSERT INTO dodo_steal_log (guild_id, stealer_id, target_id, week_start, stolen_xp) VALUES ($1, $2, $3, $4, $5)",
-            guild_id, stealer_id, target_id, week, stolen_xp,
-        )
-        # Mark steal as used
-        await pool.execute(
-            "UPDATE dodo_mvp SET steal_used = 1, steal_target_id = $1 WHERE user_id = $2 AND steal_available = 1 AND steal_used = 0",
-            target_id, stealer_id,
-        )
-        # Using a perk makes you steal-eligible
-        await pool.execute(
-            "UPDATE dodo_users SET steal_shield = 0 WHERE user_id = $1 AND guild_id = $2",
-            stealer_id, guild_id,
-        )
+        # Execute steal atomically — all XP changes, audit log, and perk
+        # consumption must succeed or fail together.
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE dodo_users SET xp = xp - $1 WHERE user_id = $2 AND guild_id = $3",
+                    stolen_xp, target_id, guild_id,
+                )
+                await conn.execute(
+                    "UPDATE dodo_users SET xp = xp + $1 WHERE user_id = $2 AND guild_id = $3",
+                    stolen_xp, stealer_id, guild_id,
+                )
+                await conn.execute(
+                    "INSERT INTO dodo_steal_log (guild_id, stealer_id, target_id, week_start, stolen_xp) VALUES ($1, $2, $3, $4, $5)",
+                    guild_id, stealer_id, target_id, week, stolen_xp,
+                )
+                # Mark steal as used
+                await conn.execute(
+                    "UPDATE dodo_mvp SET steal_used = 1, steal_target_id = $1 WHERE user_id = $2 AND steal_available = 1 AND steal_used = 0",
+                    target_id, stealer_id,
+                )
+                # Using a perk makes you steal-eligible
+                await conn.execute(
+                    "UPDATE dodo_users SET steal_shield = 0 WHERE user_id = $1 AND guild_id = $2",
+                    stealer_id, guild_id,
+                )
 
         await interaction.response.send_message(
             embed=Embedder.success(
@@ -1856,22 +1915,24 @@ class DodoCog(commands.Cog, name="Dodo"):
             user_id,
         )
 
-        if steal:
-            # Reverse XP transfer
-            await pool.execute(
-                "UPDATE dodo_users SET xp = xp + $1 WHERE user_id = $2 AND guild_id = $3",
-                steal["stolen_xp"], user_id, steal["guild_id"],
-            )
-            await pool.execute(
-                "UPDATE dodo_users SET xp = GREATEST(0, xp - $1) WHERE user_id = $2 AND guild_id = $3",
-                steal["stolen_xp"], steal["stealer_id"], steal["guild_id"],
-            )
-            await pool.execute("DELETE FROM dodo_steal_log WHERE id = $1", steal["id"])
+        # Reverse XP + delete log + consume shield atomically
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                if steal:
+                    await conn.execute(
+                        "UPDATE dodo_users SET xp = xp + $1 WHERE user_id = $2 AND guild_id = $3",
+                        steal["stolen_xp"], user_id, steal["guild_id"],
+                    )
+                    await conn.execute(
+                        "UPDATE dodo_users SET xp = GREATEST(0, xp - $1) WHERE user_id = $2 AND guild_id = $3",
+                        steal["stolen_xp"], steal["stealer_id"], steal["guild_id"],
+                    )
+                    await conn.execute("DELETE FROM dodo_steal_log WHERE id = $1", steal["id"])
 
-        # Consume shield
-        await pool.execute(
-            "UPDATE dodo_users SET steal_shield = 0 WHERE user_id = $1", user_id,
-        )
+                # Consume shield
+                await conn.execute(
+                    "UPDATE dodo_users SET steal_shield = 0 WHERE user_id = $1", user_id,
+                )
 
         # Public announcement
         if steal:
@@ -1974,17 +2035,19 @@ class DodoCog(commands.Cog, name="Dodo"):
     @tasks.loop(minutes=1)
     async def check_expirations(self):
         """Background task: red task expiry, reminders, MVP, strike reset."""
+        if not self.bot.database.is_ready:
+            return
         try:
             pool = self.bot.database.pool
             now = _now()
-            now_iso = _sql_dt(now)
+            now_dt = _sql_dt(now)
 
             # 1. Red task expiry
             expired_tasks = await pool.fetch(
                 """SELECT id, user_id, guild_id FROM dodo_tasks
                    WHERE priority = 'red' AND is_completed = 0 AND is_expired = 0
                    AND timer_expires IS NOT NULL AND timer_expires < $1""",
-                now_iso,
+                now_dt,
             )
 
             for task in expired_tasks:
@@ -2003,7 +2066,7 @@ class DodoCog(commands.Cog, name="Dodo"):
                 """SELECT * FROM dodo_tasks
                    WHERE remind_enabled = 1 AND is_completed = 0 AND is_expired = 0
                    AND next_remind_at IS NOT NULL AND next_remind_at <= $1""",
-                now_iso,
+                now_dt,
             )
             reminder_tasks = [dict(r) for r in reminder_rows]
 
@@ -2021,7 +2084,9 @@ class DodoCog(commands.Cog, name="Dodo"):
                     next_td = _parse_timer(intervals[new_stage])
                     if next_td:
                         try:
-                            created = datetime.fromisoformat(task["created_at"]).replace(tzinfo=timezone.utc)
+                            created = task["created_at"] if isinstance(task["created_at"], datetime) else datetime.fromisoformat(task["created_at"])
+                            if created.tzinfo is None:
+                                created = created.replace(tzinfo=timezone.utc)
                             next_remind = _sql_dt(created + next_td)
                         except (ValueError, TypeError):
                             next_remind = _sql_dt(now + next_td)

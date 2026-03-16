@@ -5,38 +5,353 @@ Uses asyncpg to connect to Supabase PostgreSQL.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import re
+import socket
 from typing import Any, Dict, List, Optional, Set
+from urllib.parse import urlparse, urlunparse
 
 import asyncpg
 
 logger = logging.getLogger(__name__)
+
+# All exception types that can occur during asyncpg connection attempts.
+# - OSError / TimeoutError: network-level failures
+# - asyncpg.PostgresError / InterfaceError: driver-level failures
+# - ValueError: raised by Python's urllib.parse when the DSN contains a
+#   hostname that looks like a bracketed IPv6 literal but isn't
+#   (common with Supabase connection strings on some Python versions).
+_CONNECT_ERRORS = (
+    OSError,
+    asyncpg.PostgresError,
+    asyncpg.InterfaceError,
+    TimeoutError,
+    ValueError,
+)
+
+# ── Supabase region helpers ──────────────────────────────────────────
+
+# Canonical list of AWS regions where Supabase projects can be deployed.
+# Pooler hostnames follow the pattern: aws-0-{REGION}.pooler.supabase.com
+_VALID_SUPABASE_REGIONS = {
+    "us-east-1", "us-east-2", "us-west-1",
+    "ca-central-1",
+    "eu-west-1", "eu-west-2", "eu-west-3",
+    "eu-central-1", "eu-central-2", "eu-north-1",
+    "ap-south-1", "ap-southeast-1", "ap-southeast-2",
+    "ap-northeast-1", "ap-northeast-2",
+    "sa-east-1",
+}
+
+
+def _normalize_region(raw: str) -> str:
+    """Try to fix common SUPABASE_REGION typos and return a valid region.
+
+    Common mistakes:
+      - GCP-style names:  ``asia-northeast1`` → ``ap-northeast-1``
+      - Missing dash:     ``ap-northeast1``   → ``ap-northeast-1``
+      - Trailing junk:    ``ap-northeast1-1`` → ``ap-northeast-1``
+      - Extra whitespace: `` us-east-1 ``     → ``us-east-1``
+
+    Returns the corrected region if a match is found, otherwise the
+    original string (the caller should log a warning).
+    """
+    region = raw.strip().lower()
+
+    # Already valid
+    if region in _VALID_SUPABASE_REGIONS:
+        return region
+
+    # Strategy 1: insert missing dashes.
+    # AWS regions always end with a direction + dash + digit, e.g.
+    # "east-1", "northeast-2", "central-1", "south-1".
+    # A common typo drops the dash: "northeast1" or adds extra: "northeast1-1".
+    # Normalise by enforcing <letters>-<digit> at the end.
+    normalised = re.sub(r"([a-z])(\d)(?:-\d)?$", r"\1-\2", region)
+    if normalised in _VALID_SUPABASE_REGIONS:
+        return normalised
+
+    # Strategy 2: GCP-style "asia-northeast1" → "ap-northeast-1"
+    gcp_map = {
+        "asia-northeast": "ap-northeast",
+        "asia-southeast": "ap-southeast",
+        "asia-south": "ap-south",
+    }
+    for gcp_prefix, aws_prefix in gcp_map.items():
+        if region.startswith(gcp_prefix):
+            candidate = region.replace(gcp_prefix, aws_prefix, 1)
+            candidate = re.sub(r"([a-z])(\d)(?:-\d)?$", r"\1-\2", candidate)
+            if candidate in _VALID_SUPABASE_REGIONS:
+                return candidate
+
+    # No match found — return original
+    return region
+
+
+def _resolve_host(hostname: str) -> bool:
+    """Return True if *hostname* resolves via DNS."""
+    try:
+        socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        return True
+    except (socket.gaierror, OSError):
+        return False
+
+
+def _find_working_region(project_ref: str, preferred: str) -> str:
+    """Return a region whose pooler hostname resolves via DNS.
+
+    Tries the preferred region first, then falls back to probing all
+    known regions.  Returns the preferred region as-is if nothing works
+    (the connection attempt will fail later with a clear error).
+    """
+    preferred_host = f"aws-0-{preferred}.pooler.supabase.com"
+    if _resolve_host(preferred_host):
+        return preferred
+
+    logger.warning(
+        "Pooler hostname %s does not resolve — trying other regions…",
+        preferred_host,
+    )
+    for region in sorted(_VALID_SUPABASE_REGIONS):
+        if region == preferred:
+            continue
+        host = f"aws-0-{region}.pooler.supabase.com"
+        if _resolve_host(host):
+            logger.info(
+                "Found working pooler region via DNS probe: %s", region
+            )
+            return region
+
+    # Nothing resolved — return preferred so the error message is useful
+    logger.error(
+        "No Supabase pooler hostname resolved via DNS. "
+        "Please set DATABASE_URL to the Session Pooler connection string "
+        "from: Supabase Dashboard → Project Settings → Database → "
+        "Connection string → 'Session Pooler' tab."
+    )
+    return preferred
+
+
+# ── URL auto-conversion ──────────────────────────────────────────────
+
+def _to_pooler_url(url: str) -> str:
+    """Auto-convert a **direct** Supabase connection string to the
+    free IPv4-compatible **Session Pooler** format.
+
+    Direct format (IPv6 only — fails on Railway / Render / most VPS):
+        postgresql://postgres:[PASS]@db.<REF>.supabase.co:5432/postgres
+
+    Session Pooler format (IPv4 + IPv6 — works everywhere, FREE):
+        postgresql://postgres.<REF>:[PASS]@aws-0-<REGION>.pooler.supabase.com:5432/postgres
+
+    If the URL is already a pooler URL, or is not a Supabase URL at all,
+    it is returned unchanged.
+    """
+    if not url:
+        return url
+
+    # Detect common mistake: user pasted the Supabase *API* URL
+    # (https://xxx.supabase.co) instead of the PostgreSQL connection string.
+    if url.startswith("https://") and ".supabase.co" in url:
+        m_ref = re.search(r"https://([a-z0-9]+)\.supabase\.co", url)
+        if m_ref:
+            logger.critical(
+                "DATABASE_URL is set to the Supabase **REST API** URL "
+                "(https://%s.supabase.co) — this is NOT a PostgreSQL connection string!\n"
+                "Go to: Supabase Dashboard → Project Settings → Database → "
+                "Connection string → 'Session Pooler' tab and copy the "
+                "postgresql:// URL.",
+                m_ref.group(1),
+            )
+        # Return as-is — asyncpg will fail with a clear scheme error,
+        # and the retry logic will surface the CRITICAL log above.
+        return url
+
+    # Already using pooler → nothing to do
+    if "pooler.supabase.com" in url:
+        logger.info("DATABASE_URL already uses Supabase Session Pooler (IPv4 OK)")
+        return url
+
+    # Match direct Supabase connection: db.<REF>.supabase.co
+    m = re.search(r"@db\.([a-z0-9]+)\.supabase\.co", url)
+    if not m:
+        # Not a Supabase direct URL — could be local/other PG, leave as-is
+        return url
+
+    project_ref = m.group(1)
+    logger.warning(
+        "Detected direct Supabase connection string (db.%s.supabase.co). "
+        "Direct connections require IPv6 which is unavailable on most "
+        "deployment platforms.  Auto-converting to Session Pooler…",
+        project_ref,
+    )
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        logger.error("Could not parse DATABASE_URL — returning as-is")
+        return url
+
+    # Original user is usually 'postgres', pooler needs 'postgres.<REF>'
+    orig_user = parsed.username or "postgres"
+    # Strip any existing .ref suffix to avoid double-appending
+    base_user = orig_user.split(".")[0]
+    new_user = f"{base_user}.{project_ref}"
+
+    password = parsed.password or ""
+
+    # Supabase region detection: try to pull from env, normalise typos,
+    # then verify via DNS — falling back to probing all known regions.
+    raw_region = os.getenv("SUPABASE_REGION", "us-east-1")
+    region = _normalize_region(raw_region)
+    if region != raw_region:
+        logger.info(
+            "Normalised SUPABASE_REGION '%s' → '%s'", raw_region, region,
+        )
+
+    if region not in _VALID_SUPABASE_REGIONS:
+        logger.warning(
+            "SUPABASE_REGION '%s' is not a recognised AWS region. "
+            "Valid regions: %s",
+            region, ", ".join(sorted(_VALID_SUPABASE_REGIONS)),
+        )
+
+    # DNS-check the generated hostname; if it fails, try other regions
+    region = _find_working_region(project_ref, region)
+
+    new_host = f"aws-0-{region}.pooler.supabase.com"
+
+    # Session Pooler uses port 5432 (supports prepared statements)
+    # Transaction Pooler uses port 6543 (does NOT support prepared stmts)
+    new_port = 5432
+
+    new_netloc = f"{new_user}:{password}@{new_host}:{new_port}"
+    pooler_url = urlunparse((
+        parsed.scheme or "postgresql",
+        new_netloc,
+        parsed.path or "/postgres",
+        parsed.params,
+        parsed.query,
+        parsed.fragment,
+    ))
+
+    logger.info(
+        "Converted to Session Pooler: %s@%s:%d (region=%s)",
+        new_user, new_host, new_port, region,
+    )
+    return pooler_url
 
 
 class DatabaseManager:
     """Async PostgreSQL wrapper for all bot persistence (Supabase)."""
 
     def __init__(self, database_url: str):
-        self.database_url = database_url
+        self.database_url = _to_pooler_url(database_url)
         self._pool: Optional[asyncpg.Pool] = None
+        self._connect_task: Optional[asyncio.Task] = None
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
-    async def initialize(self) -> None:
-        """Open the connection pool and create tables if needed."""
-        self._pool = await asyncpg.create_pool(
-            self.database_url,
-            min_size=2,
-            max_size=10,
-            statement_cache_size=0,  # Required for Supabase PgBouncer compatibility
-        )
-        await self._create_tables()
-        await self._migrate_dodo_tasks_remind_character()
-        logger.info("Database initialized (PostgreSQL via asyncpg)")
+    @property
+    def is_ready(self) -> bool:
+        """True when the connection pool is open and usable."""
+        return self._pool is not None
+
+    async def _try_connect(self) -> bool:
+        """Attempt a single connection cycle. Returns True on success."""
+        try:
+            import ssl as _ssl
+            _ctx = _ssl.create_default_context()
+            # Supabase Session Pooler requires TLS but the cert CN
+            # won't match the pooler hostname \u2014 skip verification.
+            _ctx.check_hostname = False
+            _ctx.verify_mode = _ssl.CERT_NONE
+
+            self._pool = await asyncpg.create_pool(
+                self.database_url,
+                min_size=2,
+                max_size=10,
+                statement_cache_size=0,  # Required for Supabase pooler compatibility
+                command_timeout=30,
+                ssl=_ctx,
+            )
+            await self._create_tables()
+            await self._migrate_dodo_tasks_remind_character()
+            await self._migrate_dodo_config_role_columns()
+            logger.info(
+                "Database initialized (PostgreSQL via asyncpg + Session Pooler)"
+            )
+            return True
+        except _CONNECT_ERRORS as exc:
+            # Clean up partial pool if it was created
+            if self._pool is not None:
+                try:
+                    await self._pool.close()
+                except Exception:
+                    pass
+                self._pool = None
+            raise exc
+
+    async def initialize(
+        self, *, max_retries: int = 5, base_delay: float = 2.0
+    ) -> bool:
+        """Open the connection pool and create tables if needed.
+
+        Retries with exponential back-off so transient network errors
+        (common on containerised platforms like Railway) don't crash
+        the bot on startup.  Returns True on success, False if all
+        retries were exhausted (the bot can still start without DB).
+        """
+        for attempt in range(1, max_retries + 1):
+            try:
+                await self._try_connect()
+                return True
+            except _CONNECT_ERRORS as exc:
+                delay = base_delay * (2 ** (attempt - 1))  # 2, 4, 8, 16, 32 s
+                logger.warning(
+                    "DB connect attempt %d/%d failed: %s — retrying in %.0fs",
+                    attempt, max_retries, exc, delay,
+                )
+                await asyncio.sleep(delay)
+
+        logger.error("Could not connect to database after %d attempts", max_retries)
+        return False
+
+    async def connect_forever(
+        self, *, interval: float = 30.0
+    ) -> None:
+        """Keep trying to connect in the background until successful.
+
+        Intended to be launched as an ``asyncio.Task`` when the initial
+        ``initialize()`` fails so the bot can come online and recover
+        once the DB becomes reachable.
+        """
+        while not self.is_ready:
+            try:
+                await self._try_connect()
+                logger.info("Background DB reconnect succeeded")
+                return
+            except _CONNECT_ERRORS as exc:
+                logger.warning(
+                    "Background DB reconnect failed: %s — next try in %.0fs",
+                    exc, interval,
+                )
+                await asyncio.sleep(interval)
+
+    def start_background_connect(self) -> None:
+        """Spawn a background task that keeps retrying the DB connection."""
+        if self._connect_task is None or self._connect_task.done():
+            self._connect_task = asyncio.create_task(
+                self.connect_forever(), name="db-reconnect"
+            )
+            logger.info("Spawned background DB reconnect task")
 
     async def close(self) -> None:
+        if self._connect_task and not self._connect_task.done():
+            self._connect_task.cancel()
         if self._pool:
             await self._pool.close()
             logger.info("Database connection pool closed")
@@ -62,6 +377,25 @@ class DatabaseManager:
                 logger.info("Migrating dodo_tasks: adding remind_character column")
                 await self.pool.execute("ALTER TABLE dodo_tasks ADD COLUMN remind_character TEXT")
 
+    async def _migrate_dodo_config_role_columns(self) -> None:
+        """Add MVP role columns to dodo_config if they don't exist."""
+        tbl = await self.pool.fetchval(
+            """SELECT 1 FROM information_schema.tables
+               WHERE table_name = 'dodo_config'"""
+        )
+        if not tbl:
+            return
+        for col_name in ("daily_mvp_role_id", "weekly_mvp_role_id"):
+            exists = await self.pool.fetchval(
+                """SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'dodo_config' AND column_name = $1""",
+                col_name,
+            )
+            if not exists:
+                logger.info("Migrating dodo_config: adding %s column", col_name)
+                await self.pool.execute(
+                    f"ALTER TABLE dodo_config ADD COLUMN {col_name} BIGINT"
+                )
 
     # ── Schema ───────────────────────────────────────────────────────
 
@@ -342,11 +676,13 @@ class DatabaseManager:
             """)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS dodo_config (
-                    guild_id            BIGINT PRIMARY KEY,
-                    tasks_channel_id    BIGINT,
-                    gc_channel_id       BIGINT,
-                    configured_by       TEXT,
-                    configured_at       TIMESTAMPTZ DEFAULT NOW()
+                    guild_id                BIGINT PRIMARY KEY,
+                    tasks_channel_id        BIGINT,
+                    gc_channel_id           BIGINT,
+                    daily_mvp_role_id       BIGINT,
+                    weekly_mvp_role_id      BIGINT,
+                    configured_by           TEXT,
+                    configured_at           TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
             # ── Indexes ──────────────────────────────────────────
@@ -376,6 +712,8 @@ class DatabaseManager:
         )
 
     async def get_user_model(self, user_id: int) -> Optional[str]:
+        if not self.is_ready:
+            return None
         row = await self.pool.fetchrow(
             "SELECT preferred_model FROM users WHERE user_id = $1", user_id
         )
@@ -389,6 +727,8 @@ class DatabaseManager:
         )
 
     async def add_user_tokens(self, user_id: int, tokens: int) -> None:
+        if not self.is_ready:
+            return
         await self.ensure_user(user_id)
         await self.pool.execute(
             "UPDATE users SET total_tokens = total_tokens + $1, updated_at = NOW() WHERE user_id = $2",
@@ -516,13 +856,18 @@ class DatabaseManager:
         success: bool = True,
         error_message: Optional[str] = None,
     ) -> None:
-        await self.pool.execute(
-            """INSERT INTO usage_logs
-               (user_id, guild_id, command, model, tokens_used, latency_ms, success, error_message)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
-            user_id, guild_id, command, model, tokens_used, latency_ms,
-            1 if success else 0, error_message,
-        )
+        if not self.is_ready:
+            return  # Silently skip — analytics are non-critical
+        try:
+            await self.pool.execute(
+                """INSERT INTO usage_logs
+                   (user_id, guild_id, command, model, tokens_used, latency_ms, success, error_message)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
+                user_id, guild_id, command, model, tokens_used, latency_ms,
+                1 if success else 0, error_message,
+            )
+        except Exception as exc:
+            logger.debug("log_usage skipped: %s", exc)
 
     async def get_global_stats(self) -> Dict[str, Any]:
         """Return aggregate bot statistics."""
@@ -1212,25 +1557,35 @@ class DatabaseManager:
         guild_id: int,
         tasks_channel_id: Optional[int] = None,
         gc_channel_id: Optional[int] = None,
+        daily_mvp_role_id: Optional[int] = None,
+        weekly_mvp_role_id: Optional[int] = None,
         configured_by: str = "",
     ) -> None:
-        """Set or update the Dodo channel config for a guild (upsert)."""
+        """Set or update the Dodo config for a guild (upsert)."""
         await self.pool.execute(
-            """INSERT INTO dodo_config (guild_id, tasks_channel_id, gc_channel_id, configured_by)
-               VALUES ($1, $2, $3, $4)
+            """INSERT INTO dodo_config
+                   (guild_id, tasks_channel_id, gc_channel_id,
+                    daily_mvp_role_id, weekly_mvp_role_id, configured_by)
+               VALUES ($1, $2, $3, $4, $5, $6)
                ON CONFLICT(guild_id) DO UPDATE SET
-                   tasks_channel_id = COALESCE(EXCLUDED.tasks_channel_id, dodo_config.tasks_channel_id),
-                   gc_channel_id    = COALESCE(EXCLUDED.gc_channel_id, dodo_config.gc_channel_id),
-                   configured_by    = EXCLUDED.configured_by,
-                   configured_at    = NOW()
+                   tasks_channel_id   = COALESCE(EXCLUDED.tasks_channel_id,   dodo_config.tasks_channel_id),
+                   gc_channel_id      = COALESCE(EXCLUDED.gc_channel_id,      dodo_config.gc_channel_id),
+                   daily_mvp_role_id  = COALESCE(EXCLUDED.daily_mvp_role_id,  dodo_config.daily_mvp_role_id),
+                   weekly_mvp_role_id = COALESCE(EXCLUDED.weekly_mvp_role_id, dodo_config.weekly_mvp_role_id),
+                   configured_by      = EXCLUDED.configured_by,
+                   configured_at      = NOW()
             """,
-            guild_id, tasks_channel_id, gc_channel_id, configured_by,
+            guild_id, tasks_channel_id, gc_channel_id,
+            daily_mvp_role_id, weekly_mvp_role_id, configured_by,
         )
 
     async def get_dodo_config(self, guild_id: int) -> Optional[Dict[str, Any]]:
-        """Get the Dodo channel config for a guild."""
+        """Get the Dodo config for a guild."""
         row = await self.pool.fetchrow(
-            "SELECT tasks_channel_id, gc_channel_id, configured_by, configured_at FROM dodo_config WHERE guild_id = $1",
+            """SELECT tasks_channel_id, gc_channel_id,
+                      daily_mvp_role_id, weekly_mvp_role_id,
+                      configured_by, configured_at
+               FROM dodo_config WHERE guild_id = $1""",
             guild_id,
         )
         return dict(row) if row else None

@@ -110,9 +110,15 @@ class Settings:
         )
     )
 
-    # Database (Supabase PostgreSQL)
+    # Database (Supabase PostgreSQL — use Session Pooler URL for IPv4 compat)
     database_url: str = field(
         default_factory=lambda: os.getenv("DATABASE_URL", "")
+    )
+    # Supabase region — used for auto-converting direct connection strings
+    # to Session Pooler format.  Only needed if you use a direct DB URL;
+    # ignored when you provide a pooler URL directly.
+    supabase_region: str = field(
+        default_factory=lambda: os.getenv("SUPABASE_REGION", "us-east-1")
     )
 
     # Music API mirrors (comma-separated JioSaavn mirrors)
@@ -131,19 +137,7 @@ class Settings:
         default_factory=lambda: int(os.getenv("MUSIC_API_TIMEOUT", "30"))
     )
 
-    # Dodo Todo System
-    dodo_tasks_channel_id: Optional[int] = field(
-        default_factory=lambda: _parse_optional_int(os.getenv("DODO_TASKS_CHANNEL_ID", ""))
-    )
-    dodo_gc_channel_id: Optional[int] = field(
-        default_factory=lambda: _parse_optional_int(os.getenv("DODO_GC_CHANNEL_ID", ""))
-    )
-    dodo_daily_mvp_role_id: Optional[int] = field(
-        default_factory=lambda: _parse_optional_int(os.getenv("DODO_DAILY_MVP_ROLE_ID", ""))
-    )
-    dodo_weekly_mvp_role_id: Optional[int] = field(
-        default_factory=lambda: _parse_optional_int(os.getenv("DODO_WEEKLY_MVP_ROLE_ID", ""))
-    )
+    # Dodo Todo System \u2014 configured per-guild via /dodo setchannel (stored in DB)
 
     # Railway
     port: int = field(default_factory=lambda: int(os.getenv("PORT", "8080")))
