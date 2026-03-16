@@ -79,11 +79,22 @@ class StarzaiBot(commands.Bot):
         )
 
         self.settings = settings
-        self.llm = LLMClient(
-            api_key=settings.megallm_api_key,
-            base_url=settings.megallm_base_url,
-            default_model=settings.default_model,
-        )
+
+        # Build multi-provider LLM client from all configured API keys.
+        # Providers are tried in priority order with automatic failover.
+        provider_configs = settings.build_provider_configs()
+        if provider_configs:
+            self.llm = LLMClient(
+                providers=provider_configs,
+                default_model=settings.default_model,
+            )
+        else:
+            # Fallback to legacy single-provider mode
+            self.llm = LLMClient(
+                api_key=settings.megallm_api_key,
+                base_url=settings.megallm_base_url,
+                default_model=settings.default_model,
+            )
         self.rate_limiter = RateLimiter(
             user_limit=settings.rate_limit_per_user,
             global_limit=settings.rate_limit_global,
@@ -306,6 +317,8 @@ class StarzaiBot(commands.Bot):
         logger.info("Health-check server listening on port %d", self.settings.port)
 
     async def _health_handler(self, _request: web.Request) -> web.Response:
+        # NOTE: Provider details are intentionally omitted from the public
+        # health endpoint.  Use logs for provider debugging.
         return web.json_response(
             {
                 "status": "ok",

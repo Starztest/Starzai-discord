@@ -25,6 +25,12 @@ from utils.embedder import Embedder
 from utils.llm_client import LLMClient, LLMClientError
 from utils.analysis_view import AnalysisView, create_analysis_embeds, format_full_report
 from utils.analysis_helpers import multi_agent_analysis
+from utils.model_registry import (
+    ModelTier,
+    ModelRegistry,
+    TIER_DISPLAY,
+    build_registry,
+)
 
 if TYPE_CHECKING:
     from bot import StarzaiBot
@@ -160,6 +166,18 @@ class ChatCog(commands.Cog, name="Chat"):
             return saved
         return self.bot.settings.default_model
 
+    def _get_registry(self) -> ModelRegistry:
+        """Return the model registry (cached on bot instance)."""
+        if not hasattr(self.bot, '_model_registry') or self.bot._model_registry is None:
+            active = [p.cfg.name for p in self.bot.llm._providers]
+            self.bot._model_registry = build_registry(
+                active_providers=active,
+                free_models=self.bot.settings.free_models or None,
+                premium_models=self.bot.settings.premium_models or None,
+                ultra_models=self.bot.settings.ultra_models or None,
+            )
+        return self.bot._model_registry
+
     # ── Helper: log usage ────────────────────────────────────────────
 
     async def _log(
@@ -264,7 +282,7 @@ class ChatCog(commands.Cog, name="Chat"):
     @app_commands.command(
         name="ask", description="Ask a question using a specific model"
     )
-    @app_commands.describe(message="Your question", model="AI model to use")
+    @app_commands.describe(message="Your question", model="AI model to use (start typing to search)")
     async def ask_cmd(
         self, interaction: discord.Interaction, message: str, model: str = ""
     ) -> None:
@@ -289,6 +307,21 @@ class ChatCog(commands.Cog, name="Chat"):
                 embed=Embedder.error("AI Error", str(exc))
             )
             await self._log(interaction, "ask", resolved, success=False, error_message=str(exc))
+
+    @ask_cmd.autocomplete("model")
+    async def ask_model_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list:
+        """Provide autocomplete suggestions for model names in /ask."""
+        registry = self._get_registry()
+        matches = registry.search(current, limit=25)
+        return [
+            app_commands.Choice(
+                name=f"{m.display_name} — {m.description[:40]}" if m.description else m.display_name,
+                value=m.canonical,
+            )
+            for m in matches
+        ]
 
     # ── /conversation ────────────────────────────────────────────────
 
@@ -460,44 +493,69 @@ class ChatCog(commands.Cog, name="Chat"):
     @app_commands.command(
         name="set-model", description="Set your preferred AI model"
     )
-    @app_commands.describe(model="The model to use by default")
+    @app_commands.describe(model="The model to use by default (start typing to search)")
     async def set_model_cmd(
         self, interaction: discord.Interaction, model: str
     ) -> None:
-        # Validate explicitly: check if input is a valid model or alias
-        settings = self.bot.settings
-        model_lower = model.strip().lower()
-        
-        if model in settings.available_models:
-            resolved = model
-        elif model_lower in settings.model_aliases:
-            resolved = settings.model_aliases[model_lower]
+        resolved = self.bot.settings.resolve_model(model)
+        registry = self._get_registry()
+        entry = registry.get(resolved)
+
+        if entry:
+            display = f"`{entry.canonical}` ({entry.display_name})"
+        elif "/" in resolved:
+            display = f"`{resolved}` (provider-specific)"
         else:
-            await interaction.response.send_message(
-                embed=Embedder.error(
-                    "Unknown Model",
-                    f"`{model}` is not available.\nUse `/models` to see available models and aliases.",
-                ),
-                ephemeral=True,
-            )
-            return
+            display = f"`{resolved}`"
 
         await self.bot.database.set_user_model(interaction.user.id, resolved)
         await interaction.response.send_message(
             embed=Embedder.success(
                 "Model Updated",
-                f"Your preferred model is now `{resolved}`.\nAll future requests will use this model.",
+                f"Your preferred model is now {display}.\nAll future requests will use this model.",
             )
         )
 
+    @set_model_cmd.autocomplete("model")
+    async def set_model_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list:
+        """Provide autocomplete suggestions for model names."""
+        registry = self._get_registry()
+        matches = registry.search(current, limit=25)
+        return [
+            app_commands.Choice(
+                name=f"{m.display_name} — {m.description[:40]}" if m.description else m.display_name,
+                value=m.canonical,
+            )
+            for m in matches
+        ]
+
     # ── /models ──────────────────────────────────────────────────────
 
-    @app_commands.command(name="models", description="List available AI models")
+    @app_commands.command(name="models", description="Browse and select AI models by tier")
     async def models_cmd(self, interaction: discord.Interaction) -> None:
         current = await self._resolve_model(interaction.user.id)
-        view = ModelSelectorView(self.bot, interaction.user.id, current)
+        registry = self._get_registry()
+
+        # Build tier summary (no provider info shown)
+        tiers = []
+        for tier in ModelTier:
+            models = registry.by_tier(tier)
+            if models:
+                meta = TIER_DISPLAY.get(tier, {})
+                tiers.append({
+                    "emoji": meta.get("emoji", ""),
+                    "label": meta.get("label", tier.value),
+                    "description": meta.get("description", ""),
+                    "count": len(models),
+                })
+
+        view = ModelCatalogueView(
+            self.bot, interaction.user.id, current, registry
+        )
         await interaction.response.send_message(
-            embed=Embedder.model_list(self.bot.settings.available_models, current),
+            embed=Embedder.model_catalogue(current, tiers),
             view=view,
             ephemeral=True,
         )
@@ -1620,31 +1678,53 @@ Format with bullet points and emojis. Be insightful and respectful."""
             logger.info("Expired mention conversation for user %s", user_id)
 
 
-# ── Model Selector View ──────────────────────────────────────────────
+# ── Model Catalogue View ─────────────────────────────────────────────
 
-class ModelSelectorView(discord.ui.View):
-    """Interactive button view for selecting AI models."""
-    
-    def __init__(self, bot: StarzaiBot, user_id: int, current_model: str):
-        super().__init__(timeout=180)  # 3 minute timeout
+
+class ModelCatalogueView(discord.ui.View):
+    """Interactive tier-based model browser.
+
+    Shows tier buttons first.  When a user picks a tier, a
+    ``Select`` menu of models in that tier appears for selection.
+    No provider information is shown anywhere.
+    """
+
+    def __init__(
+        self,
+        bot: StarzaiBot,
+        user_id: int,
+        current_model: str,
+        registry: ModelRegistry,
+    ):
+        super().__init__(timeout=300)
         self.bot = bot
         self.user_id = user_id
         self.current_model = current_model
-        
-        # Add buttons for each model (max 5 per row, max 25 total)
-        models = bot.settings.available_models[:25]  # Discord limit
-        for i, model in enumerate(models):
+        self.registry = registry
+
+        # Add a tier button per populated tier
+        row = 0
+        for tier in ModelTier:
+            models = registry.by_tier(tier)
+            if not models:
+                continue
+            meta = TIER_DISPLAY.get(tier, {})
+            emoji = meta.get("emoji", "")
+            label = meta.get("label", tier.value)
+
             button = discord.ui.Button(
-                label=model,
-                style=discord.ButtonStyle.primary if model == current_model else discord.ButtonStyle.secondary,
-                custom_id=f"model_{model}",
-                row=i // 5,  # 5 buttons per row
+                label=f"{emoji} {label} ({len(models)})",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"tier_{tier.value}",
+                row=row // 5,
             )
-            button.callback = self._make_callback(model)
+            button.callback = self._make_tier_callback(tier)
             self.add_item(button)
-    
-    def _make_callback(self, model: str):
-        """Create a callback for a specific model button."""
+            row += 1
+
+    def _make_tier_callback(self, tier: ModelTier):
+        """Return an interaction callback that shows models for *tier*."""
+
         async def callback(interaction: discord.Interaction):
             if interaction.user.id != self.user_id:
                 await interaction.response.send_message(
@@ -1652,27 +1732,147 @@ class ModelSelectorView(discord.ui.View):
                     ephemeral=True,
                 )
                 return
-            
-            resolved = self.bot.settings.resolve_model(model)
-            await self.bot.database.set_user_model(self.user_id, resolved)
-            
-            # Update the view to show new selection
-            for item in self.children:
-                if isinstance(item, discord.ui.Button):
-                    if item.label == model:
-                        item.style = discord.ButtonStyle.primary
-                    else:
-                        item.style = discord.ButtonStyle.secondary
-            
-            await interaction.response.edit_message(
-                embed=Embedder.success(
-                    "Model Updated",
-                    f"Your preferred model is now **{resolved}**.\nAll future requests will use this model."
-                ),
-                view=self,
+
+            models = self.registry.by_tier(tier)
+            meta = TIER_DISPLAY.get(tier, {})
+
+            # Build a Select menu for the models in this tier
+            view = ModelSelectView(
+                self.bot,
+                self.user_id,
+                self.current_model,
+                models,
+                self.registry,
             )
-        
+
+            model_data = [
+                {
+                    "canonical": m.canonical,
+                    "display_name": m.display_name,
+                    "description": m.description,
+                }
+                for m in models
+            ]
+
+            await interaction.response.edit_message(
+                embed=Embedder.model_tier_list(
+                    meta.get("label", tier.value),
+                    meta.get("emoji", ""),
+                    model_data,
+                    self.current_model,
+                ),
+                view=view,
+            )
+
         return callback
+
+
+class ModelSelectView(discord.ui.View):
+    """Dropdown selector for models within a tier (no provider info)."""
+
+    def __init__(
+        self,
+        bot: StarzaiBot,
+        user_id: int,
+        current_model: str,
+        models: list,
+        registry: ModelRegistry,
+    ):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.user_id = user_id
+        self.current_model = current_model
+        self.registry = registry
+
+        # Build select options (max 25) — no provider info shown
+        options = []
+        for m in models[:25]:
+            desc = (m.description or "")[:100]
+
+            options.append(
+                discord.SelectOption(
+                    label=m.display_name[:100],
+                    value=m.canonical,
+                    description=desc[:100] or None,
+                    default=(m.canonical == current_model),
+                )
+            )
+
+        if options:
+            select = discord.ui.Select(
+                placeholder="Choose a model...",
+                options=options,
+                custom_id="model_select",
+            )
+            select.callback = self._on_select
+            self.add_item(select)
+
+        # Back button
+        back_btn = discord.ui.Button(
+            label="Back to Tiers",
+            style=discord.ButtonStyle.secondary,
+            custom_id="back_to_tiers",
+            row=1,
+        )
+        back_btn.callback = self._go_back
+        self.add_item(back_btn)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "This selector isn't for you! Use `/models` to get your own.",
+                ephemeral=True,
+            )
+            return
+
+        selected = interaction.data["values"][0]
+        entry = self.registry.get(selected)
+        display = entry.display_name if entry else selected
+
+        await self.bot.database.set_user_model(self.user_id, selected)
+        self.current_model = selected
+
+        await interaction.response.edit_message(
+            embed=Embedder.success(
+                "Model Updated",
+                f"Your preferred model is now **{display}** (`{selected}`).\n"
+                "All future requests will use this model.",
+            ),
+            view=None,
+        )
+
+    async def _go_back(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "These buttons aren't for you!",
+                ephemeral=True,
+            )
+            return
+
+        # Rebuild the catalogue view
+        view = ModelCatalogueView(
+            self.bot,
+            self.user_id,
+            self.current_model,
+            self.registry,
+        )
+
+        tiers = []
+        for tier in ModelTier:
+            models = self.registry.by_tier(tier)
+            if models:
+                meta = TIER_DISPLAY.get(tier, {})
+                tiers.append({
+                    "emoji": meta.get("emoji", ""),
+                    "label": meta.get("label", tier.value),
+                    "description": meta.get("description", ""),
+                    "count": len(models),
+                })
+
+        await interaction.response.edit_message(
+            embed=Embedder.model_catalogue(self.current_model, tiers),
+            view=view,
+        )
 
 
 async def setup(bot: StarzaiBot) -> None:

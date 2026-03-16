@@ -183,7 +183,7 @@ class SearchCog(commands.Cog, name="Search"):
     )
     @app_commands.describe(
         query="What to search for (e.g. 'latest Ukraine war updates')",
-        model="AI model to use (optional)",
+        model="AI model to use (start typing to search)",
     )
     async def search_cmd(
         self,
@@ -300,7 +300,7 @@ class SearchCog(commands.Cog, name="Search"):
     )
     @app_commands.describe(
         topic="News topic (e.g. 'Israel Hamas war', 'AI regulation', 'stock market')",
-        model="AI model to use (optional)",
+        model="AI model to use (start typing to search)",
     )
     async def news_cmd(
         self,
@@ -404,6 +404,38 @@ class SearchCog(commands.Cog, name="Search"):
                 interaction, "news", resolved_model,
                 success=False, error_message=str(exc),
             )
+
+    # ── Model autocomplete for /search and /news ────────────────────
+
+    @search_cmd.autocomplete("model")
+    async def search_model_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list:
+        from utils.model_registry import build_registry
+        registry = build_registry()
+        matches = registry.search(current, limit=25)
+        return [
+            app_commands.Choice(
+                name=f"{m.display_name} — {m.description[:40]}" if m.description else m.display_name,
+                value=m.canonical,
+            )
+            for m in matches
+        ]
+
+    @news_cmd.autocomplete("model")
+    async def news_model_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list:
+        from utils.model_registry import build_registry
+        registry = build_registry()
+        matches = registry.search(current, limit=25)
+        return [
+            app_commands.Choice(
+                name=f"{m.display_name} — {m.description[:40]}" if m.description else m.display_name,
+                value=m.canonical,
+            )
+            for m in matches
+        ]
 
     # ══════════════════════════════════════════════════════════════
     #  /setnews — Configure auto-news for a channel

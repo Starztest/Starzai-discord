@@ -118,7 +118,7 @@ class Embedder:
 
     @classmethod
     def model_list(cls, models: List[str], current: str) -> discord.Embed:
-        """Create an embed listing available models."""
+        """Create an embed listing available models (legacy flat list)."""
         lines = []
         for m in models:
             marker = " ◀ *current*" if m == current else ""
@@ -126,6 +126,55 @@ class Embedder:
         return cls.standard(
             "🤖 Available Models",
             "\n".join(lines) or "No models configured.",
+        )
+
+    @classmethod
+    def model_catalogue(
+        cls,
+        current: str,
+        tiers: Optional[List[dict]] = None,
+    ) -> discord.Embed:
+        """Create a rich model catalogue embed with tiers (no provider info)."""
+        lines = [
+            f"Your current model: **`{current}`**\n",
+            "Choose a tier below to browse models, "
+            "or type `/set-model` with a model name.\n",
+        ]
+
+        if tiers:
+            for tier in tiers:
+                emoji = tier.get("emoji", "")
+                label = tier.get("label", "")
+                desc = tier.get("description", "")
+                count = tier.get("count", 0)
+                lines.append(f"{emoji} **{label}** — {desc} ({count} models)")
+
+        return cls.standard(
+            "🤖 AI Model Catalogue",
+            "\n".join(lines),
+        )
+
+    @classmethod
+    def model_tier_list(
+        cls,
+        tier_name: str,
+        tier_emoji: str,
+        models: List[dict],
+        current: str,
+    ) -> discord.Embed:
+        """Create an embed listing models in a specific tier (no provider info)."""
+        lines = []
+        for m in models:
+            name = m.get("canonical", "")
+            display = m.get("display_name", name)
+            desc = m.get("description", "")
+            marker = " ◀" if name == current else ""
+            lines.append(f"`{name}` — **{display}**{marker}\n  {desc}")
+
+        return cls.standard(
+            f"{tier_emoji} {tier_name} Models",
+            "\n".join(lines) or "No models in this tier.",
+            footer="Use the dropdown to select a model",
         )
 
     @classmethod
