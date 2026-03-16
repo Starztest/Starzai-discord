@@ -49,13 +49,79 @@ class Settings:
         default_factory=lambda: _parse_optional_int(os.getenv("DISCORD_APPLICATION_ID", ""))
     )
 
-    # MegaLLM
+    # ── LLM Provider API Keys ─────────────────────────────────────
+    # At least ONE provider key is required for the bot to function.
+
+    # MegaLLM (legacy — still supported as a provider)
     megallm_api_key: str = field(
         default_factory=lambda: os.getenv("MEGALLM_API_KEY", "")
     )
     megallm_base_url: str = field(
         default_factory=lambda: os.getenv(
             "MEGALLM_BASE_URL", "https://ai.megallm.io/v1"
+        )
+    )
+
+    # Requesty.ai — unified LLM gateway, 400+ models
+    requesty_api_key: str = field(
+        default_factory=lambda: os.getenv("REQUESTY_API_KEY", "")
+    )
+    requesty_base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "REQUESTY_BASE_URL", "https://router.requesty.ai/v1"
+        )
+    )
+
+    # Featherless AI — open-source models
+    featherless_api_key: str = field(
+        default_factory=lambda: os.getenv("FEATHERLESS_API_KEY", "")
+    )
+    featherless_base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "FEATHERLESS_BASE_URL", "https://api.featherless.ai/v1"
+        )
+    )
+
+    # ModelsLab — LLM + image generation
+    modelslab_api_key: str = field(
+        default_factory=lambda: os.getenv("MODELSLAB_API_KEY", "")
+    )
+    modelslab_base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "MODELSLAB_BASE_URL", "https://modelslab.com/api/uncensored-chat/v1"
+        )
+    )
+
+    # Chutes.ai — decentralized serverless AI
+    chutes_api_key: str = field(
+        default_factory=lambda: os.getenv("CHUTES_API_KEY", "")
+    )
+    chutes_base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "CHUTES_BASE_URL", "https://llm.chutes.ai/v1"
+        )
+    )
+
+    # Puter — free AI API (user-pays model, OpenAI-compatible)
+    puter_auth_token: str = field(
+        default_factory=lambda: os.getenv("PUTER_AUTH_TOKEN", "")
+    )
+    puter_base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "PUTER_BASE_URL", "https://api.puter.com/puterai/openai/v1"
+        )
+    )
+
+    # ── Provider Priority & Routing ───────────────────────────────
+    # Comma-separated provider names in order of preference.
+    # Only providers with valid API keys will be used.
+    # Available: requesty, featherless, modelslab, chutes, puter, megallm
+    llm_provider_priority: List[str] = field(
+        default_factory=lambda: _parse_list(
+            os.getenv(
+                "LLM_PROVIDER_PRIORITY",
+                "requesty,chutes,featherless,modelslab,puter,megallm",
+            )
         )
     )
 
@@ -137,7 +203,7 @@ class Settings:
         default_factory=lambda: int(os.getenv("MUSIC_API_TIMEOUT", "30"))
     )
 
-    # Dodo Todo System \u2014 configured per-guild via /dodo setchannel (stored in DB)
+    # Dodo Todo System — configured per-guild via /dodo setchannel (stored in DB)
 
     # Railway
     port: int = field(default_factory=lambda: int(os.getenv("PORT", "8080")))
@@ -151,15 +217,134 @@ class Settings:
             return resolved
         return self.default_model
 
+    def has_any_llm_provider(self) -> bool:
+        """Return True if at least one LLM provider key is configured."""
+        return any([
+            self.megallm_api_key,
+            self.requesty_api_key,
+            self.featherless_api_key,
+            self.modelslab_api_key,
+            self.chutes_api_key,
+            self.puter_auth_token,
+        ])
+
     def validate(self) -> List[str]:
         """Return a list of validation errors (empty = OK)."""
         errors: List[str] = []
         if not self.discord_token:
             errors.append("DISCORD_TOKEN is required")
-        if not self.megallm_api_key:
-            errors.append("MEGALLM_API_KEY is required")
+        if not self.has_any_llm_provider():
+            errors.append(
+                "At least one LLM provider API key is required. "
+                "Set one or more of: REQUESTY_API_KEY, FEATHERLESS_API_KEY, "
+                "MODELSLAB_API_KEY, CHUTES_API_KEY, PUTER_AUTH_TOKEN, MEGALLM_API_KEY"
+            )
         if not self.available_models:
             errors.append("AVAILABLE_MODELS must contain at least one model")
         if not self.database_url:
             errors.append("DATABASE_URL is required (Supabase PostgreSQL connection string)")
         return errors
+
+    def build_provider_configs(self) -> list:
+        """
+        Build a list of ``ProviderConfig`` objects from environment variables.
+
+        Only providers with a valid API key are included.  Priority is
+        determined by the ``LLM_PROVIDER_PRIORITY`` env var (lower index = higher priority).
+        """
+        from utils.llm_client import ProviderConfig
+
+        # Map provider name → (api_key, base_url)
+        provider_creds = {
+            "requesty": (self.requesty_api_key, self.requesty_base_url),
+            "featherless": (self.featherless_api_key, self.featherless_base_url),
+            "modelslab": (self.modelslab_api_key, self.modelslab_base_url),
+            "chutes": (self.chutes_api_key, self.chutes_base_url),
+            "puter": (self.puter_auth_token, self.puter_base_url),
+            "megallm": (self.megallm_api_key, self.megallm_base_url),
+        }
+
+        # Default models per provider (sensible defaults)
+        provider_default_models = {
+            "requesty": "openai/gpt-4o-mini",
+            "featherless": "Qwen/Qwen2.5-7B-Instruct",
+            "modelslab": "gpt-4o",
+            "chutes": "deepseek-ai/DeepSeek-V3-0324",
+            "puter": "gpt-4o-mini",
+            "megallm": self.default_model,
+        }
+
+        # Model name mappings: canonical name → provider-specific name
+        # This allows cogs to request "gpt-4" and each provider translates it
+        provider_model_maps = {
+            "requesty": {
+                "gpt-4": "openai/gpt-4",
+                "gpt-4o": "openai/gpt-4o",
+                "gpt-4o-mini": "openai/gpt-4o-mini",
+                "gpt-3.5-turbo": "openai/gpt-3.5-turbo",
+                "claude-3-opus": "anthropic/claude-3-opus-20240229",
+                "claude-3-sonnet": "anthropic/claude-3-5-sonnet-20241022",
+                "claude-3-haiku": "anthropic/claude-3-haiku-20240307",
+            },
+            "featherless": {
+                # Featherless serves open-source models — map to closest equivalents
+                "gpt-4": "Qwen/Qwen2.5-72B-Instruct",
+                "gpt-4o": "Qwen/Qwen2.5-72B-Instruct",
+                "gpt-4o-mini": "Qwen/Qwen2.5-7B-Instruct",
+                "gpt-3.5-turbo": "Qwen/Qwen2.5-7B-Instruct",
+            },
+            "modelslab": {},  # ModelsLab passes model names through
+            "chutes": {
+                "gpt-4": "deepseek-ai/DeepSeek-V3-0324",
+                "gpt-4o": "deepseek-ai/DeepSeek-V3-0324",
+                "gpt-3.5-turbo": "deepseek-ai/DeepSeek-V3-0324",
+            },
+            "puter": {
+                # Puter supports OpenAI model names directly
+                "gpt-4": "gpt-4o",
+                "gpt-3.5-turbo": "gpt-4o-mini",
+            },
+            "megallm": {},  # MegaLLM passes through
+        }
+
+        # Extra headers per provider
+        provider_extra_headers = {
+            "requesty": {
+                "HTTP-Referer": "https://starzai.bot",
+                "X-Title": "StarzAI Discord Bot",
+            },
+            "featherless": {
+                "HTTP-Referer": "https://starzai.bot",
+                "X-Title": "StarzAI Discord Bot",
+            },
+            "chutes": {
+                "X-Title": "StarzAI Discord Bot",
+            },
+            "modelslab": {},
+            "puter": {},
+            "megallm": {},
+        }
+
+        configs: list = []
+        for priority, name in enumerate(self.llm_provider_priority):
+            name = name.strip().lower()
+            if name not in provider_creds:
+                continue
+            api_key, base_url = provider_creds[name]
+            if not api_key:
+                continue  # Skip providers without API keys
+
+            configs.append(
+                ProviderConfig(
+                    name=name,
+                    base_url=base_url.rstrip("/"),
+                    api_key=api_key,
+                    default_model=provider_default_models.get(name, self.default_model),
+                    priority=priority,
+                    enabled=True,
+                    model_map=provider_model_maps.get(name, {}),
+                    extra_headers=provider_extra_headers.get(name, {}),
+                )
+            )
+
+        return configs
