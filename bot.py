@@ -317,13 +317,14 @@ class StarzaiBot(commands.Bot):
         logger.info("Health-check server listening on port %d", self.settings.port)
 
     async def _health_handler(self, _request: web.Request) -> web.Response:
+        # NOTE: Provider details are intentionally omitted from the public
+        # health endpoint.  Use logs for provider debugging.
         return web.json_response(
             {
                 "status": "ok",
                 "bot": str(self.user),
                 "guilds": len(self.guilds),
                 "latency_ms": round(self.latency * 1000, 2),
-                "llm_providers": self.llm.provider_status(),
             }
         )
 

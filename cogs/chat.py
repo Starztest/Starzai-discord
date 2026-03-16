@@ -26,9 +26,9 @@ from utils.llm_client import LLMClient, LLMClientError
 from utils.analysis_view import AnalysisView, create_analysis_embeds, format_full_report
 from utils.analysis_helpers import multi_agent_analysis
 from utils.model_registry import (
-    ModelCategory,
+    ModelTier,
     ModelRegistry,
-    CATEGORY_DISPLAY,
+    TIER_DISPLAY,
     build_registry,
 )
 
@@ -170,7 +170,12 @@ class ChatCog(commands.Cog, name="Chat"):
         """Return the model registry (cached on bot instance)."""
         if not hasattr(self.bot, '_model_registry') or self.bot._model_registry is None:
             active = [p.cfg.name for p in self.bot.llm._providers]
-            self.bot._model_registry = build_registry(active)
+            self.bot._model_registry = build_registry(
+                active_providers=active,
+                free_models=self.bot.settings.free_models or None,
+                premium_models=self.bot.settings.premium_models or None,
+                ultra_models=self.bot.settings.ultra_models or None,
+            )
         return self.bot._model_registry
 
     # ── Helper: log usage ────────────────────────────────────────────
@@ -528,35 +533,29 @@ class ChatCog(commands.Cog, name="Chat"):
 
     # ── /models ──────────────────────────────────────────────────────
 
-    @app_commands.command(name="models", description="Browse and select from 20+ AI models")
+    @app_commands.command(name="models", description="Browse and select AI models by tier")
     async def models_cmd(self, interaction: discord.Interaction) -> None:
         current = await self._resolve_model(interaction.user.id)
         registry = self._get_registry()
-        active_providers = [p.cfg.name for p in self.bot.llm._providers]
 
-        # Build category summary
-        categories = []
-        for cat in ModelCategory:
-            models = registry.by_category(cat)
-            # Only show categories with models available on active providers
-            available = [
-                m for m in models
-                if any(p in m.providers for p in active_providers)
-            ]
-            if available:
-                meta = CATEGORY_DISPLAY.get(cat, {})
-                categories.append({
+        # Build tier summary (no provider info shown)
+        tiers = []
+        for tier in ModelTier:
+            models = registry.by_tier(tier)
+            if models:
+                meta = TIER_DISPLAY.get(tier, {})
+                tiers.append({
                     "emoji": meta.get("emoji", ""),
-                    "label": meta.get("label", cat.value),
+                    "label": meta.get("label", tier.value),
                     "description": meta.get("description", ""),
-                    "count": len(available),
+                    "count": len(models),
                 })
 
         view = ModelCatalogueView(
-            self.bot, interaction.user.id, current, registry, active_providers
+            self.bot, interaction.user.id, current, registry
         )
         await interaction.response.send_message(
-            embed=Embedder.model_catalogue(current, categories, active_providers),
+            embed=Embedder.model_catalogue(current, tiers),
             view=view,
             ephemeral=True,
         )
@@ -1683,10 +1682,11 @@ Format with bullet points and emojis. Be insightful and respectful."""
 
 
 class ModelCatalogueView(discord.ui.View):
-    """Interactive category-based model browser.
+    """Interactive tier-based model browser.
 
-    Shows category buttons first.  When a user picks a category a
-    ``Select`` menu of models in that category appears for selection.
+    Shows tier buttons first.  When a user picks a tier, a
+    ``Select`` menu of models in that tier appears for selection.
+    No provider information is shown anywhere.
     """
 
     def __init__(
@@ -1695,45 +1695,35 @@ class ModelCatalogueView(discord.ui.View):
         user_id: int,
         current_model: str,
         registry: ModelRegistry,
-        active_providers: list,
     ):
         super().__init__(timeout=300)
         self.bot = bot
         self.user_id = user_id
         self.current_model = current_model
         self.registry = registry
-        self.active_providers = active_providers
 
-        # Add a category button per populated category (max 5 per row)
+        # Add a tier button per populated tier
         row = 0
-        for cat in ModelCategory:
-            models = self._available_models(cat)
+        for tier in ModelTier:
+            models = registry.by_tier(tier)
             if not models:
                 continue
-            meta = CATEGORY_DISPLAY.get(cat, {})
+            meta = TIER_DISPLAY.get(tier, {})
             emoji = meta.get("emoji", "")
-            label = meta.get("label", cat.value)
+            label = meta.get("label", tier.value)
 
             button = discord.ui.Button(
                 label=f"{emoji} {label} ({len(models)})",
                 style=discord.ButtonStyle.primary,
-                custom_id=f"cat_{cat.value}",
+                custom_id=f"tier_{tier.value}",
                 row=row // 5,
             )
-            button.callback = self._make_cat_callback(cat)
+            button.callback = self._make_tier_callback(tier)
             self.add_item(button)
             row += 1
 
-    def _available_models(self, cat: ModelCategory) -> list:
-        """Return registry models in *cat* that have at least one active provider."""
-        return [
-            m
-            for m in self.registry.by_category(cat)
-            if any(p in m.providers for p in self.active_providers)
-        ]
-
-    def _make_cat_callback(self, cat: ModelCategory):
-        """Return an interaction callback that shows models for *cat*."""
+    def _make_tier_callback(self, tier: ModelTier):
+        """Return an interaction callback that shows models for *tier*."""
 
         async def callback(interaction: discord.Interaction):
             if interaction.user.id != self.user_id:
@@ -1743,17 +1733,16 @@ class ModelCatalogueView(discord.ui.View):
                 )
                 return
 
-            models = self._available_models(cat)
-            meta = CATEGORY_DISPLAY.get(cat, {})
+            models = self.registry.by_tier(tier)
+            meta = TIER_DISPLAY.get(tier, {})
 
-            # Build a Select menu for the models in this category
+            # Build a Select menu for the models in this tier
             view = ModelSelectView(
                 self.bot,
                 self.user_id,
                 self.current_model,
                 models,
                 self.registry,
-                self.active_providers,
             )
 
             model_data = [
@@ -1761,14 +1750,13 @@ class ModelCatalogueView(discord.ui.View):
                     "canonical": m.canonical,
                     "display_name": m.display_name,
                     "description": m.description,
-                    "providers": [p for p in m.provider_names if p in self.active_providers],
                 }
                 for m in models
             ]
 
             await interaction.response.edit_message(
-                embed=Embedder.model_category_list(
-                    meta.get("label", cat.value),
+                embed=Embedder.model_tier_list(
+                    meta.get("label", tier.value),
                     meta.get("emoji", ""),
                     model_data,
                     self.current_model,
@@ -1780,7 +1768,7 @@ class ModelCatalogueView(discord.ui.View):
 
 
 class ModelSelectView(discord.ui.View):
-    """Dropdown selector for models within a category."""
+    """Dropdown selector for models within a tier (no provider info)."""
 
     def __init__(
         self,
@@ -1789,24 +1777,17 @@ class ModelSelectView(discord.ui.View):
         current_model: str,
         models: list,
         registry: ModelRegistry,
-        active_providers: list,
     ):
         super().__init__(timeout=300)
         self.bot = bot
         self.user_id = user_id
         self.current_model = current_model
         self.registry = registry
-        self.active_providers = active_providers
 
-        # Build select options (max 25)
+        # Build select options (max 25) — no provider info shown
         options = []
         for m in models[:25]:
-            providers = [p for p in m.provider_names if p in active_providers]
-            prov_text = f" ({', '.join(providers)})" if providers else ""
             desc = (m.description or "")[:100]
-            if prov_text:
-                max_desc = 100 - len(prov_text)
-                desc = desc[:max_desc] + prov_text
 
             options.append(
                 discord.SelectOption(
@@ -1828,9 +1809,9 @@ class ModelSelectView(discord.ui.View):
 
         # Back button
         back_btn = discord.ui.Button(
-            label="Back to Categories",
+            label="Back to Tiers",
             style=discord.ButtonStyle.secondary,
-            custom_id="back_to_cats",
+            custom_id="back_to_tiers",
             row=1,
         )
         back_btn.callback = self._go_back
@@ -1874,25 +1855,22 @@ class ModelSelectView(discord.ui.View):
             self.user_id,
             self.current_model,
             self.registry,
-            self.active_providers,
         )
 
-        categories = []
-        for cat in ModelCategory:
-            models = view._available_models(cat)
+        tiers = []
+        for tier in ModelTier:
+            models = self.registry.by_tier(tier)
             if models:
-                meta = CATEGORY_DISPLAY.get(cat, {})
-                categories.append({
+                meta = TIER_DISPLAY.get(tier, {})
+                tiers.append({
                     "emoji": meta.get("emoji", ""),
-                    "label": meta.get("label", cat.value),
+                    "label": meta.get("label", tier.value),
                     "description": meta.get("description", ""),
                     "count": len(models),
                 })
 
         await interaction.response.edit_message(
-            embed=Embedder.model_catalogue(
-                self.current_model, categories, self.active_providers
-            ),
+            embed=Embedder.model_catalogue(self.current_model, tiers),
             view=view,
         )
 

@@ -1,19 +1,19 @@
 """
 Model Registry — single source of truth for all available AI models.
 
-Maps canonical model names to providers, categories, and display metadata.
-The registry is populated from provider model maps at startup and provides:
+Models are organized into three tiers (Free, Premium, Ultra) and are
+configured via environment variables.  The owner adds model names to the
+tier env vars; the bot handles provider routing internally.
 
-- Model discovery and search (for Discord autocomplete)
-- Categorized browsing (for /models UI with Discord's 25-item limits)
-- Provider-aware routing (which provider can serve a given model)
-- Validation (is this a valid model name?)
-- Backward compatibility (legacy model names still resolve)
+**No provider information is ever shown to end users.**
+Provider details are used only for internal API routing and logged at
+startup for debugging.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -21,31 +21,25 @@ from typing import Dict, List, Optional, Sequence, Tuple
 logger = logging.getLogger(__name__)
 
 
-# ── Model Categories ─────────────────────────────────────────────────
+# ── Model Tiers ──────────────────────────────────────────────────────
 
 
-class ModelCategory(str, Enum):
-    """User-facing categories for the /models UI."""
+class ModelTier(str, Enum):
+    """User-facing tier for the /models UI."""
 
-    POWERFUL = "powerful"       # Flagship models (GPT-4, Claude 3 Opus, etc.)
-    FAST = "fast"              # Optimised for speed (GPT-4o-mini, Haiku, etc.)
-    CODE = "code"              # Code-specialised (DeepSeek Coder, etc.)
-    CREATIVE = "creative"      # Creative writing, roleplay
-    OPEN_SOURCE = "open_source" # OSS models (Qwen, Llama, Mistral)
-    FREE = "free"              # Free-tier models (Puter, etc.)
+    FREE = "free"
+    PREMIUM = "premium"
+    ULTRA = "ultra"
 
 
-CATEGORY_DISPLAY = {
-    ModelCategory.POWERFUL:     {"emoji": "\u26a1",  "label": "Powerful",    "description": "Flagship models — best quality"},
-    ModelCategory.FAST:         {"emoji": "\U0001f3ce\ufe0f", "label": "Fast", "description": "Optimised for speed"},
-    ModelCategory.CODE:         {"emoji": "\U0001f4bb",  "label": "Code",       "description": "Code generation & analysis"},
-    ModelCategory.CREATIVE:     {"emoji": "\U0001f3a8",  "label": "Creative",   "description": "Creative writing & roleplay"},
-    ModelCategory.OPEN_SOURCE:  {"emoji": "\U0001f310",  "label": "Open Source", "description": "Community models (Qwen, Llama, Mistral)"},
-    ModelCategory.FREE:         {"emoji": "\U0001f193",  "label": "Free",       "description": "Free-tier models — no cost"},
+TIER_DISPLAY = {
+    ModelTier.FREE:    {"emoji": "🆓", "label": "Free",    "description": "Free models — no cost"},
+    ModelTier.PREMIUM: {"emoji": "⭐", "label": "Premium", "description": "High-quality models"},
+    ModelTier.ULTRA:   {"emoji": "👑", "label": "Ultra",   "description": "Top-tier flagship models"},
 }
 
 
-# ── Data Classes ──────────────────────────────────────────────────────
+# ── Data Classes ─────────────────────────────────────────────────────
 
 
 @dataclass
@@ -54,11 +48,11 @@ class ModelEntry:
 
     canonical: str              # e.g. "gpt-4o"
     display_name: str           # e.g. "GPT-4o"
-    category: ModelCategory
+    tier: ModelTier
     description: str = ""       # short description for UI
-    # provider_name → provider-specific model ID
+    # provider_name → provider-specific model ID  (INTERNAL ONLY — never shown to users)
     providers: Dict[str, str] = field(default_factory=dict)
-    # Extra tags for search (e.g. ["openai", "vision", "128k"])
+    # Extra tags for search (e.g. ["vision", "128k"])
     tags: List[str] = field(default_factory=list)
     # Context window size (0 = unknown)
     context_window: int = 0
@@ -75,15 +69,78 @@ class ModelEntry:
         return self.providers.get(provider, self.canonical)
 
 
-# ── Registry ──────────────────────────────────────────────────────────
+# ── Display Names & Descriptions ─────────────────────────────────────
+# Cosmetic metadata for known models.  Unknown models get auto-formatted
+# names.  This is NOT a model list — it's just presentation data.
+
+KNOWN_MODEL_META: Dict[str, Dict[str, str]] = {
+    # GPT family
+    "gpt-4":            {"display": "GPT-4",             "desc": "OpenAI's most capable model"},
+    "gpt-4o":           {"display": "GPT-4o",            "desc": "OpenAI's fastest flagship with vision"},
+    "gpt-4o-mini":      {"display": "GPT-4o Mini",       "desc": "Fast, affordable, and surprisingly capable"},
+    "gpt-4.1":          {"display": "GPT-4.1",           "desc": "OpenAI's latest flagship model"},
+    "gpt-4.1-mini":     {"display": "GPT-4.1 Mini",      "desc": "Fast and efficient GPT-4.1"},
+    "gpt-4.1-nano":     {"display": "GPT-4.1 Nano",      "desc": "Ultra-fast lightweight model"},
+    "gpt-3.5-turbo":    {"display": "GPT-3.5 Turbo",     "desc": "Classic fast model — great for simple tasks"},
+    "o3":               {"display": "O3",                 "desc": "OpenAI's reasoning model"},
+    "o3-mini":          {"display": "O3 Mini",            "desc": "Efficient reasoning model"},
+    "o4-mini":          {"display": "O4 Mini",            "desc": "Next-gen reasoning model"},
+    # Claude family
+    "claude-3-opus":    {"display": "Claude 3 Opus",      "desc": "Anthropic's most capable model"},
+    "claude-3-sonnet":  {"display": "Claude 3.5 Sonnet",  "desc": "Anthropic's balanced power & speed"},
+    "claude-3-haiku":   {"display": "Claude 3 Haiku",     "desc": "Anthropic's fastest model"},
+    "claude-sonnet-4":  {"display": "Claude Sonnet 4",    "desc": "Anthropic's latest model"},
+    # Gemini
+    "gemini-2.0-flash": {"display": "Gemini 2.0 Flash",   "desc": "Google's fast multimodal model"},
+    "gemini-2.5-pro":   {"display": "Gemini 2.5 Pro",     "desc": "Google's premium model"},
+    "gemini-2.5-flash": {"display": "Gemini 2.5 Flash",   "desc": "Google's latest fast model"},
+    # DeepSeek
+    "deepseek-v3":      {"display": "DeepSeek V3",        "desc": "DeepSeek's latest flagship model"},
+    "deepseek-r1":      {"display": "DeepSeek R1",        "desc": "DeepSeek's reasoning model"},
+    "deepseek-coder-v2":{"display": "DeepSeek Coder V2",  "desc": "Code generation & analysis"},
+    # Qwen
+    "qwen-2.5-72b":    {"display": "Qwen 2.5 72B",       "desc": "Alibaba's flagship open-source model"},
+    "qwen-2.5-7b":     {"display": "Qwen 2.5 7B",        "desc": "Fast and efficient open-source model"},
+    "qwen-2.5-coder-32b": {"display": "Qwen 2.5 Coder 32B", "desc": "Code-specialised model"},
+    # Llama
+    "llama-3.1-70b":   {"display": "Llama 3.1 70B",      "desc": "Meta's powerful open-source model"},
+    "llama-3.1-8b":    {"display": "Llama 3.1 8B",       "desc": "Meta's fast open-source model"},
+    "llama-3.3-70b":   {"display": "Llama 3.3 70B",      "desc": "Meta's latest open-source model"},
+    # Mistral
+    "mistral-large":   {"display": "Mistral Large",       "desc": "Mistral AI's flagship model"},
+    "mistral-nemo":    {"display": "Mistral Nemo",        "desc": "Mistral's efficient 12B model"},
+    "mistral-small":   {"display": "Mistral Small",       "desc": "Mistral's compact fast model"},
+    # Creative / Other
+    "mythomax-13b":    {"display": "MythoMax 13B",        "desc": "Creative writing & roleplay specialist"},
+    "nous-hermes-2":   {"display": "Nous Hermes 2 Mixtral","desc": "Community-tuned creative reasoning"},
+}
+
+
+def _auto_display_name(canonical: str) -> str:
+    """Generate a display name from a canonical model ID."""
+    # "gpt-4o-mini" → "Gpt 4o Mini", "deepseek-v3" → "Deepseek V3"
+    parts = canonical.replace("-", " ").replace("_", " ").split()
+    return " ".join(p.capitalize() if not any(c.isdigit() for c in p) else p.upper()
+                    for p in parts)
+
+
+def _get_model_meta(canonical: str) -> Tuple[str, str]:
+    """Return (display_name, description) for a model, auto-generating if unknown."""
+    meta = KNOWN_MODEL_META.get(canonical, {})
+    display = meta.get("display", _auto_display_name(canonical))
+    desc = meta.get("desc", "")
+    return display, desc
+
+
+# ── Registry ─────────────────────────────────────────────────────────
 
 
 class ModelRegistry:
     """
     Central registry of all models the bot can serve.
 
-    Populated at startup from provider model maps and the built-in
-    catalogue below.
+    Populated at startup from tier env vars.  Provider routing info
+    is attached internally but never exposed to users.
     """
 
     def __init__(self) -> None:
@@ -91,7 +148,7 @@ class ModelRegistry:
         # Alias map: alternative name → canonical name
         self._aliases: Dict[str, str] = {}
 
-    # ── Registration ──────────────────────────────────────────────
+    # ── Registration ─────────────────────────────────────────────
 
     def register(self, entry: ModelEntry) -> None:
         """Register a model entry (overwrites if already present)."""
@@ -104,7 +161,7 @@ class ModelRegistry:
     def register_provider(
         self, canonical: str, provider_name: str, api_model_id: str
     ) -> None:
-        """Add a provider mapping to an existing model entry."""
+        """Add a provider mapping to an existing model entry (internal)."""
         if canonical in self._models:
             self._models[canonical].providers[provider_name] = api_model_id
         else:
@@ -112,7 +169,7 @@ class ModelRegistry:
                 "register_provider: model %r not in registry, skipping", canonical
             )
 
-    # ── Lookup ────────────────────────────────────────────────────
+    # ── Lookup ───────────────────────────────────────────────────
 
     def get(self, name: str) -> Optional[ModelEntry]:
         """Look up a model by canonical name or alias."""
@@ -141,18 +198,18 @@ class ModelRegistry:
             return entry.canonical
         return default
 
-    # ── Querying ──────────────────────────────────────────────────
+    # ── Querying ─────────────────────────────────────────────────
 
     def all_models(self) -> List[ModelEntry]:
         """Return all registered models."""
         return list(self._models.values())
 
-    def by_category(self, category: ModelCategory) -> List[ModelEntry]:
-        """Return models in a specific category."""
-        return [m for m in self._models.values() if m.category == category]
+    def by_tier(self, tier: ModelTier) -> List[ModelEntry]:
+        """Return models in a specific tier."""
+        return [m for m in self._models.values() if m.tier == tier]
 
     def for_provider(self, provider_name: str) -> List[ModelEntry]:
-        """Return all models a specific provider can serve."""
+        """Return all models a specific provider can serve (internal use)."""
         return [m for m in self._models.values() if provider_name in m.providers]
 
     def search(self, query: str, limit: int = 25) -> List[ModelEntry]:
@@ -160,6 +217,7 @@ class ModelRegistry:
         Fuzzy search for models matching *query*.
 
         Used by Discord autocomplete — returns at most *limit* results.
+        No provider info is included in search results.
         """
         q = query.strip().lower()
         if not q:
@@ -179,7 +237,7 @@ class ModelRegistry:
         """Return all canonical model names."""
         return list(self._models.keys())
 
-    # ── Provider Routing ──────────────────────────────────────────
+    # ── Provider Routing (internal) ──────────────────────────────
 
     def best_provider(
         self,
@@ -192,6 +250,7 @@ class ModelRegistry:
         or ``None`` if no available provider can serve it.
 
         *available_providers* should be ordered by priority (first = highest).
+        This is an internal method — provider info is never shown to users.
         """
         entry = self.get(canonical)
         if not entry:
@@ -208,10 +267,10 @@ class ModelRegistry:
 
         return None
 
-    # ── Internals ─────────────────────────────────────────────────
+    # ── Internals ────────────────────────────────────────────────
 
     def _match_score(self, entry: ModelEntry, query: str) -> int:
-        """Simple relevance scoring for search."""
+        """Simple relevance scoring for search (no provider info used)."""
         score = 0
         canonical_lower = entry.canonical.lower()
         # Exact canonical match
@@ -240,208 +299,19 @@ class ModelRegistry:
 
     def _default_selection(self, limit: int) -> List[ModelEntry]:
         """Return a curated default selection when no search query is provided."""
-        # Show one model per category, prioritising Powerful and Fast
+        # Show models from each tier, prioritising Ultra and Premium
         result: List[ModelEntry] = []
-        for cat in [
-            ModelCategory.POWERFUL,
-            ModelCategory.FAST,
-            ModelCategory.CODE,
-            ModelCategory.CREATIVE,
-            ModelCategory.OPEN_SOURCE,
-            ModelCategory.FREE,
-        ]:
-            models = self.by_category(cat)
-            result.extend(models[:4])  # up to 4 per category
+        for tier in [ModelTier.ULTRA, ModelTier.PREMIUM, ModelTier.FREE]:
+            models = self.by_tier(tier)
+            result.extend(models[:8])  # up to 8 per tier
 
         return result[:limit]
 
 
-# ── Built-in Model Catalogue ─────────────────────────────────────────
+# ── Provider → Model Mappings (INTERNAL ONLY) ───────────────────────
 #
-# This is the curated set of models the bot offers.  Provider mappings
-# are added during initialization from the provider model maps in
-# settings.py (build_provider_configs).
-#
-
-BUILTIN_MODELS: List[ModelEntry] = [
-    # ── Powerful ──────────────────────────────────────────────────
-    ModelEntry(
-        canonical="gpt-4",
-        display_name="GPT-4",
-        category=ModelCategory.POWERFUL,
-        description="OpenAI's most capable model",
-        tags=["openai", "flagship"],
-        context_window=8192,
-    ),
-    ModelEntry(
-        canonical="gpt-4o",
-        display_name="GPT-4o",
-        category=ModelCategory.POWERFUL,
-        description="OpenAI's fastest flagship model with vision",
-        tags=["openai", "flagship", "vision", "multimodal"],
-        context_window=128000,
-    ),
-    ModelEntry(
-        canonical="claude-3-opus",
-        display_name="Claude 3 Opus",
-        category=ModelCategory.POWERFUL,
-        description="Anthropic's most capable model",
-        tags=["anthropic", "flagship"],
-        context_window=200000,
-    ),
-    ModelEntry(
-        canonical="claude-3-sonnet",
-        display_name="Claude 3.5 Sonnet",
-        category=ModelCategory.POWERFUL,
-        description="Anthropic's balanced power & speed model",
-        tags=["anthropic", "balanced"],
-        context_window=200000,
-    ),
-    ModelEntry(
-        canonical="deepseek-v3",
-        display_name="DeepSeek V3",
-        category=ModelCategory.POWERFUL,
-        description="DeepSeek's latest flagship model",
-        tags=["deepseek", "flagship", "reasoning"],
-        context_window=128000,
-    ),
-
-    # ── Fast ──────────────────────────────────────────────────────
-    ModelEntry(
-        canonical="gpt-4o-mini",
-        display_name="GPT-4o Mini",
-        category=ModelCategory.FAST,
-        description="Fast, affordable, and surprisingly capable",
-        tags=["openai", "fast", "cheap"],
-        context_window=128000,
-    ),
-    ModelEntry(
-        canonical="gpt-3.5-turbo",
-        display_name="GPT-3.5 Turbo",
-        category=ModelCategory.FAST,
-        description="Classic fast model — great for simple tasks",
-        tags=["openai", "fast", "legacy"],
-        context_window=16385,
-    ),
-    ModelEntry(
-        canonical="claude-3-haiku",
-        display_name="Claude 3 Haiku",
-        category=ModelCategory.FAST,
-        description="Anthropic's fastest model",
-        tags=["anthropic", "fast"],
-        context_window=200000,
-    ),
-
-    # ── Code ──────────────────────────────────────────────────────
-    ModelEntry(
-        canonical="deepseek-coder-v2",
-        display_name="DeepSeek Coder V2",
-        category=ModelCategory.CODE,
-        description="Specialised code generation & analysis",
-        tags=["deepseek", "code", "programming"],
-        context_window=128000,
-    ),
-    ModelEntry(
-        canonical="qwen-2.5-coder-32b",
-        display_name="Qwen 2.5 Coder 32B",
-        category=ModelCategory.CODE,
-        description="Alibaba's code-specialised model (32B)",
-        tags=["qwen", "code", "open-source"],
-        context_window=32768,
-    ),
-
-    # ── Open Source ───────────────────────────────────────────────
-    ModelEntry(
-        canonical="qwen-2.5-72b",
-        display_name="Qwen 2.5 72B",
-        category=ModelCategory.OPEN_SOURCE,
-        description="Alibaba's flagship open-source model",
-        tags=["qwen", "open-source", "large"],
-        context_window=32768,
-    ),
-    ModelEntry(
-        canonical="qwen-2.5-7b",
-        display_name="Qwen 2.5 7B",
-        category=ModelCategory.OPEN_SOURCE,
-        description="Fast and efficient open-source model",
-        tags=["qwen", "open-source", "small", "fast"],
-        context_window=32768,
-    ),
-    ModelEntry(
-        canonical="llama-3.1-70b",
-        display_name="Llama 3.1 70B",
-        category=ModelCategory.OPEN_SOURCE,
-        description="Meta's powerful open-source model",
-        tags=["meta", "llama", "open-source"],
-        context_window=128000,
-    ),
-    ModelEntry(
-        canonical="llama-3.1-8b",
-        display_name="Llama 3.1 8B",
-        category=ModelCategory.OPEN_SOURCE,
-        description="Meta's fast open-source model",
-        tags=["meta", "llama", "open-source", "small", "fast"],
-        context_window=128000,
-    ),
-    ModelEntry(
-        canonical="mistral-large",
-        display_name="Mistral Large",
-        category=ModelCategory.OPEN_SOURCE,
-        description="Mistral AI's flagship model",
-        tags=["mistral", "open-source", "large"],
-        context_window=128000,
-    ),
-    ModelEntry(
-        canonical="mistral-nemo",
-        display_name="Mistral Nemo",
-        category=ModelCategory.OPEN_SOURCE,
-        description="Mistral's efficient 12B model",
-        tags=["mistral", "open-source", "fast"],
-        context_window=128000,
-    ),
-
-    # ── Creative ──────────────────────────────────────────────────
-    ModelEntry(
-        canonical="mythomax-13b",
-        display_name="MythoMax 13B",
-        category=ModelCategory.CREATIVE,
-        description="Creative writing & roleplay specialist",
-        tags=["creative", "roleplay", "open-source"],
-        context_window=4096,
-    ),
-    ModelEntry(
-        canonical="nous-hermes-2",
-        display_name="Nous Hermes 2 Mixtral",
-        category=ModelCategory.CREATIVE,
-        description="Community-tuned creative reasoning model",
-        tags=["nous", "creative", "reasoning", "open-source"],
-        context_window=32768,
-    ),
-
-    # ── Free ──────────────────────────────────────────────────────
-    ModelEntry(
-        canonical="gpt-4o-mini-free",
-        display_name="GPT-4o Mini (Free)",
-        category=ModelCategory.FREE,
-        description="GPT-4o Mini via Puter — completely free",
-        tags=["openai", "free", "puter"],
-        context_window=128000,
-    ),
-    ModelEntry(
-        canonical="claude-3-haiku-free",
-        display_name="Claude 3 Haiku (Free)",
-        category=ModelCategory.FREE,
-        description="Claude 3 Haiku via Puter — completely free",
-        tags=["anthropic", "free", "puter"],
-        context_window=200000,
-    ),
-]
-
-
-# ── Provider → Model Mappings ────────────────────────────────────────
-#
-# This maps canonical model names to provider-specific API IDs.
-# It extends the per-provider model_map in settings.py.
+# Maps canonical model names to provider-specific API IDs.
+# This is used for internal routing and is NEVER shown to users.
 #
 
 PROVIDER_MODEL_MAP: Dict[str, Dict[str, str]] = {
@@ -449,16 +319,29 @@ PROVIDER_MODEL_MAP: Dict[str, Dict[str, str]] = {
         "gpt-4": "openai/gpt-4",
         "gpt-4o": "openai/gpt-4o",
         "gpt-4o-mini": "openai/gpt-4o-mini",
+        "gpt-4.1": "openai/gpt-4.1",
+        "gpt-4.1-mini": "openai/gpt-4.1-mini",
+        "gpt-4.1-nano": "openai/gpt-4.1-nano",
         "gpt-3.5-turbo": "openai/gpt-3.5-turbo",
+        "o3": "openai/o3",
+        "o3-mini": "openai/o3-mini",
+        "o4-mini": "openai/o4-mini",
         "claude-3-opus": "anthropic/claude-3-opus-20240229",
         "claude-3-sonnet": "anthropic/claude-3-5-sonnet-20241022",
         "claude-3-haiku": "anthropic/claude-3-haiku-20240307",
+        "claude-sonnet-4": "anthropic/claude-sonnet-4-20250514",
+        "gemini-2.0-flash": "google/gemini-2.0-flash",
+        "gemini-2.5-pro": "google/gemini-2.5-pro-preview",
+        "gemini-2.5-flash": "google/gemini-2.5-flash-preview",
         "deepseek-v3": "deepseek/deepseek-chat",
+        "deepseek-r1": "deepseek/deepseek-reasoner",
         "deepseek-coder-v2": "deepseek/deepseek-coder",
         "llama-3.1-70b": "meta-llama/llama-3.1-70b-instruct",
         "llama-3.1-8b": "meta-llama/llama-3.1-8b-instruct",
+        "llama-3.3-70b": "meta-llama/llama-3.3-70b-instruct",
         "mistral-large": "mistralai/mistral-large-latest",
         "mistral-nemo": "mistralai/mistral-nemo",
+        "mistral-small": "mistralai/mistral-small-latest",
         "qwen-2.5-72b": "qwen/qwen-2.5-72b-instruct",
         "qwen-2.5-7b": "qwen/qwen-2.5-7b-instruct",
         "qwen-2.5-coder-32b": "qwen/qwen-2.5-coder-32b-instruct",
@@ -470,10 +353,11 @@ PROVIDER_MODEL_MAP: Dict[str, Dict[str, str]] = {
         "qwen-2.5-coder-32b": "Qwen/Qwen2.5-Coder-32B-Instruct",
         "llama-3.1-70b": "meta-llama/Meta-Llama-3.1-70B-Instruct",
         "llama-3.1-8b": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+        "llama-3.3-70b": "meta-llama/Llama-3.3-70B-Instruct",
         "mistral-nemo": "mistralai/Mistral-Nemo-Instruct-2407",
         "nous-hermes-2": "NousResearch/Nous-Hermes-2-Mixtral-8x7B-DPO",
         "mythomax-13b": "Gryphe/MythoMax-L2-13b",
-        # Map canonical closed-source names to closest open-source equivalents
+        # Fallback mappings for closed-source names
         "gpt-4": "Qwen/Qwen2.5-72B-Instruct",
         "gpt-4o": "Qwen/Qwen2.5-72B-Instruct",
         "gpt-4o-mini": "Qwen/Qwen2.5-7B-Instruct",
@@ -481,12 +365,14 @@ PROVIDER_MODEL_MAP: Dict[str, Dict[str, str]] = {
     },
     "chutes": {
         "deepseek-v3": "deepseek-ai/DeepSeek-V3-0324",
+        "deepseek-r1": "deepseek-ai/DeepSeek-R1",
         "deepseek-coder-v2": "deepseek-ai/DeepSeek-Coder-V2-Instruct",
         "qwen-2.5-72b": "Qwen/Qwen2.5-72B-Instruct",
         "qwen-2.5-7b": "Qwen/Qwen2.5-7B-Instruct",
         "llama-3.1-70b": "meta-llama/Llama-3.1-70B-Instruct",
         "llama-3.1-8b": "meta-llama/Llama-3.1-8B-Instruct",
-        # Map closed-source names to DeepSeek equivalent
+        "llama-3.3-70b": "meta-llama/Llama-3.3-70B-Instruct",
+        # Fallback mappings for closed-source names
         "gpt-4": "deepseek-ai/DeepSeek-V3-0324",
         "gpt-4o": "deepseek-ai/DeepSeek-V3-0324",
         "gpt-3.5-turbo": "deepseek-ai/DeepSeek-V3-0324",
@@ -498,8 +384,6 @@ PROVIDER_MODEL_MAP: Dict[str, Dict[str, str]] = {
         "gpt-3.5-turbo": "gpt-3.5-turbo",
     },
     "puter": {
-        "gpt-4o-mini-free": "gpt-4o-mini",
-        "claude-3-haiku-free": "claude-3-haiku-20240307",
         "gpt-4": "gpt-4o",
         "gpt-4o": "gpt-4o",
         "gpt-4o-mini": "gpt-4o-mini",
@@ -544,63 +428,168 @@ BUILTIN_ALIASES: Dict[str, str] = {
     # DeepSeek
     "deepseek": "deepseek-v3",
     "deepseek-coder": "deepseek-coder-v2",
+    # Gemini
+    "gemini": "gemini-2.5-flash",
+    "gemini-flash": "gemini-2.0-flash",
+    "gemini-pro": "gemini-2.5-pro",
     # Qwen
     "qwen": "qwen-2.5-72b",
     "qwen-72b": "qwen-2.5-72b",
     "qwen-7b": "qwen-2.5-7b",
     "qwen-coder": "qwen-2.5-coder-32b",
     # Llama
-    "llama": "llama-3.1-70b",
+    "llama": "llama-3.3-70b",
     "llama-70b": "llama-3.1-70b",
     "llama-8b": "llama-3.1-8b",
     # Mistral
     "mistral": "mistral-large",
     "nemo": "mistral-nemo",
-    # Free
-    "free": "gpt-4o-mini-free",
-    "free-gpt": "gpt-4o-mini-free",
-    "free-claude": "claude-3-haiku-free",
 }
 
 
-# ── Initialization ───────────────────────────────────────────────────
+# ── Default Tier Assignments ─────────────────────────────────────────
+# Used when the owner hasn't set tier env vars.  These are sensible
+# defaults that can be fully overridden via FREE_MODELS, PREMIUM_MODELS,
+# ULTRA_MODELS environment variables.
+
+DEFAULT_FREE_MODELS = [
+    "gpt-4o-mini",
+    "gpt-3.5-turbo",
+    "gemini-2.0-flash",
+    "llama-3.1-8b",
+    "qwen-2.5-7b",
+    "mistral-nemo",
+    "mistral-small",
+    "deepseek-v3",
+    "mythomax-13b",
+    "nous-hermes-2",
+]
+
+DEFAULT_PREMIUM_MODELS = [
+    "gpt-4",
+    "gpt-4o",
+    "gpt-4.1-mini",
+    "claude-3-sonnet",
+    "claude-3-haiku",
+    "gemini-2.5-flash",
+    "deepseek-r1",
+    "deepseek-coder-v2",
+    "llama-3.1-70b",
+    "llama-3.3-70b",
+    "qwen-2.5-72b",
+    "qwen-2.5-coder-32b",
+    "mistral-large",
+]
+
+DEFAULT_ULTRA_MODELS = [
+    "gpt-4.1",
+    "o3",
+    "o3-mini",
+    "o4-mini",
+    "claude-3-opus",
+    "claude-sonnet-4",
+    "gemini-2.5-pro",
+]
 
 
-def build_registry(active_providers: Optional[List[str]] = None) -> ModelRegistry:
+# ── Initialization ──────────────────────────────────────────────────
+
+
+def _parse_model_list(raw: str) -> List[str]:
+    """Parse a comma-separated model list, stripping whitespace."""
+    return [m.strip() for m in raw.split(",") if m.strip()]
+
+
+def build_registry(
+    active_providers: Optional[List[str]] = None,
+    free_models: Optional[List[str]] = None,
+    premium_models: Optional[List[str]] = None,
+    ultra_models: Optional[List[str]] = None,
+) -> ModelRegistry:
     """
     Build and return a fully-populated ModelRegistry.
 
-    *active_providers* is an optional list of provider names that have
-    valid API keys.  If given, models that have NO active provider will
-    still be registered but can be filtered in the UI.
+    Model lists can be passed directly or are read from environment
+    variables: FREE_MODELS, PREMIUM_MODELS, ULTRA_MODELS.
+
+    If none are set, sensible defaults are used.
     """
     registry = ModelRegistry()
 
-    # 1. Register all built-in models
-    for entry in BUILTIN_MODELS:
-        registry.register(entry)
+    # 1. Determine model lists per tier
+    #    Priority: explicit args > env vars > defaults
+    env_free = os.getenv("FREE_MODELS", "")
+    env_premium = os.getenv("PREMIUM_MODELS", "")
+    env_ultra = os.getenv("ULTRA_MODELS", "")
 
-    # 2. Add provider mappings from the consolidated map
+    if free_models is not None:
+        tier_free = free_models
+    elif env_free:
+        tier_free = _parse_model_list(env_free)
+    else:
+        tier_free = DEFAULT_FREE_MODELS
+
+    if premium_models is not None:
+        tier_premium = premium_models
+    elif env_premium:
+        tier_premium = _parse_model_list(env_premium)
+    else:
+        tier_premium = DEFAULT_PREMIUM_MODELS
+
+    if ultra_models is not None:
+        tier_ultra = ultra_models
+    elif env_ultra:
+        tier_ultra = _parse_model_list(env_ultra)
+    else:
+        tier_ultra = DEFAULT_ULTRA_MODELS
+
+    # 2. Register models per tier
+    tier_map = {
+        ModelTier.FREE: tier_free,
+        ModelTier.PREMIUM: tier_premium,
+        ModelTier.ULTRA: tier_ultra,
+    }
+
+    for tier, model_names in tier_map.items():
+        for name in model_names:
+            display_name, description = _get_model_meta(name)
+            entry = ModelEntry(
+                canonical=name,
+                display_name=display_name,
+                tier=tier,
+                description=description,
+            )
+            registry.register(entry)
+
+    # 3. Add provider mappings from the consolidated map (INTERNAL)
     for provider_name, model_map in PROVIDER_MODEL_MAP.items():
         for canonical, api_id in model_map.items():
             registry.register_provider(canonical, provider_name, api_id)
 
-    # 3. Register aliases
+    # 4. Register aliases
     for alias, canonical in BUILTIN_ALIASES.items():
         registry.add_alias(alias, canonical)
 
-    # 4. Log summary
+    # 5. Log summary (provider info only appears in logs, never to users)
     total = len(registry.all_models())
+    tier_counts = {t: len(registry.by_tier(t)) for t in ModelTier}
     if active_providers:
         available = sum(
             1 for m in registry.all_models()
             if any(p in m.providers for p in active_providers)
         )
         logger.info(
-            "Model registry: %d models registered, %d available with current providers (%s)",
-            total, available, ", ".join(active_providers),
+            "Model registry: %d models (%d free, %d premium, %d ultra), "
+            "%d available with current providers (%s)",
+            total, tier_counts[ModelTier.FREE], tier_counts[ModelTier.PREMIUM],
+            tier_counts[ModelTier.ULTRA], available,
+            ", ".join(active_providers),
         )
     else:
-        logger.info("Model registry: %d models registered", total)
+        logger.info(
+            "Model registry: %d models (%d free, %d premium, %d ultra)",
+            total, tier_counts[ModelTier.FREE], tier_counts[ModelTier.PREMIUM],
+            tier_counts[ModelTier.ULTRA],
+        )
 
     return registry

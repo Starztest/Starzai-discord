@@ -125,7 +125,24 @@ class Settings:
         )
     )
 
-    # Models
+    # Models — tier-based configuration
+    # Owners define models per tier via env vars (comma-separated).
+    # If not set, sensible defaults from the model registry are used.
+    free_models: List[str] = field(
+        default_factory=lambda: _parse_list(
+            os.getenv("FREE_MODELS", "")
+        ) if os.getenv("FREE_MODELS") else []
+    )
+    premium_models: List[str] = field(
+        default_factory=lambda: _parse_list(
+            os.getenv("PREMIUM_MODELS", "")
+        ) if os.getenv("PREMIUM_MODELS") else []
+    )
+    ultra_models: List[str] = field(
+        default_factory=lambda: _parse_list(
+            os.getenv("ULTRA_MODELS", "")
+        ) if os.getenv("ULTRA_MODELS") else []
+    )
     available_models: List[str] = field(
         default_factory=lambda: _parse_list(
             os.getenv(
@@ -226,7 +243,11 @@ class Settings:
         lower = stripped.lower()
 
         # 1. Registry lookup (canonical + aliases)
-        registry = build_registry()
+        registry = build_registry(
+            free_models=self.free_models or None,
+            premium_models=self.premium_models or None,
+            ultra_models=self.ultra_models or None,
+        )
         entry = registry.get(stripped)
         if entry:
             return entry.canonical
@@ -275,9 +296,9 @@ class Settings:
                 "Set one or more of: REQUESTY_API_KEY, FEATHERLESS_API_KEY, "
                 "MODELSLAB_API_KEY, CHUTES_API_KEY, PUTER_AUTH_TOKEN, MEGALLM_API_KEY"
             )
-        # Note: AVAILABLE_MODELS is no longer required — the model registry
-        # provides the full catalogue.  The env var is still respected for
-        # backward compatibility but an empty list is not an error.
+        # Note: AVAILABLE_MODELS is no longer required — model tiers
+        # (FREE_MODELS, PREMIUM_MODELS, ULTRA_MODELS) provide the catalogue.
+        # The env var is still respected for backward compatibility.
         if not self.database_url:
             errors.append("DATABASE_URL is required (Supabase PostgreSQL connection string)")
         return errors

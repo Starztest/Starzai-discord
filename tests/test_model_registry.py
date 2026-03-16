@@ -1,18 +1,22 @@
 """
-Tests for the model registry — model catalogue, search, aliases,
+Tests for the model registry — model tiers, search, aliases,
 provider routing, and integration with Settings.resolve_model().
 """
 
+import os
 import unittest
 
 from utils.model_registry import (
     BUILTIN_ALIASES,
-    BUILTIN_MODELS,
-    CATEGORY_DISPLAY,
-    ModelCategory,
+    DEFAULT_FREE_MODELS,
+    DEFAULT_PREMIUM_MODELS,
+    DEFAULT_ULTRA_MODELS,
+    KNOWN_MODEL_META,
     ModelEntry,
     ModelRegistry,
+    ModelTier,
     PROVIDER_MODEL_MAP,
+    TIER_DISPLAY,
     build_registry,
 )
 
@@ -24,7 +28,7 @@ class TestModelEntry(unittest.TestCase):
         entry = ModelEntry(
             canonical="test",
             display_name="Test",
-            category=ModelCategory.FAST,
+            tier=ModelTier.FREE,
             providers={"requesty": "openai/test", "chutes": "test-ai/test"},
         )
         self.assertEqual(set(entry.provider_names), {"requesty", "chutes"})
@@ -33,7 +37,7 @@ class TestModelEntry(unittest.TestCase):
         entry = ModelEntry(
             canonical="test",
             display_name="Test",
-            category=ModelCategory.FAST,
+            tier=ModelTier.FREE,
             providers={"requesty": "openai/test"},
         )
         self.assertTrue(entry.supports_provider("requesty"))
@@ -43,7 +47,7 @@ class TestModelEntry(unittest.TestCase):
         entry = ModelEntry(
             canonical="gpt-4",
             display_name="GPT-4",
-            category=ModelCategory.POWERFUL,
+            tier=ModelTier.PREMIUM,
             providers={"requesty": "openai/gpt-4"},
         )
         self.assertEqual(entry.api_model_id("requesty"), "openai/gpt-4")
@@ -52,7 +56,7 @@ class TestModelEntry(unittest.TestCase):
         entry = ModelEntry(
             canonical="gpt-4",
             display_name="GPT-4",
-            category=ModelCategory.POWERFUL,
+            tier=ModelTier.PREMIUM,
             providers={"requesty": "openai/gpt-4"},
         )
         # Unknown provider falls back to canonical name
@@ -68,7 +72,7 @@ class TestModelRegistry(unittest.TestCase):
             ModelEntry(
                 canonical="gpt-4",
                 display_name="GPT-4",
-                category=ModelCategory.POWERFUL,
+                tier=ModelTier.PREMIUM,
                 description="OpenAI's most capable model",
                 providers={"requesty": "openai/gpt-4", "puter": "gpt-4o"},
                 tags=["openai"],
@@ -78,7 +82,7 @@ class TestModelRegistry(unittest.TestCase):
             ModelEntry(
                 canonical="gpt-4o-mini",
                 display_name="GPT-4o Mini",
-                category=ModelCategory.FAST,
+                tier=ModelTier.FREE,
                 description="Fast and cheap",
                 providers={"requesty": "openai/gpt-4o-mini"},
                 tags=["openai", "fast"],
@@ -88,9 +92,17 @@ class TestModelRegistry(unittest.TestCase):
             ModelEntry(
                 canonical="qwen-2.5-72b",
                 display_name="Qwen 2.5 72B",
-                category=ModelCategory.OPEN_SOURCE,
+                tier=ModelTier.PREMIUM,
                 providers={"featherless": "Qwen/Qwen2.5-72B-Instruct"},
                 tags=["qwen", "open-source"],
+            )
+        )
+        registry.register(
+            ModelEntry(
+                canonical="gpt-4.1",
+                display_name="GPT-4.1",
+                tier=ModelTier.ULTRA,
+                providers={"requesty": "openai/gpt-4.1"},
             )
         )
         registry.add_alias("gpt4", "gpt-4")
@@ -135,18 +147,31 @@ class TestModelRegistry(unittest.TestCase):
 
     def test_all_models(self):
         reg = self._make_registry()
-        self.assertEqual(len(reg.all_models()), 3)
+        self.assertEqual(len(reg.all_models()), 4)
 
-    def test_by_category(self):
+    def test_by_tier_free(self):
         reg = self._make_registry()
-        powerful = reg.by_category(ModelCategory.POWERFUL)
-        self.assertEqual(len(powerful), 1)
-        self.assertEqual(powerful[0].canonical, "gpt-4")
+        free = reg.by_tier(ModelTier.FREE)
+        self.assertEqual(len(free), 1)
+        self.assertEqual(free[0].canonical, "gpt-4o-mini")
+
+    def test_by_tier_premium(self):
+        reg = self._make_registry()
+        premium = reg.by_tier(ModelTier.PREMIUM)
+        self.assertEqual(len(premium), 2)
+        canonicals = {m.canonical for m in premium}
+        self.assertEqual(canonicals, {"gpt-4", "qwen-2.5-72b"})
+
+    def test_by_tier_ultra(self):
+        reg = self._make_registry()
+        ultra = reg.by_tier(ModelTier.ULTRA)
+        self.assertEqual(len(ultra), 1)
+        self.assertEqual(ultra[0].canonical, "gpt-4.1")
 
     def test_for_provider(self):
         reg = self._make_registry()
         requesty_models = reg.for_provider("requesty")
-        self.assertEqual(len(requesty_models), 2)  # gpt-4, gpt-4o-mini
+        self.assertEqual(len(requesty_models), 3)  # gpt-4, gpt-4o-mini, gpt-4.1
 
     def test_register_provider(self):
         reg = self._make_registry()
@@ -196,11 +221,11 @@ class TestModelRegistry(unittest.TestCase):
     def test_canonical_names(self):
         reg = self._make_registry()
         names = reg.canonical_names()
-        self.assertEqual(set(names), {"gpt-4", "gpt-4o-mini", "qwen-2.5-72b"})
+        self.assertEqual(set(names), {"gpt-4", "gpt-4o-mini", "qwen-2.5-72b", "gpt-4.1"})
 
 
 class TestBestProvider(unittest.TestCase):
-    """Test model-aware provider routing."""
+    """Test model-aware provider routing (internal — not shown to users)."""
 
     def _make_registry(self) -> ModelRegistry:
         registry = ModelRegistry()
@@ -208,7 +233,7 @@ class TestBestProvider(unittest.TestCase):
             ModelEntry(
                 canonical="claude-3-opus",
                 display_name="Claude 3 Opus",
-                category=ModelCategory.POWERFUL,
+                tier=ModelTier.ULTRA,
                 providers={
                     "requesty": "anthropic/claude-3-opus-20240229",
                     "puter": "claude-3-opus-20240229",
@@ -259,23 +284,42 @@ class TestBestProvider(unittest.TestCase):
 class TestBuildRegistry(unittest.TestCase):
     """Test the build_registry() factory function."""
 
-    def test_all_builtin_models_registered(self):
+    def test_default_free_models_registered(self):
         registry = build_registry()
-        for model in BUILTIN_MODELS:
+        for model in DEFAULT_FREE_MODELS:
             self.assertTrue(
-                registry.is_valid(model.canonical),
-                f"Built-in model {model.canonical!r} should be in registry",
+                registry.is_valid(model),
+                f"Default free model {model!r} should be in registry",
+            )
+
+    def test_default_premium_models_registered(self):
+        registry = build_registry()
+        for model in DEFAULT_PREMIUM_MODELS:
+            self.assertTrue(
+                registry.is_valid(model),
+                f"Default premium model {model!r} should be in registry",
+            )
+
+    def test_default_ultra_models_registered(self):
+        registry = build_registry()
+        for model in DEFAULT_ULTRA_MODELS:
+            self.assertTrue(
+                registry.is_valid(model),
+                f"Default ultra model {model!r} should be in registry",
             )
 
     def test_all_builtin_aliases_registered(self):
         registry = build_registry()
         for alias, canonical in BUILTIN_ALIASES.items():
-            entry = registry.get(alias)
-            self.assertIsNotNone(
-                entry,
-                f"Alias {alias!r} -> {canonical!r} should resolve",
-            )
-            self.assertEqual(entry.canonical, canonical)
+            # Only check aliases whose target models exist in the defaults
+            all_defaults = DEFAULT_FREE_MODELS + DEFAULT_PREMIUM_MODELS + DEFAULT_ULTRA_MODELS
+            if canonical in all_defaults:
+                entry = registry.get(alias)
+                self.assertIsNotNone(
+                    entry,
+                    f"Alias {alias!r} -> {canonical!r} should resolve",
+                )
+                self.assertEqual(entry.canonical, canonical)
 
     def test_provider_maps_attached(self):
         registry = build_registry()
@@ -293,35 +337,82 @@ class TestBuildRegistry(unittest.TestCase):
         self.assertIn("requesty", entry.providers)
         self.assertIn("chutes", entry.providers)
 
-    def test_active_providers_filter(self):
-        registry = build_registry(active_providers=["requesty"])
-        # Should still register all models, but logging differs
-        self.assertGreater(len(registry.all_models()), 0)
+    def test_custom_model_lists(self):
+        """Test passing explicit model lists overrides defaults."""
+        registry = build_registry(
+            free_models=["gpt-4o-mini"],
+            premium_models=["gpt-4o"],
+            ultra_models=["gpt-4.1"],
+        )
+        total = len(registry.all_models())
+        self.assertEqual(total, 3)
 
-    def test_categories_have_models(self):
+        free = registry.by_tier(ModelTier.FREE)
+        self.assertEqual(len(free), 1)
+        self.assertEqual(free[0].canonical, "gpt-4o-mini")
+
+        premium = registry.by_tier(ModelTier.PREMIUM)
+        self.assertEqual(len(premium), 1)
+        self.assertEqual(premium[0].canonical, "gpt-4o")
+
+        ultra = registry.by_tier(ModelTier.ULTRA)
+        self.assertEqual(len(ultra), 1)
+        self.assertEqual(ultra[0].canonical, "gpt-4.1")
+
+    def test_env_var_override(self):
+        """Test that env vars override defaults when set."""
+        old_free = os.environ.get("FREE_MODELS")
+        old_premium = os.environ.get("PREMIUM_MODELS")
+        old_ultra = os.environ.get("ULTRA_MODELS")
+
+        try:
+            os.environ["FREE_MODELS"] = "gpt-3.5-turbo,llama-3.1-8b"
+            os.environ["PREMIUM_MODELS"] = "gpt-4"
+            os.environ["ULTRA_MODELS"] = "o3"
+
+            registry = build_registry()
+            free = registry.by_tier(ModelTier.FREE)
+            premium = registry.by_tier(ModelTier.PREMIUM)
+            ultra = registry.by_tier(ModelTier.ULTRA)
+
+            self.assertEqual(len(free), 2)
+            self.assertEqual({m.canonical for m in free}, {"gpt-3.5-turbo", "llama-3.1-8b"})
+            self.assertEqual(len(premium), 1)
+            self.assertEqual(premium[0].canonical, "gpt-4")
+            self.assertEqual(len(ultra), 1)
+            self.assertEqual(ultra[0].canonical, "o3")
+        finally:
+            # Restore env
+            for key, val in [("FREE_MODELS", old_free), ("PREMIUM_MODELS", old_premium), ("ULTRA_MODELS", old_ultra)]:
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
+
+    def test_tiers_have_models(self):
         registry = build_registry()
-        for cat in ModelCategory:
-            models = registry.by_category(cat)
+        for tier in ModelTier:
+            models = registry.by_tier(tier)
             self.assertGreater(
                 len(models), 0,
-                f"Category {cat.value} should have at least one model",
+                f"Tier {tier.value} should have at least one model",
             )
 
 
-class TestModelCategory(unittest.TestCase):
-    """Test ModelCategory enum and display metadata."""
+class TestModelTier(unittest.TestCase):
+    """Test ModelTier enum and display metadata."""
 
-    def test_all_categories_have_display(self):
-        for cat in ModelCategory:
-            self.assertIn(cat, CATEGORY_DISPLAY)
-            meta = CATEGORY_DISPLAY[cat]
+    def test_all_tiers_have_display(self):
+        for tier in ModelTier:
+            self.assertIn(tier, TIER_DISPLAY)
+            meta = TIER_DISPLAY[tier]
             self.assertIn("emoji", meta)
             self.assertIn("label", meta)
             self.assertIn("description", meta)
 
-    def test_category_values(self):
-        expected = {"powerful", "fast", "code", "creative", "open_source", "free"}
-        actual = {cat.value for cat in ModelCategory}
+    def test_tier_values(self):
+        expected = {"free", "premium", "ultra"}
+        actual = {tier.value for tier in ModelTier}
         self.assertEqual(actual, expected)
 
 
@@ -347,12 +438,29 @@ class TestProviderModelMap(unittest.TestCase):
                 )
 
 
+class TestKnownModelMeta(unittest.TestCase):
+    """Test that known model metadata is consistent."""
+
+    def test_all_defaults_have_metadata(self):
+        """All default models should have display names and descriptions."""
+        all_defaults = DEFAULT_FREE_MODELS + DEFAULT_PREMIUM_MODELS + DEFAULT_ULTRA_MODELS
+        for model in all_defaults:
+            self.assertIn(
+                model, KNOWN_MODEL_META,
+                f"Default model {model!r} should have metadata in KNOWN_MODEL_META",
+            )
+
+    def test_metadata_has_required_fields(self):
+        for name, meta in KNOWN_MODEL_META.items():
+            self.assertIn("display", meta, f"Model {name} missing 'display' in metadata")
+            self.assertIn("desc", meta, f"Model {name} missing 'desc' in metadata")
+
+
 class TestSettingsResolveModel(unittest.TestCase):
     """Test Settings.resolve_model() with the new registry integration."""
 
     def _make_settings(self, **overrides):
         """Create a minimal Settings for testing."""
-        import os
         # Temporarily set env vars for testing
         old_env = {}
         defaults = {
